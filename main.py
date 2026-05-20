@@ -3,6 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from routes import submit
 import os
 
 load_dotenv()
@@ -31,3 +32,5 @@ def health_check():
         "supabase_url_loaded": bool(os.getenv("SUPABASE_URL")),
         "supabase_key_loaded": bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY")),
     }
+# Register routes
+app.include_router(submit.router)
