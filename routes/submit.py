@@ -1,11 +1,13 @@
 """
 Submission endpoint - receives case answers from the frontend,
-scores them (currently with a dummy score), and returns feedback.
+scores them (currently with a dummy score), saves to Supabase,
+and returns feedback.
 """
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
+from services.supabase_client import get_supabase_client
 
 
 router = APIRouter()
@@ -40,29 +42,64 @@ class SubmissionResponse(BaseModel):
 @router.post("/submit", response_model=SubmissionResponse)
 async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     """
-    Receive a case submission and return AI-generated feedback.
-    Currently returns a DUMMY score - will be replaced with OpenAI in Chunk C.
+    Receive a case submission, save it to Supabase, and return feedback.
+    Currently uses DUMMY scoring - will be replaced with OpenAI in Chunk C.
     """
-    # TODO Chunk C: Replace this dummy logic with real OpenAI call
-    dummy_response = SubmissionResponse(
-        submission_id="dummy-submission-id-12345",
-        score=72,
-        breakdown=FeedbackBreakdown(
-            structure=16,
-            logic=14,
-            data_usage=12,
-            communication=15,
-            creativity=15,
-        ),
-        strengths=[
+    # Generate dummy feedback (Chunk C will replace this with real OpenAI call)
+    dummy_breakdown = {
+        "structure": 16,
+        "logic": 14,
+        "data_usage": 12,
+        "communication": 15,
+        "creativity": 15,
+    }
+    dummy_score = sum(dummy_breakdown.values())  # 72
+    dummy_feedback = {
+        "breakdown": dummy_breakdown,
+        "strengths": [
             "Clear opening framework",
             "Logical segmentation of problem",
         ],
-        improvements=[
+        "improvements": [
             "Quantification missing - no numbers used",
             "Did not consider cost side of equation",
         ],
-        summary="Solid structural approach but stayed qualitative throughout. Adding specific numbers and considering both revenue and cost dimensions would strengthen the answer significantly.",
-    )
+        "summary": (
+            "Solid structural approach but stayed qualitative throughout. "
+            "Adding specific numbers and considering both revenue and cost "
+            "dimensions would strengthen the answer significantly."
+        ),
+    }
 
-    return dummy_response
+    # Save submission to Supabase and get the real UUID back
+    supabase = get_supabase_client()
+    try:
+        result = supabase.table("submissions").insert({
+            "user_id": submission.user_id,
+            "case_id": submission.case_id,
+            "answer_text": submission.answer_text,
+            "score": dummy_score,
+            "feedback_json": dummy_feedback,
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save submission: {str(e)}"
+        )
+
+    if not result.data or len(result.data) == 0:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase returned empty result"
+        )
+
+    saved_submission = result.data[0]
+
+    return SubmissionResponse(
+        submission_id=saved_submission["id"],
+        score=dummy_score,
+        breakdown=FeedbackBreakdown(**dummy_breakdown),
+        strengths=dummy_feedback["strengths"],
+        improvements=dummy_feedback["improvements"],
+        summary=dummy_feedback["summary"],
+    )
