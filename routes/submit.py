@@ -1,13 +1,13 @@
 """
 Submission endpoint - receives case answers from the frontend,
-scores them (currently with a dummy score), saves to Supabase,
-and returns feedback.
+scores them using OpenAI, saves to Supabase, and returns feedback.
 """
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
 from services.supabase_client import get_supabase_client
+from services.ai_scorer import score_case_answer, AIScoringError
 
 
 router = APIRouter()
@@ -21,12 +21,13 @@ class SubmissionRequest(BaseModel):
 
 
 class FeedbackBreakdown(BaseModel):
-    """Score breakdown across 5 dimensions, each out of 20."""
-    structure: int = Field(..., ge=0, le=20)
-    logic: int = Field(..., ge=0, le=20)
-    data_usage: int = Field(..., ge=0, le=20)
-    communication: int = Field(..., ge=0, le=20)
-    creativity: int = Field(..., ge=0, le=20)
+    """Score breakdown across 6 dimensions."""
+    structure: int = Field(..., ge=0, le=25)
+    quantitative: int = Field(..., ge=0, le=20)
+    synthesis: int = Field(..., ge=0, le=20)
+    business_judgment: int = Field(..., ge=0, le=15)
+    creativity: int = Field(..., ge=0, le=10)
+    presence: int = Field(..., ge=0, le=10)
 
 
 class SubmissionResponse(BaseModel):
@@ -42,44 +43,52 @@ class SubmissionResponse(BaseModel):
 @router.post("/submit", response_model=SubmissionResponse)
 async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     """
-    Receive a case submission, save it to Supabase, and return feedback.
-    Currently uses DUMMY scoring - will be replaced with OpenAI in Chunk C.
+    Receive a case submission, score it with AI, save to Supabase, return feedback.
     """
-    # Generate dummy feedback (Chunk C will replace this with real OpenAI call)
-    dummy_breakdown = {
-        "structure": 16,
-        "logic": 14,
-        "data_usage": 12,
-        "communication": 15,
-        "creativity": 15,
-    }
-    dummy_score = sum(dummy_breakdown.values())  # 72
-    dummy_feedback = {
-        "breakdown": dummy_breakdown,
-        "strengths": [
-            "Clear opening framework",
-            "Logical segmentation of problem",
-        ],
-        "improvements": [
-            "Quantification missing - no numbers used",
-            "Did not consider cost side of equation",
-        ],
-        "summary": (
-            "Solid structural approach but stayed qualitative throughout. "
-            "Adding specific numbers and considering both revenue and cost "
-            "dimensions would strengthen the answer significantly."
-        ),
-    }
-
-    # Save submission to Supabase and get the real UUID back
     supabase = get_supabase_client()
+
+    # Step 1: Fetch the case content (AI needs the case prompt for context)
+    try:
+        case_result = supabase.table("cases").select("*").eq(
+    "id", submission.case_id
+).maybe_single().execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch case: {str(e)}"
+        )
+
+    if not case_result.data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Case not found: {submission.case_id}"
+        )
+
+    case = case_result.data
+    case_content = case["content"]
+    case_type = case["type"]
+
+    # Step 2: Score the answer using OpenAI
+    try:
+        feedback = score_case_answer(
+            case_content=case_content,
+            case_type=case_type,
+            user_answer=submission.answer_text,
+        )
+    except AIScoringError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI scoring failed: {str(e)}"
+        )
+
+    # Step 3: Save submission to Supabase
     try:
         result = supabase.table("submissions").insert({
             "user_id": submission.user_id,
             "case_id": submission.case_id,
             "answer_text": submission.answer_text,
-            "score": dummy_score,
-            "feedback_json": dummy_feedback,
+            "score": feedback["score"],
+            "feedback_json": feedback,
         }).execute()
     except Exception as e:
         raise HTTPException(
@@ -95,11 +104,28 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
 
     saved_submission = result.data[0]
 
+    # Step 4: Update user's points (add the score to their cumulative total)
+    try:
+        # Fetch current points
+        user_result = supabase.table("users").select("points").eq(
+            "id", submission.user_id
+        ).maybe_Single().execute()
+        
+        current_points = user_result.data["points"] if user_result.data else 0
+        new_points = current_points + feedback["score"]
+        
+        supabase.table("users").update({
+            "points": new_points
+        }).eq("id", submission.user_id).execute()
+    except Exception as e:
+        # Non-critical - log but don't fail the submission
+        print(f"Warning: Failed to update user points: {str(e)}")
+
     return SubmissionResponse(
         submission_id=saved_submission["id"],
-        score=dummy_score,
-        breakdown=FeedbackBreakdown(**dummy_breakdown),
-        strengths=dummy_feedback["strengths"],
-        improvements=dummy_feedback["improvements"],
-        summary=dummy_feedback["summary"],
+        score=feedback["score"],
+        breakdown=FeedbackBreakdown(**feedback["breakdown"]),
+        strengths=feedback["strengths"],
+        improvements=feedback["improvements"],
+        summary=feedback["summary"],
     )
