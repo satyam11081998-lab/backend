@@ -108,18 +108,20 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     try:
         # Fetch current points
         user_result = supabase.table("users").select("points").eq(
-        "id", submission.user_id
-    ).maybe_single().execute()
-        
-        current_points = user_result.data["points"] if user_result.data else 0
+            "id", submission.user_id
+        ).maybe_single().execute()
+
+        current_points = (user_result.data or {}).get("points", 0)
         new_points = current_points + feedback["score"]
-        
+
         supabase.table("users").update({
             "points": new_points
         }).eq("id", submission.user_id).execute()
+
+        print(f"Updated user {submission.user_id} points: {current_points} -> {new_points}")
     except Exception as e:
-        # Non-critical - log but don't fail the submission
-        print(f"Warning: Failed to update user points: {str(e)}")
+        # Log clearly but don't fail the submission - score is already saved
+        print(f"ERROR: Failed to update user points for {submission.user_id}: {type(e).__name__}: {str(e)}")
 
     return SubmissionResponse(
         submission_id=saved_submission["id"],
