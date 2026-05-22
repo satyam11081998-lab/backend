@@ -108,8 +108,8 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     try:
         # Fetch current points
         user_result = supabase.table("users").select("points").eq(
-            "id", submission.user_id
-        ).maybe_Single().execute()
+        "id", submission.user_id
+    ).maybe_single().execute()
         
         current_points = user_result.data["points"] if user_result.data else 0
         new_points = current_points + feedback["score"]
