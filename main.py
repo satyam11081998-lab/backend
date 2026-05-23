@@ -1,14 +1,14 @@
-"""Consilio Backend - FastAPI server."""
+"""MECE Backend - FastAPI server."""
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from routes import submit
+from routes import submit, news, cron
 import os
 
 load_dotenv()
 
-app = FastAPI(title="Consilio Backend", version="0.1.0")
+app = FastAPI(title="MECE Backend", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +25,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Consilio Backend"}
+    return {"status": "ok", "service": "MECE Backend"}
 
 
 @app.get("/health")
@@ -35,6 +35,13 @@ def health_check():
         "openai_key_loaded": bool(os.getenv("OPENAI_API_KEY")),
         "supabase_url_loaded": bool(os.getenv("SUPABASE_URL")),
         "supabase_key_loaded": bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY")),
+        "gnews_key_loaded": bool(os.getenv("GNEWS_API_KEY")),
+        "newsapi_key_loaded": bool(os.getenv("NEWSAPI_KEY")),
+        "cron_secret_loaded": bool(os.getenv("CRON_SECRET")),
     }
-# Register routes
+
+
+# Register all routes
 app.include_router(submit.router)
+app.include_router(news.router)
+app.include_router(cron.router)
