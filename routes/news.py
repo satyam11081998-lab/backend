@@ -150,25 +150,27 @@ async def generate_brief_for_headline(headline_id: str) -> BriefResponse:
     """
     supabase = get_supabase_client()
     
-    # Step 1: Check if brief already exists (cache hit = no AI call)
+# Step 1: Check if brief already exists (cache hit = no AI call)
     try:
         existing_res = supabase.table("gd_briefs") \
             .select("*") \
             .eq("headline_id", headline_id) \
-            .maybe_single() \
+            .limit(1) \
             .execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to check existing brief: {type(e).__name__}: {e}"
         )
-    
+
+    existing_data = (existing_res.data or [None])[0] if existing_res and existing_res.data else None
+
     # Step 2: Fetch the headline (need it for both cache miss AND response)
     try:
         headline_res = supabase.table("news_headlines") \
             .select("*") \
             .eq("id", headline_id) \
-            .maybe_single() \
+            .limit(1) \
             .execute()
     except Exception as e:
         raise HTTPException(
@@ -176,14 +178,14 @@ async def generate_brief_for_headline(headline_id: str) -> BriefResponse:
             detail=f"Failed to fetch headline: {type(e).__name__}: {e}"
         )
     
-    if not headline_res.data:
+    if not headline_res or not headline_res.data:
         raise HTTPException(status_code=404, detail=f"Headline not found: {headline_id}")
-    
-    headline = headline_res.data
-    
+
+    headline = headline_res.data[0]
+
     # Cache hit: return existing brief
-    if existing_res.data:
-        b = existing_res.data
+    if existing_data:
+        b = existing_data
         return BriefResponse(
             id=b["id"],
             headline_id=headline_id,
@@ -286,34 +288,34 @@ async def get_brief(headline_id: str) -> BriefResponse:
         brief_res = supabase.table("gd_briefs") \
             .select("*") \
             .eq("headline_id", headline_id) \
-            .maybe_single() \
+            .limit(1) \
             .execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch brief: {type(e).__name__}: {e}"
         )
-    
-    if not brief_res.data:
+
+    if not brief_res or not brief_res.data:
         raise HTTPException(status_code=404, detail="Brief not generated yet")
-    
+
     try:
         headline_res = supabase.table("news_headlines") \
             .select("*") \
             .eq("id", headline_id) \
-            .maybe_single() \
+            .limit(1) \
             .execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch headline: {type(e).__name__}: {e}"
         )
-    
-    if not headline_res.data:
+
+    if not headline_res or not headline_res.data:
         raise HTTPException(status_code=404, detail="Headline not found")
-    
-    b = brief_res.data
-    h = headline_res.data
+
+    b = brief_res.data[0]
+    h = headline_res.data[0]
     
     return BriefResponse(
         id=b["id"],
