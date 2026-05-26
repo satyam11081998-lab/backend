@@ -104,6 +104,75 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
 
     saved_submission = result.data[0]
 
+    # Step 3.5: Record this attempt in case_attempts
+    # - First-time attempts count toward leaderboards + earn badges
+    # - Subsequent attempts (Lite/Pro re-attempts) are tracked but don't update leaderboard
+    
+    from datetime import datetime, timedelta, timezone
+    IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(IST_OFFSET).date().isoformat()
+    
+    # Check if this user has attempted this case before
+    try:
+        prior_res = supabase.table("case_attempts") \
+            .select("id, attempt_number") \
+            .eq("user_id", submission.user_id) \
+            .eq("case_id", submission.case_id) \
+            .order("attempt_number", desc=True) \
+            .limit(1) \
+            .execute()
+        prior_row = (prior_res.data or [None])[0] if prior_res and prior_res.data else None
+    except Exception as e:
+        print(f"WARN: case_attempts lookup failed: {e}")
+        prior_row = None
+    
+    is_first_attempt = prior_row is None
+    attempt_number = 1 if is_first_attempt else (prior_row.get("attempt_number", 0) + 1)
+    
+    # Check if today's daily case matches this case
+    counted_for_daily = False
+    daily_date_val = None
+    if is_first_attempt:
+        try:
+            sched_res = supabase.table("daily_schedule") \
+                .select("case_id") \
+                .eq("scheduled_date", today_ist) \
+                .limit(1) \
+                .execute()
+            sched_row = (sched_res.data or [None])[0] if sched_res and sched_res.data else None
+            if sched_row and sched_row.get("case_id") == submission.case_id:
+                counted_for_daily = True
+                daily_date_val = today_ist
+        except Exception as e:
+            print(f"WARN: daily schedule check failed: {e}")
+    
+    try:
+        supabase.table("case_attempts").insert({
+            "user_id": submission.user_id,
+            "case_id": submission.case_id,
+            "submission_id": saved_submission["id"],
+            "attempt_number": attempt_number,
+            "is_first_attempt": is_first_attempt,
+            "counted_for_daily": counted_for_daily,
+            "daily_date": daily_date_val,
+        }).execute()
+    except Exception as e:
+        # Don't fail the submission — attempt tracking is bonus
+        print(f"WARN: case_attempts insert failed: {e}")
+    
+    # IMPORTANT: only first attempts contribute to points
+    if not is_first_attempt:
+        # Skip the points update logic below
+        # Return early with the saved submission
+        return SubmissionResponse(
+            submission_id=saved_submission["id"],
+            score=feedback["score"],
+            breakdown=FeedbackBreakdown(**feedback["breakdown"]),
+            strengths=feedback["strengths"],
+            improvements=feedback["improvements"],
+            summary=feedback["summary"],
+        )
+
     # Step 4: Update user's points (add the score to their cumulative total)
     try:
         # Fetch current points

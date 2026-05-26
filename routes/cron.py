@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from typing import Optional
 from services.supabase_client import get_supabase_client
 from services.news_fetcher import fetch_all_headlines
+from services.daily_scheduler import fill_daily_schedule
 from services.headline_classifier import (
     classify_headlines,
     filter_top_headlines,
@@ -197,4 +198,36 @@ async def cron_cleanup(x_cron_secret: Optional[str] = Header(default=None)) -> C
         status="ok",
         message=f"Deleted {to_delete} headlines (and cascaded briefs) older than 14 days",
         details={"deleted": to_delete, "cutoff": cutoff}
+    )
+
+
+# ============================================================
+# Endpoint: Daily schedule cron — fills 7-day buffer
+# 
+# Called by cron-job.org every day at 6 AM IST.
+# Idempotent — safe to call multiple times.
+# ============================================================
+
+@router.post("/schedule-daily", response_model=CronResponse)
+async def cron_schedule_daily(x_cron_secret: Optional[str] = Header(default=None)) -> CronResponse:
+    """
+    Fill the daily_schedule table to maintain a 7-day-ahead buffer.
+    
+    Picks unused cases (60-day cooldown) and assigns them to empty slots
+    in the next 7 days. Idempotent.
+    """
+    verify_cron_secret(x_cron_secret)
+    
+    try:
+        result = fill_daily_schedule()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Schedule fill failed: {type(e).__name__}: {e}"
+        )
+    
+    return CronResponse(
+        status=result.get("status", "ok"),
+        message=result.get("message", "Daily schedule updated"),
+        details=result,
     )

@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from routes import submit, news, cron
+from routes import submit, news, cron, daily
 import os
 
 load_dotenv()
@@ -45,3 +45,4 @@ def health_check():
 app.include_router(submit.router)
 app.include_router(news.router)
 app.include_router(cron.router)
+app.include_router(daily.router)
