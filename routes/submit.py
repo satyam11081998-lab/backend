@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from typing import List
 from services.supabase_client import get_supabase_client
 from services.ai_scorer import score_case_answer, AIScoringError
+from services.badge_awarder import award_badges_for_submission
 
 
 router = APIRouter()
@@ -191,6 +192,23 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     except Exception as e:
         # Log clearly but don't fail the submission - score is already saved
         print(f"ERROR: Failed to update user points for {submission.user_id}: {type(e).__name__}: {str(e)}")
+
+    # Step 5: Award any newly-earned badges
+    try:
+        await_badges = award_badges_for_submission(
+            user_id=submission.user_id,
+            submission_id=saved_submission["id"],
+            score=feedback["score"],
+            feedback_breakdown=feedback["breakdown"],
+            case_id=submission.case_id,
+            case_type=case_type,
+            is_first_attempt=is_first_attempt,
+            counted_for_daily=counted_for_daily,
+        )
+        if await_badges:
+            print(f"Awarded badges to {submission.user_id}: {await_badges}")
+    except Exception as e:
+        print(f"WARN: badge awarding failed for {submission.user_id}: {e}")
 
     return SubmissionResponse(
         submission_id=saved_submission["id"],
