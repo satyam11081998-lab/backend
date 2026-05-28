@@ -26,9 +26,9 @@ class ClassifiedHeadline(TypedDict):
     published_at: str
     
     # AI-added fields
-    gd_worthiness_score: int  # 0-10
+    gd_worthiness_score: int  # 0-100
     keywords: List[str]        # 2-4 topic tags
-    category: str              # "business", "macro", "policy", "tech", "global", "other"
+    category: str              # "business", "macro", "micro", "policy", "tech", "geopolitics", "jobs", "other"
     is_star: bool              # only ONE headline in batch has is_star=True
 
 
@@ -41,29 +41,31 @@ CLASSIFIER_SYSTEM_PROMPT = """You are an expert curator for MBA Group Discussion
 
 Your job: rate news headlines for how likely they are to become GD topics in MBA/PGDM placement interviews at IIMs, IMI, FMS, SP Jain, and top consulting/IB recruiters.
 
-A high GD-worthy headline (8-10) has these traits:
+You must score each headline on a scale of 0 to 100 based on the following specific parameters:
+- India-specific relevance (Does it affect the Indian economy or society?)
+- Management/Strategy impact (Does it involve corporate governance, mergers, leadership, or business strategy?)
+- Jobs & Recruiting context (Does it impact MBA hiring, tech layoffs, or workforce trends?)
+- Macroeconomics (Inflation, GDP, RBI policy, central budgets)
+- Microeconomics (Specific sector dynamics, supply chain, pricing strategies)
+- Geopolitics (Trade wars, international relations affecting Indian business)
+
+A high GD-worthy headline (80-100) has these traits:
 - Has TWO defensible sides (room for debate)
-- Touches business strategy, economics, policy, regulation, or sector dynamics
-- Affects multiple stakeholders (consumers, companies, government, society)
-- Recent enough to be relevant but substantive enough for 10-min discussion
-- Indian context strongly preferred but global business is also valid
+- Touches heavily on one or more of the above parameters.
+- Affects multiple stakeholders (consumers, companies, government, society).
 
-A LOW GD-worthy headline (0-3):
-- Sports, entertainment, celebrity news
-- Crime, accidents, individual tragedies  
-- Political rallies or partisan content (unless business-relevant policy)
-- Generic press releases or product launches
-- Single-company minor news with no broader implications
-
-Mid-range (4-7):
-- Tech product launches with sector implications
-- Earnings results of major companies
-- Court rulings affecting business
+You MUST instantly score 0 for any news about:
+- Bollywood, celebrity gossip, or entertainment.
+- Sports (unless it's a major business acquisition, e.g., IPL broadcasting rights).
+- Local crimes, accidents, or individual tragedies.
+- Purely political posturing (e.g., party rallies) without economic/policy substance.
+- Penny stock movements or "Top 5 stocks to buy" clickbait.
+- Generic PR product launches with no strategic depth.
 
 For EACH headline you receive, output:
-- gd_worthiness_score (0-10 integer)
-- keywords (2-4 short topic tags, e.g., "RBI policy", "fintech regulation", "EV adoption")
-- category (one of: "business", "macro", "policy", "tech", "global", "sector", "other")
+- gd_worthiness_score (0-100 integer)
+- keywords (2-4 short topic tags, e.g., "RBI policy", "fintech regulation")
+- category (one of: "business", "macro", "micro", "policy", "tech", "geopolitics", "jobs", "other")
 
 Then identify the single STAR headline — the most GD-worthy one in the batch — and set is_star=true for it.
 
@@ -74,7 +76,7 @@ Example output structure:
   "classified": [
     {
       "title": "...",
-      "gd_worthiness_score": 8,
+      "gd_worthiness_score": 85,
       "keywords": ["RBI policy", "inflation"],
       "category": "macro",
       "is_star": true
@@ -182,7 +184,7 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
             "source_url": original["source_url"],
             "source_name": original["source_name"],
             "published_at": original["published_at"],
-            "gd_worthiness_score": max(0, min(10, int(ai_data.get("gd_worthiness_score", 5)))),
+            "gd_worthiness_score": max(0, min(100, int(ai_data.get("gd_worthiness_score", 50)))),
             "keywords": [str(k).strip() for k in ai_data.get("keywords", [])][:4],
             "category": str(ai_data.get("category", "other")).lower(),
             "is_star": is_star,
@@ -196,18 +198,21 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
     return results
 
 
-def filter_top_headlines(classified: List[ClassifiedHeadline], top_n: int = 20) -> List[ClassifiedHeadline]:
+def filter_top_headlines(classified: List[ClassifiedHeadline], top_n: int = 10, min_score: int = 75) -> List[ClassifiedHeadline]:
     """
-    From a batch of classified headlines, return the top N by score.
-    Always includes the star headline.
+    From a batch of classified headlines, return the top N by score that meet the min_score.
+    Always includes the star headline if it exists.
     Sorts result by: star first, then descending score.
     """
     if not classified:
         return []
     
+    # Filter by minimum score (unless it's the star)
+    qualified = [h for h in classified if h["gd_worthiness_score"] >= min_score or h["is_star"]]
+    
     # Sort by gd_worthiness_score descending, with star always at top
     sorted_h = sorted(
-        classified,
+        qualified,
         key=lambda h: (not h["is_star"], -h["gd_worthiness_score"])
     )
     

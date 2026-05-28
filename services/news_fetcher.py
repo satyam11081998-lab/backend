@@ -38,8 +38,11 @@ PRIORITY_KEYWORDS = [
     "FDI", "trade", "economy", "stock", "market"
 ]
 
+# Specific Indian domains for NewsAPI 'everything' endpoint
+INDIAN_DOMAINS = "livemint.com,timesofindia.indiatimes.com,hindustantimes.com,thehindu.com,economictimes.indiatimes.com"
 
-def fetch_from_gnews(api_key: str, max_results: int = 15) -> List[RawHeadline]:
+
+def fetch_from_gnews(api_key: str, max_results: int = 50, page: int = 1) -> List[RawHeadline]:
     """
     Fetch recent business headlines from GNews API.
     Docs: https://gnews.io/docs/v4
@@ -55,6 +58,7 @@ def fetch_from_gnews(api_key: str, max_results: int = 15) -> List[RawHeadline]:
                 "lang": "en",
                 "country": "in",         # India focus
                 "max": max_results // len(GNEWS_TOPICS),
+                "page": page,
                 "apikey": api_key,
             }
             response = httpx.get(
@@ -88,55 +92,56 @@ def fetch_from_gnews(api_key: str, max_results: int = 15) -> List[RawHeadline]:
     return headlines
 
 
-def fetch_from_newsapi(api_key: str, max_results: int = 15) -> List[RawHeadline]:
+def fetch_from_newsapi(api_key: str, max_results: int = 50, page: int = 1) -> List[RawHeadline]:
     """
     Fetch recent business headlines from NewsAPI.org.
     Docs: https://newsapi.org/docs
     
-    Uses /v2/top-headlines (free plan supports this for India).
+    Uses /v2/everything with specific Indian domains to ensure high volume of local business news.
     Returns up to max_results headlines. Empty list on failure (does not raise).
     """
     headlines: List[RawHeadline] = []
     
-    for category in NEWSAPI_CATEGORIES:
-        try:
-            params = {
-                "category": category,
-                "country": "in",  # India focus
-                "pageSize": max_results,
-                "apiKey": api_key,
-            }
-            response = httpx.get(
-                "https://newsapi.org/v2/top-headlines",
-                params=params,
-                timeout=15.0
-            )
+    try:
+        params = {
+            "q": "business OR economy OR startup OR market OR RBI OR policy",
+            "domains": INDIAN_DOMAINS,
+            "sortBy": "publishedAt",
+            "pageSize": max_results,
+            "page": page,
+            "language": "en",
+            "apiKey": api_key,
+        }
+        response = httpx.get(
+            "https://newsapi.org/v2/everything",
+            params=params,
+            timeout=15.0
+        )
+        
+        if response.status_code != 200:
+            print(f"NewsAPI error: HTTP {response.status_code} — {response.text[:200]}")
+            return headlines
+        
+        data = response.json()
+        articles = data.get("articles", [])
             
-            if response.status_code != 200:
-                print(f"NewsAPI error for category '{category}': HTTP {response.status_code} — {response.text[:200]}")
+        for article in articles:
+            # Skip articles with no URL (NewsAPI sometimes returns these)
+            if not article.get("url"):
                 continue
-            
-            data = response.json()
-            articles = data.get("articles", [])
-            
-            for article in articles:
-                # Skip articles with no URL (NewsAPI sometimes returns these)
-                if not article.get("url"):
-                    continue
-                    
-                headlines.append({
-                    "title": (article.get("title") or "").strip(),
-                    "description": (article.get("description") or "").strip() or None,
-                    "thumbnail_url": article.get("urlToImage") or None,
-                    "source_url": article["url"],
-                    "source_name": (article.get("source") or {}).get("name", "Unknown"),
-                    "published_at": article.get("publishedAt", datetime.now(timezone.utc).isoformat()),
-                    "source_api": "newsapi",
-                })
                 
-        except Exception as e:
-            print(f"NewsAPI fetch failed for category '{category}': {type(e).__name__}: {e}")
-            continue
+            headlines.append({
+                "title": (article.get("title") or "").strip(),
+                "description": (article.get("description") or "").strip() or None,
+                "thumbnail_url": article.get("urlToImage") or None,
+                "source_url": article["url"],
+                "source_name": (article.get("source") or {}).get("name", "Unknown"),
+                "published_at": article.get("publishedAt", datetime.now(timezone.utc).isoformat()),
+                "source_api": "newsapi",
+            })
+                
+    except Exception as e:
+        print(f"NewsAPI fetch failed: {type(e).__name__}: {e}")
     
     return headlines
 
@@ -160,12 +165,12 @@ def deduplicate_headlines(headlines: List[RawHeadline]) -> List[RawHeadline]:
     return unique
 
 
-def fetch_all_headlines() -> List[RawHeadline]:
+def fetch_all_headlines(max_results: int = 50, page: int = 1) -> List[RawHeadline]:
     """
     Main entry point: fetch from both APIs, combine, deduplicate.
     
     Reads API keys from environment variables.
-    Returns deduplicated list of up to 30 raw headlines.
+    Returns deduplicated list of raw headlines.
     Empty list if both APIs fail.
     """
     gnews_key = os.environ.get("GNEWS_API_KEY", "").strip()
@@ -174,14 +179,14 @@ def fetch_all_headlines() -> List[RawHeadline]:
     all_headlines: List[RawHeadline] = []
     
     if gnews_key:
-        gnews_results = fetch_from_gnews(gnews_key)
+        gnews_results = fetch_from_gnews(gnews_key, max_results=max_results, page=page)
         all_headlines.extend(gnews_results)
         print(f"GNews returned {len(gnews_results)} headlines")
     else:
         print("WARNING: GNEWS_API_KEY not set, skipping GNews")
     
     if newsapi_key:
-        newsapi_results = fetch_from_newsapi(newsapi_key)
+        newsapi_results = fetch_from_newsapi(newsapi_key, max_results=max_results, page=page)
         all_headlines.extend(newsapi_results)
         print(f"NewsAPI returned {len(newsapi_results)} headlines")
     else:

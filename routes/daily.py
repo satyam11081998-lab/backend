@@ -39,6 +39,7 @@ class TodayResponse(BaseModel):
     date: str  # YYYY-MM-DD in IST
     case: Optional[TodayCaseInfo]
     guesstimate_code: Optional[str]
+    guesstimate_title: Optional[str] = None
     brief: Optional[TodayHeadlineInfo]
     attempted_by_current_user: bool = False  # filled by frontend or auth-aware version later
 
@@ -110,10 +111,27 @@ async def get_today() -> TodayResponse:
     except Exception:
         pass
     
+    # Fetch guesstimate title if code exists
+    guess_title = None
+    guess_code = sched_row.get("guesstimate_code") if sched_row else None
+    if guess_code:
+        try:
+            guess_res = supabase.table("guesstimates") \
+                .select("title") \
+                .eq("code", guess_code) \
+                .limit(1) \
+                .execute()
+            guess_row = (guess_res.data or [None])[0] if guess_res and guess_res.data else None
+            if guess_row:
+                guess_title = guess_row.get("title")
+        except Exception:
+            pass
+            
     return TodayResponse(
         date=today,
         case=case_info,
-        guesstimate_code=sched_row.get("guesstimate_code") if sched_row else None,
+        guesstimate_code=guess_code,
+        guesstimate_title=guess_title,
         brief=brief_info,
     )
 

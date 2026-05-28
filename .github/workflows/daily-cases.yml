@@ -1,0 +1,19 @@
+name: Daily Cases & Guesstimates Generator (00:01 AM IST)
+
+on:
+  schedule:
+    # 18:31 UTC is 00:01 AM IST (next day)
+    - cron: '31 18 * * *'
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  generate-content:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit /cron/schedule-daily Endpoint
+        run: |
+          curl -X POST "${{ secrets.API_BASE_URL }}/cron/schedule-daily" \
+          -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+          --retry 3 \
+          --retry-delay 10 \
+          --fail

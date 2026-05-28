@@ -59,39 +59,59 @@ async def cron_fetch_news(x_cron_secret: Optional[str] = Header(default=None)) -
     """
     verify_cron_secret(x_cron_secret)
     
-    # Step 1: Fetch from both news APIs
-    try:
-        raw_headlines = fetch_all_headlines()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch news: {type(e).__name__}: {e}"
-        )
+    # Step 1: Fetch and classify in a loop until we have at least 10 highly-scored headlines
+    top_headlines = []
+    page = 1
+    max_results = 50
+    total_fetched = 0
+    total_classified = 0
     
-    if not raw_headlines:
-        return CronResponse(
-            status="warning",
-            message="No headlines fetched from any source",
-            details={"fetched": 0, "saved": 0}
-        )
+    while len(top_headlines) < 10 and page <= 5:
+        try:
+            raw_headlines = fetch_all_headlines(max_results=max_results, page=page)
+            if not raw_headlines:
+                break
+                
+            total_fetched += len(raw_headlines)
+            
+            classified = classify_headlines(raw_headlines)
+            total_classified += len(classified)
+            
+            # Filter this batch for minimum score of 75
+            batch_top = filter_top_headlines(classified, top_n=50, min_score=75)
+            top_headlines.extend(batch_top)
+            
+            # Deduplicate by URL
+            seen_urls = set()
+            unique_top = []
+            for h in top_headlines:
+                if h["source_url"] not in seen_urls:
+                    seen_urls.add(h["source_url"])
+                    unique_top.append(h)
+            top_headlines = unique_top
+            
+            if len(top_headlines) >= 10:
+                break
+                
+            # Prepare for next iteration
+            page += 1
+            max_results = 20
+            
+        except Exception as e:
+            if page == 1:
+                raise HTTPException(status_code=500, detail=f"Failed to fetch news on first try: {type(e).__name__}: {e}")
+            else:
+                print(f"Warning: Fetch loop failed on page {page}: {e}")
+                break
     
-    # Step 2: Classify with AI (single batched call)
-    try:
-        classified = classify_headlines(raw_headlines)
-    except ClassificationError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Classification failed: {str(e)}"
-        )
-    
-    # Step 3: Keep top 20 (star always included)
-    top_headlines = filter_top_headlines(classified, top_n=20)
+    # Trim to Top 20 max to avoid saving too many
+    top_headlines = sorted(top_headlines, key=lambda h: (not h["is_star"], -h["gd_worthiness_score"]))[:20]
     
     if not top_headlines:
         return CronResponse(
             status="warning",
-            message="No headlines survived classification",
-            details={"fetched": len(raw_headlines), "classified": len(classified), "saved": 0}
+            message="No headlines survived classification or none fetched",
+            details={"fetched": total_fetched, "classified": total_classified, "saved": 0}
         )
     
     # Step 4: Insert into Supabase (skip duplicates via unique constraint on source_url)
@@ -137,13 +157,14 @@ async def cron_fetch_news(x_cron_secret: Optional[str] = Header(default=None)) -
     
     return CronResponse(
         status="ok",
-        message=f"Fetched {len(raw_headlines)}, saved {saved_count}, skipped {skipped_count}",
+        message=f"Fetched {total_fetched}, saved {saved_count}, skipped {skipped_count}",
         details={
-            "fetched": len(raw_headlines),
-            "classified": len(classified),
+            "fetched": total_fetched,
+            "classified": total_classified,
             "considered_top": len(top_headlines),
             "saved": saved_count,
             "skipped_duplicates": skipped_count,
+            "pages_fetched": page,
         }
     )
 
