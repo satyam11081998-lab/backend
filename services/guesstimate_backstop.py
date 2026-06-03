@@ -1,16 +1,23 @@
 """
-Guesstimate arithmetic backstop — faithful Python port of the frontend TS
-(lib/scoring/calc-chain.ts + arithmetic-check.ts + apply-backstop.ts).
+Guesstimate arithmetic backstop — Python port of the frontend TS
+(lib/scoring/calc-chain.ts + arithmetic-check.ts + apply-backstop.ts), hardened.
 
-Principle (unchanged from the TS): the LLM TRANSCRIBES the candidate's stated math
-into a structured CalcChain (LLMs are OK at transcription); CODE VERIFIES it (LLMs
-are bad at arithmetic). The backstop recomputes every step, OVERRIDES the arithmetic
-dimension (D4) with its deterministic verdict, and caps the total on magnitude
-implausibility. It is honest about scope: it does NOT judge assumption realism —
-that stays with the LLM under the segmentation dimension.
+Principle (unchanged): the LLM TRANSCRIBES the candidate's stated math into a
+structured CalcChain; CODE VERIFIES it. The backstop recomputes the steps it can
+fully reconstruct, OVERRIDES the arithmetic dimension with its deterministic
+verdict, and caps the total on magnitude implausibility.
 
-Weights and behaviour mirror the TS exactly (GUESSTIMATE_WEIGHTS, TOLERANCE=0.02,
-caps 0.5/0.35). Keep this file in sync with the TS if either changes.
+2026-06-02 hardening (fixes "everything recomputes to 0 / false arithmetic 1/5"):
+  - BASE/`literal` steps are assumptions, not recomputations: their computed value
+    is their stated value (input if given, else claimedValue) — they NEVER false-flag.
+  - A step is only FLAGGED when it is fully recomputable (a derived op whose inputs
+    all resolve to finite numbers) AND the recompute genuinely disagrees. Steps we
+    can't reconstruct are marked unverified and skipped — never invented as errors.
+  - `percent_of` handles "12%", 0.12, 12, or a "#ref" as the percentage without crashing.
+  - If NOTHING in the chain is verifiable, the arithmetic dimension falls back to the
+    LLM's own score (we add no information, so we don't override).
+
+Weights/tolerance/caps mirror the TS. Keep in sync if either changes.
 """
 
 import math
@@ -29,19 +36,27 @@ DIMENSIONS = ["scoping", "structure", "segmentation", "arithmetic", "sanity"]
 
 EPS = 1e-9
 TOLERANCE = 0.02  # 2% — generous; guesstimates round freely
+DERIVED_OPS = {"add", "subtract", "multiply", "divide", "percent_of"}
 
 
-def _pct_to_fraction(v) -> float:
+def _is_finite(x) -> bool:
+    return isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x))
+
+
+def _to_number(v) -> float:
+    """Parse a number from int/float or a clean numeric string; NaN if not parseable."""
     if isinstance(v, (int, float)):
-        return v / 100 if v > 1 else float(v)
-    s = str(v).strip()
-    if s.endswith("%"):
-        return float(s[:-1]) / 100
-    n = float(s)
-    return n / 100 if n > 1 else n
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
 
 
 def _fmt(n: float) -> str:
+    if not _is_finite(n):
+        return "—"
     a = abs(n)
     if a >= 1e7:
         return f"{n / 1e7:.2f} cr"
@@ -53,13 +68,18 @@ def _fmt(n: float) -> str:
 
 
 def resolve_chain(chain: Dict[str, Any], tolerance: float = TOLERANCE) -> List[Dict[str, Any]]:
-    """Recompute every step from its inputs, resolving #refs to COMPUTED (not claimed) values."""
+    """
+    Recompute every step. Each result carries:
+      computedValue, claimedValue, relError, ok, verifiable, op
+    `verifiable` = we could fully reconstruct this step's math (derived op + all inputs
+    resolved to finite numbers). Only verifiable steps can ever be flagged.
+    """
     steps = chain.get("steps", []) or []
-    by_id = {s["id"]: s for s in steps}
+    by_id = {s.get("id"): s for s in steps if s.get("id") is not None}
     computed: Dict[str, float] = {}
-    out: List[Dict[str, Any]] = []
+    _verifiable: Dict[str, bool] = {}
 
-    def resolve_input(inp) -> float:
+    def resolve_ref(inp) -> float:
         if isinstance(inp, (int, float)):
             return float(inp)
         s = str(inp).strip()
@@ -68,56 +88,82 @@ def resolve_chain(chain: Dict[str, Any], tolerance: float = TOLERANCE) -> List[D
             if ref not in computed and ref in by_id:
                 compute_step(by_id[ref])
             return computed.get(ref, float("nan"))
-        try:
-            return float(s)
-        except ValueError:
+        return _to_number(s)
+
+    def resolve_pct(inp) -> float:
+        if isinstance(inp, str) and inp.strip().endswith("%"):
+            return _to_number(inp.strip()[:-1]) / 100.0
+        v = resolve_ref(inp)
+        if not _is_finite(v):
             return float("nan")
+        return v / 100.0 if v > 1 else v
 
     def compute_step(step: Dict[str, Any]) -> float:
-        sid = step["id"]
+        sid = step.get("id")
         if sid in computed:
             return computed[sid]
         op = step.get("op")
         inputs = step.get("inputs", []) or []
+        claimed = _to_number(step.get("claimedValue", 0))
+        verifiable = False
         val: float
-        if op == "literal":
-            first = inputs[0] if inputs else 0
-            val = float(first) if isinstance(first, (int, float)) else float(str(first))
-        elif op == "add":
-            val = sum(resolve_input(x) for x in inputs)
-        elif op == "subtract":
-            val = resolve_input(inputs[0])
-            for x in inputs[1:]:
-                val -= resolve_input(x)
-        elif op == "multiply":
-            val = 1.0
-            for x in inputs:
-                val *= resolve_input(x)
-        elif op == "divide":
-            val = resolve_input(inputs[0])
-            for x in inputs[1:]:
-                d = resolve_input(x)
-                val = val / d if d != 0 else float("inf")
+
+        if op == "literal" or op not in DERIVED_OPS:
+            # Base assumption (or an op we don't recompute): the stated value IS the value.
+            v = resolve_ref(inputs[0]) if inputs else float("nan")
+            val = v if _is_finite(v) else (claimed if _is_finite(claimed) else 0.0)
+            verifiable = False
         elif op == "percent_of":
-            pct = _pct_to_fraction(inputs[0])
-            base = resolve_input(inputs[1])
-            val = pct * base
+            pct = resolve_pct(inputs[0]) if len(inputs) >= 1 else float("nan")
+            base = resolve_ref(inputs[1]) if len(inputs) >= 2 else float("nan")
+            if _is_finite(pct) and _is_finite(base):
+                val, verifiable = pct * base, True
+            else:
+                val, verifiable = (claimed if _is_finite(claimed) else float("nan")), False
         else:
-            val = float("nan")
+            resolved = [resolve_ref(x) for x in inputs]
+            if resolved and all(_is_finite(r) for r in resolved):
+                if op == "add":
+                    val = sum(resolved)
+                elif op == "subtract":
+                    val = resolved[0]
+                    for r in resolved[1:]:
+                        val -= r
+                elif op == "multiply":
+                    val = 1.0
+                    for r in resolved:
+                        val *= r
+                else:  # divide
+                    val = resolved[0]
+                    for r in resolved[1:]:
+                        val = val / r if r != 0 else float("inf")
+                verifiable = _is_finite(val)
+            else:
+                val, verifiable = (claimed if _is_finite(claimed) else float("nan")), False
+
         computed[sid] = val
+        _verifiable[sid] = verifiable
         return val
 
+    out: List[Dict[str, Any]] = []
     for step in steps:
-        computed_value = compute_step(step)
-        claimed = float(step.get("claimedValue", 0) or 0)
-        rel_error = abs(computed_value - claimed) / max(abs(claimed), EPS)
+        cv = compute_step(step)
+        claimed = _to_number(step.get("claimedValue", 0))
+        verifiable = _verifiable.get(step.get("id"), False)
+        if verifiable and _is_finite(cv) and _is_finite(claimed):
+            rel = abs(cv - claimed) / max(abs(claimed), EPS)
+            ok = rel <= tolerance
+        else:
+            rel, ok = 0.0, True  # not verifiable → never a finding
         out.append({
-            "id": step["id"],
+            "id": step.get("id"),
             "label": step.get("label", ""),
+            "op": step.get("op"),
             "claimedValue": claimed,
-            "computedValue": computed_value,
-            "relError": rel_error,
-            "ok": rel_error <= tolerance,
+            "computedValue": cv,
+            "relError": rel,
+            "ok": ok,
+            "verifiable": verifiable,
         })
     return out
 
@@ -133,21 +179,18 @@ def _orders_outside(value: float, band: Dict[str, float]) -> float:
 
 
 def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-    """Deterministic checks over a CalcChain → corrected D4 score + total cap + findings."""
     resolved = resolve_chain(chain, TOLERANCE)
-    by_id = {s["id"]: s for s in (chain.get("steps", []) or [])}
     findings: List[Dict[str, Any]] = []
+    verifiable_steps = [r for r in resolved if r["verifiable"]]
 
     for r in resolved:
-        if r["ok"]:
+        if r["ok"] or not r["verifiable"]:
             continue
-        step = by_id.get(r["id"], {})
-        if step.get("op") == "percent_of":
+        if r["op"] == "percent_of":
             findings.append({
                 "kind": "base_inconsistency", "stepId": r["id"], "label": r["label"],
                 "message": f"\"{r['label']}\" claims {_fmt(r['claimedValue'])} but the stated "
-                           f"percentage of its base recomputes to {_fmt(r['computedValue'])}. "
-                           f"The base or the result is wrong.",
+                           f"percentage of its base recomputes to {_fmt(r['computedValue'])}.",
                 "claimed": r["claimedValue"], "computed": r["computedValue"],
             })
         else:
@@ -158,15 +201,15 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
                 "claimed": r["claimedValue"], "computed": r["computedValue"],
             })
 
-    # final-value check
+    # final-value check — only when the final step is one we actually recomputed
     final_ref = chain.get("finalRef")
     final_step = None
     if final_ref:
         final_step = next((r for r in resolved if r["id"] == final_ref), None)
-    elif resolved:
-        final_step = resolved[-1]
-    final_value = float(chain.get("finalValue", 0) or 0)
-    if final_step:
+    elif verifiable_steps:
+        final_step = verifiable_steps[-1]
+    final_value = _to_number(chain.get("finalValue", 0))
+    if final_step and final_step["verifiable"] and _is_finite(final_value) and _is_finite(final_step["computedValue"]):
         rel_err = abs(final_step["computedValue"] - final_value) / max(abs(final_value), EPS)
         if rel_err > TOLERANCE:
             findings.append({
@@ -176,40 +219,43 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
                 "claimed": final_value, "computed": final_step["computedValue"],
             })
 
-    # magnitude guard (only if the author provided a plausible band)
     total_cap_factor = 1.0
-    if band:
+    if band and _is_finite(final_value):
         oom = _orders_outside(final_value, band)
         if oom >= 2:
             findings.append({
                 "kind": "magnitude_implausible", "label": "order of magnitude",
                 "message": f"Final answer {_fmt(final_value)} is ~{oom:.1f} orders of magnitude "
-                           f"outside the plausible range [{_fmt(band['low'])}–{_fmt(band['high'])}]. "
-                           f"A clean-looking method does not rescue an answer this far off.",
+                           f"outside the plausible range [{_fmt(band['low'])}–{_fmt(band['high'])}].",
                 "claimed": final_value, "computed": band["low"],
             })
             total_cap_factor = 0.35 if oom >= 3 else 0.5
 
-    # corrected D4 from count/severity of arithmetic findings (magnitude excluded)
+    could_verify = len(verifiable_steps) > 0 or (final_step is not None and final_step["verifiable"])
     arith_findings = [f for f in findings if f["kind"] != "magnitude_implausible"]
     n = len(arith_findings)
-    arithmetic_score = 5 if n == 0 else 3 if n == 1 else 2 if n == 2 else 1
 
-    summary = (
-        "Arithmetic verified: every step recomputes within tolerance and the final value is consistent."
-        if not findings
-        else f"{len(findings)} arithmetic issue(s) found by independent recomputation — "
-             "these are deterministic, not opinion."
-    )
+    if not could_verify:
+        arithmetic_score = None  # defer to LLM's read
+        summary = ("Arithmetic could not be independently recomputed from the steps provided, "
+                   "so the interviewer's assessment stands for this dimension.")
+    elif n == 0:
+        arithmetic_score = 5
+        summary = "Arithmetic verified: every recomputable step checks out within tolerance."
+    else:
+        arithmetic_score = 3 if n == 1 else 2 if n == 2 else 1
+        summary = (f"{n} arithmetic issue(s) found by independent recomputation of the steps "
+                   "that could be verified — these are deterministic, not opinion.")
 
     return {
         "findings": findings,
         "arithmeticScore": arithmetic_score,
+        "verifiableCount": len(verifiable_steps),
         "totalCapFactor": total_cap_factor,
         "summary": summary,
         "notChecked": (
-            "This backstop verifies internal arithmetic consistency only. It does NOT judge whether "
-            "the ASSUMPTIONS are realistic — that is scored by the LLM under the segmentation dimension."
+            "This backstop verifies internal arithmetic consistency of the steps it can reconstruct. "
+            "It does NOT judge whether the ASSUMPTIONS are realistic — that is scored under segmentation."
         ),
     }
 
@@ -230,12 +276,19 @@ def apply_backstop(
     chain: Dict[str, Any],
     band: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
-    """Combine LLM rubric dim scores + calc chain → final backstop-corrected score."""
     backstop = run_backstop(chain, band)
 
     corrected = dict(llm_dims)
-    corrected["arithmetic"] = backstop["arithmeticScore"]
-    arithmetic_overridden = backstop["arithmeticScore"] != llm_dims.get("arithmetic")
+    bs_score = backstop["arithmeticScore"]
+    if bs_score is None:
+        try:
+            corrected["arithmetic"] = max(1, min(5, int(round(float(llm_dims.get("arithmetic", 3))))))
+        except (TypeError, ValueError):
+            corrected["arithmetic"] = 3
+        arithmetic_overridden = False
+    else:
+        corrected["arithmetic"] = bs_score
+        arithmetic_overridden = bs_score != llm_dims.get("arithmetic")
 
     raw_total = _weighted_total(corrected)
     total = round(raw_total * backstop["totalCapFactor"])

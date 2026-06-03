@@ -33,15 +33,25 @@ You must ALSO transcribe the candidate's stated calculation into a structured ch
 server can verify the arithmetic. Transcribe ONLY what they actually wrote — do not fix or \
 invent steps. If they gave no usable numbers, return an empty steps array and finalValue 0.
 
-CalcChain format:
+CalcChain format — follow these rules EXACTLY so the chain fully recomputes:
 - steps: ordered list. Each step: {id, label, op, inputs, claimedValue, unit?}
-  - op ∈ "literal" | "add" | "subtract" | "multiply" | "divide" | "percent_of"
-  - inputs: numbers, or "#stepId" references to earlier steps. For "percent_of": [percent, "#baseId"] \
-where percent is like "60%" or 0.6.
-  - claimedValue: the number the CANDIDATE wrote for that step (transcribe their figure, even if wrong).
-  - "literal" steps are stated assumptions: inputs:[number], claimedValue:number.
-- finalValue: the candidate's stated final answer (number).
-- finalRef: the id of the step that is their final answer (optional).
+  - op ∈ "literal" | "add" | "subtract" | "multiply" | "divide" | "percent_of".
+  - **Base assumptions** (a raw number the candidate assumed, e.g. a population or a price): use \
+op "literal" and put the number in BOTH inputs (as a single number) and claimedValue — \
+e.g. {"id":"pop","label":"Bengaluru population","op":"literal","inputs":[14000000],"claimedValue":14000000}.
+  - **Derived steps**: inputs must be ONLY plain numbers or "#id" references to EARLIER steps — \
+never words, labels, or units. claimedValue = the number the candidate wrote for that step.
+  - "percent_of": inputs = [percent, "#baseId"] where percent is "12%" or 0.12 (NOT a #ref), and the \
+second input is the "#id" of the base it is a percentage of.
+  - Use plain numbers everywhere — NO commas, currency symbols, or unit suffixes like "L"/"K"/"cr" \
+inside inputs or claimedValue (write 24000, not "24K" or "₹24,000").
+- finalValue: the candidate's stated final answer (a plain number).
+- finalRef: the id of the step whose computed value IS the final answer. finalValue MUST equal that \
+step's computation. If the candidate blends or averages multiple scenarios, add an EXPLICIT step \
+(e.g. an "add" then "divide", or a weighted "add") that produces the blended number, and point \
+finalRef at THAT step — never point finalRef at a single sub-scenario.
+- Every derived step must trace back through #refs to literal steps so the whole chain recomputes \
+end-to-end. Do not leave a derived step's inputs empty.
 
 OUTPUT: return ONLY a valid JSON object, no markdown, exactly:
 {
