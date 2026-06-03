@@ -62,6 +62,9 @@ protagonist (a CXO/PE fund/founder), and the explicit decision to make. Self-con
 (e.g. "Estimate the break-even price if fixed costs are ₹50 cr and variable cost is ₹120/unit.").
 - framework_hint: ONE short line nudging the structure WITHOUT giving the answer \
 (e.g. "Think Profit = Revenue − Cost; split revenue into price × volume by segment.").
+- solution: a concise worked model solution (4-8 sentences) — the structure a strong candidate would \
+use, the key driver, the arithmetic with the ₹ numbers, and the recommendation. This is shown to the \
+candidate AFTER they submit, so it should teach how to solve, not just state the answer.
 
 # GUESSTIMATE
 - difficulty: one of "easy", "medium", "hard".
@@ -71,15 +74,17 @@ Pune in a year.").
 top-down or bottom-up, segment by a sensible driver, give a single point estimate, and sanity-check it.
 - approach_hint: ONE short line on a sensible starting point WITHOUT giving the answer \
 (e.g. "Start from Pune's population, funnel to households, two-wheeler ownership, EV share, replacement rate.").
+- solution: a concise worked estimation (4-8 sentences) — the segmentation path, each assumption with a \
+number, the multiplication chain to the final ₹/unit figure, and a one-line sanity check. Shown AFTER submit.
 
 OUTPUT FORMAT — return ONLY a valid JSON object, no markdown, exactly this shape:
 {
   "case": {
     "title": "...", "type": "...", "difficulty": "...",
-    "scenario": "...", "quant_ask": "...", "framework_hint": "..."
+    "scenario": "...", "quant_ask": "...", "framework_hint": "...", "solution": "..."
   },
   "guesstimate": {
-    "title": "...", "difficulty": "...", "prompt": "...", "approach_hint": "..."
+    "title": "...", "difficulty": "...", "prompt": "...", "approach_hint": "...", "solution": "..."
   }
 }
 """
@@ -135,6 +140,7 @@ def _compose_case_row(case: dict) -> dict:
         "difficulty": _coerce_difficulty(case.get("difficulty")),
         "content": content,
         "hint": _clean(case.get("framework_hint")) or None,
+        "solution": _clean(case.get("solution")) or None,
         "is_active": True,
     }
 
@@ -151,6 +157,7 @@ def _compose_guesstimate_row(guess: dict) -> dict:
         "difficulty": _coerce_difficulty(guess.get("difficulty")),
         "content": prompt,
         "hint": _clean(guess.get("approach_hint")) or None,
+        "solution": _clean(guess.get("solution")) or None,
         "is_active": True,
     }
 

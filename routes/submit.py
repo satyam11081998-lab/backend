@@ -5,9 +5,9 @@ scores them using OpenAI, saves to Supabase, and returns feedback.
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict, Optional, Any
 from services.supabase_client import get_supabase_client
-from services.ai_scorer import score_case_answer, AIScoringError
+from services.ai_scorer import score_case_answer, score_guesstimate_answer, AIScoringError
 from services.badge_awarder import award_badges_for_submission
 
 
@@ -21,24 +21,20 @@ class SubmissionRequest(BaseModel):
     answer_text: str = Field(..., min_length=50, description="User's answer (min 50 chars)")
 
 
-class FeedbackBreakdown(BaseModel):
-    """Score breakdown across 6 dimensions."""
-    structure: int = Field(..., ge=0, le=25)
-    quantitative: int = Field(..., ge=0, le=20)
-    synthesis: int = Field(..., ge=0, le=20)
-    business_judgment: int = Field(..., ge=0, le=15)
-    creativity: int = Field(..., ge=0, le=10)
-    presence: int = Field(..., ge=0, le=10)
-
-
 class SubmissionResponse(BaseModel):
-    """What the backend returns to the frontend after scoring."""
+    """What the backend returns to the frontend after scoring.
+
+    `breakdown` is a flexible {dimension: score} map: 6 dims for cases, 5 for
+    guesstimates (see `rubric`). `backstop` is present only for guesstimates.
+    """
     submission_id: str
     score: int = Field(..., ge=0, le=100)
-    breakdown: FeedbackBreakdown
+    breakdown: Dict[str, int]
     strengths: List[str]
     improvements: List[str]
     summary: str
+    rubric: str = "case"
+    backstop: Optional[Dict[str, Any]] = None
 
 
 @router.post("/submit", response_model=SubmissionResponse)
@@ -69,13 +65,21 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     case_content = case["content"]
     case_type = case["type"]
 
-    # Step 2: Score the answer using OpenAI
+    # Step 2: Score the answer using OpenAI.
+    # Guesstimates use the dedicated 5-dim rubric + deterministic arithmetic backstop
+    # (gpt-4o-mini); all other types use the standard 6-dim scorer (gpt-4o).
     try:
-        feedback = score_case_answer(
-            case_content=case_content,
-            case_type=case_type,
-            user_answer=submission.answer_text,
-        )
+        if case_type == "guesstimate":
+            feedback = score_guesstimate_answer(
+                case_content=case_content,
+                user_answer=submission.answer_text,
+            )
+        else:
+            feedback = score_case_answer(
+                case_content=case_content,
+                case_type=case_type,
+                user_answer=submission.answer_text,
+            )
     except AIScoringError as e:
         raise HTTPException(
             status_code=500,
@@ -168,10 +172,12 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
         return SubmissionResponse(
             submission_id=saved_submission["id"],
             score=feedback["score"],
-            breakdown=FeedbackBreakdown(**feedback["breakdown"]),
+            breakdown=feedback["breakdown"],
             strengths=feedback["strengths"],
             improvements=feedback["improvements"],
             summary=feedback["summary"],
+            rubric=feedback.get("rubric", "case"),
+            backstop=feedback.get("backstop"),
         )
 
     # Step 4: Update user's points (add the score to their cumulative total)
@@ -213,8 +219,10 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     return SubmissionResponse(
         submission_id=saved_submission["id"],
         score=feedback["score"],
-        breakdown=FeedbackBreakdown(**feedback["breakdown"]),
+        breakdown=feedback["breakdown"],
         strengths=feedback["strengths"],
         improvements=feedback["improvements"],
         summary=feedback["summary"],
+        rubric=feedback.get("rubric", "case"),
+        backstop=feedback.get("backstop"),
     )

@@ -17,6 +17,11 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from prompts.scoring_prompt import SCORING_SYSTEM_PROMPT, build_scoring_user_prompt
+from prompts.guesstimate_scoring_prompt import (
+    GUESSTIMATE_SCORING_SYSTEM_PROMPT,
+    build_guesstimate_user_prompt,
+)
+from services.guesstimate_backstop import apply_backstop, DIMENSIONS as GUESSTIMATE_DIMS
 
 load_dotenv()
 
@@ -30,6 +35,10 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Model selection - GPT-4o is reliable for structured output
 # Swap to "gpt-4o-mini" for ~10x cheaper if scoring quality acceptable
 SCORING_MODEL = "gpt-4o"
+
+# Guesstimates are arithmetic-driven and the deterministic backstop catches the math
+# the model would miss, so mini + backstop is the right cost/quality trade (~10x cheaper).
+GUESSTIMATE_SCORING_MODEL = "gpt-4o-mini"
 
 
 class AIScoringError(Exception):
@@ -110,3 +119,83 @@ def score_case_answer(
         )
 
     return feedback
+
+def score_guesstimate_answer(
+    case_content: str,
+    user_answer: str,
+) -> Dict[str, Any]:
+    """
+    Score a GUESSTIMATE answer: one gpt-4o-mini call returns the 5 rubric dims +
+    a transcribed calc-chain; the deterministic backstop then recomputes the math,
+    OVERRIDES the arithmetic dimension, and caps the total. We never trust the LLM's
+    own arithmetic.
+
+    Returns a feedback dict shaped for persistence + the results page:
+        score (0-100), breakdown (5 guesstimate dims, 1..5; arithmetic = backstop-corrected),
+        strengths, improvements, summary, rubric='guesstimate', backstop={...}
+    Raises AIScoringError on failure.
+    """
+    user_prompt = build_guesstimate_user_prompt(
+        case_content=case_content,
+        user_answer=user_answer,
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=GUESSTIMATE_SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": GUESSTIMATE_SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        raise AIScoringError(f"OpenAI API call failed (guesstimate): {str(e)}")
+
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        raise AIScoringError("OpenAI returned empty response (guesstimate)")
+
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        raise AIScoringError(
+            f"OpenAI returned invalid JSON (guesstimate): {str(e)}. Raw: {raw_content[:200]}"
+        )
+
+    dims = parsed.get("dimensions")
+    chain = parsed.get("calc_chain") or {"steps": [], "finalValue": 0}
+    if not isinstance(dims, dict):
+        raise AIScoringError("Guesstimate response missing 'dimensions'")
+
+    # Coerce each dimension to an int in 1..5; default to 3 if the model omitted one.
+    def _clamp_dim(v) -> int:
+        try:
+            n = int(round(float(v)))
+        except (TypeError, ValueError):
+            n = 3
+        return max(1, min(5, n))
+
+    llm_dims = {d: _clamp_dim(dims.get(d, 3)) for d in GUESSTIMATE_DIMS}
+
+    # Deterministic backstop: recompute the chain, override arithmetic, cap total.
+    # band is optional (not yet stored per-guesstimate) — magnitude guard simply off when absent.
+    final = apply_backstop(llm_dims, chain, band=None)
+
+    return {
+        "score": int(final["total"]),
+        "breakdown": final["dimensions"],   # 5 dims, 1..5; arithmetic is backstop-corrected
+        "strengths": parsed.get("strengths", []) or [],
+        "improvements": parsed.get("improvements", []) or [],
+        "summary": parsed.get("summary", "") or "",
+        "rubric": "guesstimate",
+        "backstop": {
+            "findings": final["backstop"]["findings"],
+            "summary": final["backstop"]["summary"],
+            "notChecked": final["backstop"]["notChecked"],
+            "arithmeticOverridden": final["arithmeticOverridden"],
+            "rawTotal": final["rawTotal"],
+            "totalCapFactor": final["backstop"]["totalCapFactor"],
+        },
+    }
