@@ -75,6 +75,9 @@ def resolve_chain(chain: Dict[str, Any], tolerance: float = TOLERANCE) -> List[D
     resolved to finite numbers). Only verifiable steps can ever be flagged.
     """
     steps = chain.get("steps", []) or []
+    if not isinstance(steps, list):
+        steps = []
+    steps = [s for s in steps if isinstance(s, dict)]
     by_id = {s.get("id"): s for s in steps if s.get("id") is not None}
     computed: Dict[str, float] = {}
     _verifiable: Dict[str, bool] = {}

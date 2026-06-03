@@ -79,6 +79,7 @@ def score_case_answer(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,  # Low temperature for consistent scoring
+            max_tokens=2500,  # Cap output to prevent runaway generation
             response_format={"type": "json_object"},  # Force JSON output
         )
     except Exception as e:
@@ -148,6 +149,7 @@ def score_guesstimate_answer(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
+            max_tokens=2500,  # Cap output to prevent runaway generation
             response_format={"type": "json_object"},
         )
     except Exception as e:
