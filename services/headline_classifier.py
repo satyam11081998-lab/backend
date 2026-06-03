@@ -69,12 +69,13 @@ For EACH headline you receive, output:
 
 Then identify the single STAR headline — the most GD-worthy one in the batch — and set is_star=true for it.
 
-OUTPUT FORMAT: valid JSON object with key "classified" containing an array. Each item must include the original title plus your additions. Preserve the original order.
+OUTPUT FORMAT: valid JSON object with key "classified" containing an array. Each item must include the original "index" (the integer index given in the input for that headline) and the original title, plus your additions. Preserve the original order.
 
 Example output structure:
 {
   "classified": [
     {
+      "index": 0,
       "title": "...",
       "gd_worthiness_score": 85,
       "keywords": ["RBI policy", "inflation"],
@@ -151,16 +152,35 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
     if not isinstance(classified_array, list) or len(classified_array) == 0:
         raise ClassificationError(f"Expected 'classified' array, got: {parsed}")
     
-    # Merge AI output back with original headline data
-    # AI may not return exact same count if it got confused — match by index/title
-    classified_by_title = {item.get("title", "").strip().lower(): item for item in classified_array}
-    
+    # Merge AI output back with original headline data.
+    # PRIMARY KEY = index (each input headline was given an integer "index";
+    # the model echoes it back). GPT lightly rewrites titles, so a title-only
+    # join silently misses → headlines fell to the fallback score → got filtered
+    # out → "saved 0". We now match by index first, then fall back to a
+    # normalized title, then to positional order, then to the neutral default.
+    def _norm(t: str) -> str:
+        return " ".join((t or "").strip().lower().split())
+
+    classified_by_index = {}
+    for item in classified_array:
+        idx = item.get("index")
+        try:
+            classified_by_index[int(idx)] = item
+        except (TypeError, ValueError):
+            pass  # item had no usable index; title/position fallback will cover it
+
+    classified_by_title = {_norm(item.get("title", "")): item for item in classified_array}
+
     results: List[ClassifiedHeadline] = []
     star_found = False
     
-    for original in raw_headlines:
-        title_key = original["title"].strip().lower()
-        ai_data = classified_by_title.get(title_key)
+    for i, original in enumerate(raw_headlines):
+        # 1) match by index, 2) by normalized title, 3) by position, 4) default
+        ai_data = classified_by_index.get(i)
+        if not ai_data:
+            ai_data = classified_by_title.get(_norm(original["title"]))
+        if not ai_data and i < len(classified_array):
+            ai_data = classified_array[i]
         
         if not ai_data:
             # Fallback: use neutral defaults if AI missed this headline
