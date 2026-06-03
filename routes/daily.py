@@ -38,6 +38,10 @@ class TodayHeadlineInfo(BaseModel):
 class TodayResponse(BaseModel):
     date: str  # YYYY-MM-DD in IST
     case: Optional[TodayCaseInfo]
+    # The daily guesstimate is a real `cases` row (type='guesstimate'); this is the
+    # attemptable object the frontend links to. `guesstimate_code` is kept for
+    # back-compat and now carries the same id.
+    guesstimate: Optional[TodayCaseInfo] = None
     guesstimate_code: Optional[str]
     guesstimate_title: Optional[str] = None
     brief: Optional[TodayHeadlineInfo]
@@ -111,25 +115,28 @@ async def get_today() -> TodayResponse:
     except Exception:
         pass
     
-    # Fetch guesstimate title if code exists
+    # The daily guesstimate is a real `cases` row; its id lives in guesstimate_code.
+    guess_obj = None
     guess_title = None
     guess_code = sched_row.get("guesstimate_code") if sched_row else None
     if guess_code:
         try:
-            guess_res = supabase.table("guesstimates") \
-                .select("title") \
-                .eq("code", guess_code) \
+            guess_res = supabase.table("cases") \
+                .select("id, title, type, difficulty") \
+                .eq("id", guess_code) \
                 .limit(1) \
                 .execute()
             guess_row = (guess_res.data or [None])[0] if guess_res and guess_res.data else None
             if guess_row:
+                guess_obj = TodayCaseInfo(**guess_row)
                 guess_title = guess_row.get("title")
         except Exception:
-            pass
-            
+            pass  # fool-proof: unresolved guesstimate → just null, no crash
+
     return TodayResponse(
         date=today,
         case=case_info,
+        guesstimate=guess_obj,
         guesstimate_code=guess_code,
         guesstimate_title=guess_title,
         brief=brief_info,

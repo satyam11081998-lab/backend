@@ -1,151 +1,201 @@
 """
 Content generator service using GPT-4o.
-Generates unique, challenging daily cases and guesstimates.
+
+Generates one fresh daily Case and one fresh daily Guesstimate.
+
+IMPORTANT (2026-06-02 fix): both are written as rows in the REAL `cases`
+table — columns: (title, type, difficulty, content, hint, is_active).
+The earlier version wrote to columns that do not exist (code, sector,
+root_cause, ...) and to a non-existent `guesstimates` table, so every
+insert hard-failed → /cron/schedule-daily 500 → no daily content ever.
+
+The guesstimate is stored as a normal case with type='guesstimate', so it
+flows through the same /cases/[id] → submit → AI-score → leaderboard path
+as every other case (nothing special needed downstream).
 """
 
 import os
 import json
-from typing import TypedDict, List
+from typing import List, Optional, Tuple
 from openai import OpenAI
 from services.supabase_client import get_supabase_client
 
-class GeneratedCase(TypedDict):
-    code: str
-    title: str
-    sector: str
-    source: str
-    problem: str
-    rootCause: str
-    keyInsight: str
-    framework: str
-    resolution: str
-    math: str
-    risks: str
 
-class GeneratedGuesstimate(TypedDict):
-    code: str
-    title: str
-    approach: str
-    keyDetail: str
-    result: str
+# These MUST match lib/constants.ts on the frontend.
+VALID_CASE_TYPES = {"profitability", "market_sizing", "growth", "guesstimate"}
+VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
 
 class GeneratorError(Exception):
     pass
 
-SYSTEM_PROMPT = """You are an expert McKinsey/BCG interviewer creating practice materials for Indian MBA students.
 
-Your task is to generate one highly challenging, MECE-compliant Case Study and one Guesstimate.
-These must be unique, non-repetitive, and deeply grounded in Indian business realities or global macroeconomics.
+def _coerce_type(value: Optional[str], default: str = "profitability") -> str:
+    """Normalise an AI-supplied type to a valid enum; never let a bad value reach the DB."""
+    v = (value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return v if v in VALID_CASE_TYPES else default
 
-# 1. CASE STUDY REQUIREMENTS
-- Must have a clear 'code' (e.g., 'GEN-C-01').
-- Sector: E.g., FMCG, Fintech, SaaS, Logistics, Retail, etc.
-- Source: "Generated (Expert Mode)"
-- Problem: The core prompt given to the candidate (2-3 sentences).
-- RootCause: The underlying reason for the problem.
-- KeyInsight: The non-obvious realization the candidate must reach.
-- Framework: Recommended structure (e.g., Profitability Tree, Market Entry, Value Chain).
-- Resolution: How the case is solved.
-- Math: A quantitative aspect they must solve (e.g., "Calculate break-even if fixed costs are 50Cr...").
-- Risks: 2-3 risks of the recommended resolution.
 
-# 2. GUESSTIMATE REQUIREMENTS
-- Must have a clear 'code' (e.g., 'GEN-G-01').
-- Title: E.g., "Estimate the daily revenue of a bustling Mumbai local train station."
-- Approach: Step-by-step logic (Top-down or Bottom-up).
-- KeyDetail: Specific assumptions (e.g., "Assume 30% peak hour traffic, average ticket Rs 15").
-- Result: The final estimated number.
+def _coerce_difficulty(value: Optional[str], default: str = "medium") -> str:
+    v = (value or "").strip().lower()
+    return v if v in VALID_DIFFICULTIES else default
 
-OUTPUT FORMAT: Return a valid JSON object strictly matching this shape:
+
+def _clean(value: Optional[str]) -> str:
+    return (value or "").strip()
+
+
+SYSTEM_PROMPT = """You are an expert McKinsey/BCG/Bain interviewer creating ORIGINAL daily practice \
+material for Indian MBA placement aspirants. You produce exactly ONE case study and ONE guesstimate.
+
+Everything must be freshly invented, India-flavoured (₹ figures, Indian sectors/companies/cities), \
+realistic, and self-contained. Never reuse a real published casebook scenario verbatim.
+
+# CASE STUDY
+- type: one of "profitability", "market_sizing", "growth" (NOT guesstimate).
+- difficulty: one of "easy", "medium", "hard".
+- title: a short, specific, candidate-facing title (no company name that exists in real life unless generic).
+- scenario: the full prompt the candidate reads and solves — 3-5 sentences. Set the situation, the \
+protagonist (a CXO/PE fund/founder), and the explicit decision to make. Self-contained: include the \
+2-3 concrete ₹ numbers the candidate needs (revenue, margin, volume, growth rate, etc.).
+- quant_ask: ONE specific quantitative thing they must compute, stated as a sentence \
+(e.g. "Estimate the break-even price if fixed costs are ₹50 cr and variable cost is ₹120/unit.").
+- framework_hint: ONE short line nudging the structure WITHOUT giving the answer \
+(e.g. "Think Profit = Revenue − Cost; split revenue into price × volume by segment.").
+
+# GUESSTIMATE
+- difficulty: one of "easy", "medium", "hard".
+- title: a short, specific estimation question (e.g. "Estimate the number of EV two-wheelers sold in \
+Pune in a year.").
+- prompt: 2-4 sentences telling the candidate exactly what to estimate, to state assumptions, choose \
+top-down or bottom-up, segment by a sensible driver, give a single point estimate, and sanity-check it.
+- approach_hint: ONE short line on a sensible starting point WITHOUT giving the answer \
+(e.g. "Start from Pune's population, funnel to households, two-wheeler ownership, EV share, replacement rate.").
+
+OUTPUT FORMAT — return ONLY a valid JSON object, no markdown, exactly this shape:
 {
-    "case": {
-        "code": "...", "title": "...", "sector": "...", "source": "...", "problem": "...",
-        "rootCause": "...", "keyInsight": "...", "framework": "...", "resolution": "...", "math": "...", "risks": "..."
-    },
-    "guesstimate": {
-        "code": "...", "title": "...", "approach": "...", "keyDetail": "...", "result": "..."
-    }
+  "case": {
+    "title": "...", "type": "...", "difficulty": "...",
+    "scenario": "...", "quant_ask": "...", "framework_hint": "..."
+  },
+  "guesstimate": {
+    "title": "...", "difficulty": "...", "prompt": "...", "approach_hint": "..."
+  }
 }
 """
 
+
 def generate_daily_content(recent_themes: List[str]) -> dict:
-    """Generate a new case and guesstimate using GPT-4o."""
+    """Call GPT-4o to produce one case + one guesstimate as a JSON object."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise GeneratorError("OPENAI_API_KEY not set")
-        
+
     client = OpenAI(api_key=api_key)
-    
-    user_prompt = "Generate a challenging MBA-level Case Study and Guesstimate.\n"
+
+    user_prompt = "Generate one challenging MBA-level Case Study and one Guesstimate for today.\n"
     if recent_themes:
-        user_prompt += f"DO NOT REPEAT or use themes closely related to these recent ones:\n{', '.join(recent_themes)}\n"
-        
+        joined = ", ".join(t for t in recent_themes if t)
+        if joined:
+            user_prompt += (
+                "Make them DISTINCT from these recent titles (different sector AND different "
+                f"mechanic):\n{joined}\n"
+            )
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            temperature=0.7,
+            temperature=0.8,
         )
-        
         raw_content = response.choices[0].message.content
         return json.loads(raw_content)
     except Exception as e:
-        raise GeneratorError(f"Failed to generate content: {e}")
+        raise GeneratorError(f"Failed to generate content: {type(e).__name__}: {e}")
 
-def save_generated_content():
-    """End-to-end: generate content, save to DB, and return IDs."""
+
+def _compose_case_row(case: dict) -> dict:
+    """Map the AI case object onto the real `cases` columns."""
+    scenario = _clean(case.get("scenario"))
+    quant_ask = _clean(case.get("quant_ask"))
+    if not scenario:
+        raise GeneratorError("Case scenario missing in AI response")
+
+    content = scenario
+    if quant_ask:
+        content = f"{scenario}\n\n**Quantitative ask:** {quant_ask}"
+
+    return {
+        "title": _clean(case.get("title")) or "Daily Case",
+        "type": _coerce_type(case.get("type"), default="profitability"),
+        "difficulty": _coerce_difficulty(case.get("difficulty")),
+        "content": content,
+        "hint": _clean(case.get("framework_hint")) or None,
+        "is_active": True,
+    }
+
+
+def _compose_guesstimate_row(guess: dict) -> dict:
+    """Map the AI guesstimate object onto the real `cases` columns (type forced to guesstimate)."""
+    prompt = _clean(guess.get("prompt"))
+    if not prompt:
+        raise GeneratorError("Guesstimate prompt missing in AI response")
+
+    return {
+        "title": _clean(guess.get("title")) or "Daily Guesstimate",
+        "type": "guesstimate",  # forced — this is what makes it an attemptable guesstimate
+        "difficulty": _coerce_difficulty(guess.get("difficulty")),
+        "content": prompt,
+        "hint": _clean(guess.get("approach_hint")) or None,
+        "is_active": True,
+    }
+
+
+def save_generated_content() -> dict:
+    """
+    End-to-end: generate one case + one guesstimate, insert BOTH as `cases` rows,
+    return their ids.
+
+    Returns: {"case_id": <uuid>, "guesstimate_id": <uuid>}
+    """
     supabase = get_supabase_client()
-    
-    # Get recent cases to avoid repetition
-    recent_cases = supabase.table("cases").select("title").order("created_at", desc=True).limit(10).execute()
-    recent_themes = [row["title"] for row in (recent_cases.data or [])]
-    
+
+    # Recent titles → anti-repeat signal for the prompt.
+    try:
+        recent = (
+            supabase.table("cases")
+            .select("title")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        recent_themes = [row["title"] for row in (recent.data or []) if row.get("title")]
+    except Exception:
+        recent_themes = []  # anti-repeat is best-effort, never block generation on it
+
     content = generate_daily_content(recent_themes)
     case_data = content.get("case")
     guess_data = content.get("guesstimate")
-    
     if not case_data or not guess_data:
-        raise GeneratorError("Missing case or guesstimate in AI response")
-        
-    # Append timestamp to code to ensure uniqueness
-    import time
-    ts = str(int(time.time()))
-    case_data["code"] = f"GEN-C-{ts}"
-    guess_data["code"] = f"GEN-G-{ts}"
-    
-    # Insert case
-    case_res = supabase.table("cases").insert({
-        "code": case_data["code"],
-        "title": case_data["title"],
-        "sector": case_data["sector"],
-        "source": case_data["source"],
-        "problem": case_data["problem"],
-        "root_cause": case_data.get("rootCause"),
-        "key_insight": case_data.get("keyInsight"),
-        "framework": case_data.get("framework"),
-        "resolution": case_data.get("resolution"),
-        "math": case_data.get("math"),
-        "risks": case_data.get("risks"),
-        "is_active": True
-    }).execute()
-    
+        raise GeneratorError("AI response missing 'case' or 'guesstimate'")
+
+    case_row = _compose_case_row(case_data)
+    guess_row = _compose_guesstimate_row(guess_data)
+
+    # Insert the case
+    case_res = supabase.table("cases").insert(case_row).execute()
+    if not case_res.data:
+        raise GeneratorError("Case insert returned no row")
     case_id = case_res.data[0]["id"]
-    
-    # Insert guesstimate
-    supabase.table("guesstimates").insert({
-        "code": guess_data["code"],
-        "title": guess_data["title"],
-        "approach": guess_data["approach"],
-        "key_detail": guess_data.get("keyDetail"),
-        "result": str(guess_data.get("result")),
-        "is_active": True
-    }).execute()
-    
-    return {
-        "case_id": case_id,
-        "guesstimate_code": guess_data["code"]
-    }
+
+    # Insert the guesstimate (as a case)
+    guess_res = supabase.table("cases").insert(guess_row).execute()
+    if not guess_res.data:
+        raise GeneratorError("Guesstimate insert returned no row")
+    guesstimate_id = guess_res.data[0]["id"]
+
+    return {"case_id": case_id, "guesstimate_id": guesstimate_id}

@@ -2,18 +2,30 @@ name: Daily News Fetcher (6:00 AM IST)
 
 on:
   schedule:
-    # 00:30 UTC is exactly 06:00 AM IST
+    # 00:30 UTC == 06:00 IST
     - cron: '30 0 * * *'
-  workflow_dispatch:  # Allows manual triggering
+  workflow_dispatch: {}  # manual trigger
 
 jobs:
   fetch-news:
     runs-on: ubuntu-latest
     steps:
-      - name: Hit /cron/fetch-news Endpoint
+      - name: Wake the backend (Render cold-start guard)
+        run: |
+          echo "Warming ${{ secrets.API_BASE_URL }} ..."
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "${{ secrets.API_BASE_URL }}/health" || true)
+            echo "  attempt $i -> HTTP $code"
+            [ "$code" = "200" ] && break
+            sleep 10
+          done
+
+      - name: Hit /cron/fetch-news
         run: |
           curl -X POST "${{ secrets.API_BASE_URL }}/cron/fetch-news" \
-          -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-          --retry 3 \
-          --retry-delay 10 \
-          --fail
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            --max-time 180 \
+            --retry 3 \
+            --retry-delay 15 \
+            --retry-all-errors \
+            --fail-with-body

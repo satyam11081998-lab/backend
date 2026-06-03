@@ -2,18 +2,30 @@ name: Daily Cases & Guesstimates Generator (00:01 AM IST)
 
 on:
   schedule:
-    # 18:31 UTC is 00:01 AM IST (next day)
+    # 18:31 UTC == 00:01 IST (next day)
     - cron: '31 18 * * *'
-  workflow_dispatch:  # Allows manual triggering
+  workflow_dispatch: {}  # manual trigger
 
 jobs:
   generate-content:
     runs-on: ubuntu-latest
     steps:
-      - name: Hit /cron/schedule-daily Endpoint
+      - name: Wake the backend (Render cold-start guard)
+        run: |
+          echo "Warming ${{ secrets.API_BASE_URL }} ..."
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "${{ secrets.API_BASE_URL }}/health" || true)
+            echo "  attempt $i -> HTTP $code"
+            [ "$code" = "200" ] && break
+            sleep 10
+          done
+
+      - name: Hit /cron/schedule-daily
         run: |
           curl -X POST "${{ secrets.API_BASE_URL }}/cron/schedule-daily" \
-          -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-          --retry 3 \
-          --retry-delay 10 \
-          --fail
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            --max-time 120 \
+            --retry 3 \
+            --retry-delay 15 \
+            --retry-all-errors \
+            --fail-with-body

@@ -1,0 +1,26 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Every minute; keep_alive.py decides whether to actually ping (7-min window).
+    - cron: '* * * * *'
+  workflow_dispatch: {}  # also runnable on demand from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Ping backend
+        env:
+          # Optional override; defaults to the production URL baked into keep_alive.py.
+          RENDER_URL: ${{ vars.RENDER_URL }}
+        run: python keep_alive.py
