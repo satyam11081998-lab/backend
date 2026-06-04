@@ -19,6 +19,7 @@ from services.supabase_client import get_supabase_client
 from services.brief_generator import generate_brief, BriefGenerationError
 from services.auth import get_verified_user_id
 from services.access_guard import assert_tier_at_least
+from services.rate_limit import check_rate_limit
 
 
 router = APIRouter(prefix="/news", tags=["news"])
@@ -157,6 +158,7 @@ async def generate_brief_for_headline(
     
     # GD briefs are a Lite+ feature — verify the caller and their tier.
     _uid = get_verified_user_id(supabase, authorization)
+    check_rate_limit(f"brief:{_uid}", max_calls=10, window_seconds=60)
     assert_tier_at_least(supabase, _uid, "lite")
 
     # Step 1: Check if brief already exists (cache hit = no AI call)

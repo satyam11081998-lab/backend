@@ -11,6 +11,7 @@ from services.ai_scorer import score_case_answer, score_guesstimate_answer, AISc
 from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
 from services.access_guard import assert_can_attempt
+from services.rate_limit import check_rate_limit
 
 
 router = APIRouter()
@@ -51,6 +52,7 @@ async def submit_answer(
 
     # AUTH: derive the user id from the verified Supabase JWT, never the body.
     submission.user_id = get_verified_user_id(supabase, authorization)
+    check_rate_limit(f"submit:{submission.user_id}", max_calls=15, window_seconds=60)
 
     # Step 1: Fetch the case content (AI needs the case prompt for context)
     try:
