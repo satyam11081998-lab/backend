@@ -3,12 +3,14 @@ Submission endpoint - receives case answers from the frontend,
 scores them using OpenAI, saves to Supabase, and returns feedback.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 from services.supabase_client import get_supabase_client
 from services.ai_scorer import score_case_answer, score_guesstimate_answer, AIScoringError
 from services.badge_awarder import award_badges_for_submission
+from services.auth import get_verified_user_id
+from services.access_guard import assert_can_attempt
 
 
 router = APIRouter()
@@ -38,11 +40,17 @@ class SubmissionResponse(BaseModel):
 
 
 @router.post("/submit", response_model=SubmissionResponse)
-async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
+async def submit_answer(
+    submission: SubmissionRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> SubmissionResponse:
     """
     Receive a case submission, score it with AI, save to Supabase, return feedback.
     """
     supabase = get_supabase_client()
+
+    # AUTH: derive the user id from the verified Supabase JWT, never the body.
+    submission.user_id = get_verified_user_id(supabase, authorization)
 
     # Step 1: Fetch the case content (AI needs the case prompt for context)
     try:
@@ -64,6 +72,9 @@ async def submit_answer(submission: SubmissionRequest) -> SubmissionResponse:
     case = case_result.data
     case_content = case["content"]
     case_type = case["type"]
+
+    # TIER / QUOTA GATE — runs BEFORE any OpenAI spend.
+    assert_can_attempt(supabase, submission.user_id, case)
 
     # Step 2: Score the answer using OpenAI.
     # Guesstimates use the dedicated 5-dim rubric + deterministic arithmetic backstop

@@ -12,11 +12,13 @@ Briefs are generated on-demand when users click a headline,
 then cached forever (shared across users — briefs aren't personalized).
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from typing import List, Optional
 from services.supabase_client import get_supabase_client
 from services.brief_generator import generate_brief, BriefGenerationError
+from services.auth import get_verified_user_id
+from services.access_guard import assert_tier_at_least
 
 
 router = APIRouter(prefix="/news", tags=["news"])
@@ -140,7 +142,10 @@ async def list_headlines() -> HeadlinesListResponse:
 # ============================================================
 
 @router.post("/briefs/{headline_id}", response_model=BriefResponse)
-async def generate_brief_for_headline(headline_id: str) -> BriefResponse:
+async def generate_brief_for_headline(
+    headline_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> BriefResponse:
     """
     Generate a GD brief for the given headline.
     If a brief already exists, returns the cached version (no AI call).
@@ -150,7 +155,11 @@ async def generate_brief_for_headline(headline_id: str) -> BriefResponse:
     """
     supabase = get_supabase_client()
     
-# Step 1: Check if brief already exists (cache hit = no AI call)
+    # GD briefs are a Lite+ feature — verify the caller and their tier.
+    _uid = get_verified_user_id(supabase, authorization)
+    assert_tier_at_least(supabase, _uid, "lite")
+
+    # Step 1: Check if brief already exists (cache hit = no AI call)
     try:
         existing_res = supabase.table("gd_briefs") \
             .select("*") \

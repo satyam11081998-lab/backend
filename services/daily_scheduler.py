@@ -11,7 +11,7 @@ that id back out of `cases`. No DB migration required.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from services.supabase_client import get_supabase_client
 from services.content_generator import save_generated_content, GeneratorError
 
@@ -22,6 +22,24 @@ def today_in_ist() -> datetime:
     """Return today's date as a datetime in IST."""
     now_ist = datetime.now(IST_OFFSET)
     return now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _fallback_from_existing(supabase) -> Optional[Dict[str, Any]]:
+    """If AI generation fails, schedule EXISTING active cases so the daily
+    surface is never empty (free-tier users can only attempt the daily pair).
+    Returns None only if the bank has no case or no guesstimate at all."""
+    try:
+        c = supabase.table("cases").select("id").eq("is_active", True) \
+            .neq("type", "guesstimate").order("created_at", desc=True).limit(1).execute()
+        g = supabase.table("cases").select("id").eq("is_active", True) \
+            .eq("type", "guesstimate").order("created_at", desc=True).limit(1).execute()
+        case_id = (c.data or [None])[0]["id"] if c and c.data else None
+        guess_id = (g.data or [None])[0]["id"] if g and g.data else None
+        if case_id and guess_id:
+            return {"case_id": case_id, "guesstimate_id": guess_id, "fallback": True}
+    except Exception:
+        pass
+    return None
 
 
 def fill_daily_schedule() -> Dict[str, Any]:
@@ -56,7 +74,10 @@ def fill_daily_schedule() -> Dict[str, Any]:
     try:
         generated = save_generated_content()
     except GeneratorError as e:
-        raise RuntimeError(f"AI Generation failed: {e}")
+        # Never leave the daily surface empty — fall back to existing active cases.
+        generated = _fallback_from_existing(supabase)
+        if not generated:
+            raise RuntimeError(f"AI Generation failed and no fallback case available: {e}")
 
     # Step 3: insert today's schedule row.
     # guesstimate_code stores the guesstimate CASE id (resolved by /daily/today).
