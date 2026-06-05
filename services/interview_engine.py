@@ -231,23 +231,28 @@ def score_conversation(
 # Clarification classifier
 # -----------------------------------------------------------------------------
 
-def looks_like_clarification(text: str) -> bool:
-    """Heuristic — decides whether a user turn should decrement the
-    clarification counter.
+def count_clarifications(text: str) -> int:
+    """Heuristic — counts how many clarification questions are in the turn.
 
-    A turn is a "clarification" if it ends in '?' OR opens with one of
-    a small set of interrogative phrases. Pure assertions ("I'll assume
-    the market is the US"), notes, and calculations do NOT consume quota.
+    Counts question marks. If none, but it opens with an interrogative phrase,
+    counts as 1. Prevents users from packing 5 questions into a single message
+    and only consuming 1 quota point.
     """
     if not text:
-        return False
+        return 0
+    
+    q_count = text.count("?")
+    if q_count > 0:
+        return q_count
+        
     stripped = text.strip().lower()
-    if stripped.endswith("?"):
-        return True
     openers = (
         "what ", "why ", "how ", "when ", "where ", "who ",
         "is ", "are ", "do ", "does ", "did ", "can ", "could ",
         "should ", "would ", "may ", "might ",
     )
     first = stripped.split("\n", 1)[0]
-    return any(first.startswith(o) for o in openers)
+    if any(first.startswith(o) for o in openers):
+        return 1
+        
+    return 0

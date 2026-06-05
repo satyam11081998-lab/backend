@@ -136,7 +136,12 @@ Return JSON with EXACTLY this shape (no extra keys, do not invent dimensions):
 {
   "score": <int 0-100>,
   "breakdown": {
-    "overall": <int 0-100>
+    "structure": <int 0-25>,
+    "quantitative": <int 0-20>,
+    "synthesis": <int 0-20>,
+    "business_judgment": <int 0-15>,
+    "creativity": <int 0-10>,
+    "presence": <int 0-10>
   },
   "strengths": [<3-5 short bullets - what the candidate did well>],
   "improvements": [<3-5 short bullets - concrete, actionable, specific to this session>],
@@ -144,7 +149,7 @@ Return JSON with EXACTLY this shape (no extra keys, do not invent dimensions):
 }
 
 Notes on the JSON:
-- breakdown.overall is the same integer as score for now. When the formal case rubric replaces this prompt, breakdown will be expanded to per-dimension scores; the calling code already accepts a flexible dict.
+- The `score` should be exactly the sum of the breakdown dimensions.
 - Keep strengths/improvements bullets to one sentence each. No headers, no bold, no markdown.
 """
 

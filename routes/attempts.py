@@ -28,7 +28,7 @@ from services.interview_engine import (
     stream_interviewer_reply,
     complete_interviewer_reply,
     score_conversation,
-    looks_like_clarification,
+    count_clarifications,
     InterviewEngineError,
 )
 from services.badge_awarder import award_badges_for_submission
@@ -329,7 +329,7 @@ async def post_message(
     transcript = _fetch_transcript(supabase, attempt_id)
 
     # Does this turn consume clarification quota?
-    is_clar = looks_like_clarification(body.content)
+    clar_count = count_clarifications(body.content)
     remaining = attempt["clarification_quota"] - attempt["clarification_used"]
     quota_exhausted = remaining <= 0
 
@@ -343,17 +343,17 @@ async def post_message(
                 "role": "user",
                 "kind": body.kind if body.kind in ("text", "voice", "image", "file") else "text",
                 "content": body.content,
-                "is_clarification": is_clar and not quota_exhausted,
+                "is_clarification": (clar_count > 0) and not quota_exhausted,
             }
         )
         .execute()
     )
     user_msg = user_row.data[0]
 
-    # If quota is exhausted AND this is a clarification, do not invoke AI.
+    # If quota is exhausted AND they asked a question, do not invoke AI.
     # Spec: "Further clarification questions should be disabled" but the
     # workspace stays open — the user can still post notes/calcs.
-    if is_clar and quota_exhausted:
+    if clar_count > 0 and quota_exhausted:
         return {
             "user_message": user_msg,
             "assistant_message": None,
@@ -363,16 +363,16 @@ async def post_message(
         }
 
     # Decrement quota if this counted.
-    if is_clar:
-        new_used = attempt["clarification_used"] + 1
+    if clar_count > 0:
+        new_used = attempt["clarification_used"] + clar_count
         supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
-        remaining -= 1
+        remaining -= clar_count
 
     # ---------- Stream assistant reply ----------
     def event_stream():
         chunks: List[str] = []
         try:
-            yield f"event: meta\ndata: {{\"clarification_remaining\": {remaining}, \"is_clarification\": {str(is_clar).lower()}}}\n\n"
+            yield f"event: meta\ndata: {{\"clarification_remaining\": {max(0, remaining)}, \"is_clarification\": {str(clar_count > 0).lower()}}}\n\n"
             for token in stream_interviewer_reply(
                 case_content=case["content"],
                 case_type=case["type"],
