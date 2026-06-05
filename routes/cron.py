@@ -55,7 +55,7 @@ async def cron_fetch_news(x_cron_secret: Optional[str] = Header(default=None)) -
     
     Idempotent on source_url — duplicate URLs are skipped by the UNIQUE constraint.
     
-    Should be called once daily via cron-job.org at ~9am IST.
+    Triggered daily at ~06:00 IST by GitHub Actions (.github/workflows).
     """
     verify_cron_secret(x_cron_secret)
     
@@ -232,10 +232,9 @@ async def cron_cleanup(x_cron_secret: Optional[str] = Header(default=None)) -> C
 @router.post("/schedule-daily", response_model=CronResponse)
 async def cron_schedule_daily(x_cron_secret: Optional[str] = Header(default=None)) -> CronResponse:
     """
-    Fill the daily_schedule table to maintain a 7-day-ahead buffer.
-    
-    Picks unused cases (60-day cooldown) and assigns them to empty slots
-    in the next 7 days. Idempotent.
+    Generate today's daily case + guesstimate via the AI generator and write
+    them to daily_schedule (today-only, idempotent). Falls back to existing
+    active cases if generation fails, so the daily surface is never empty.
     """
     verify_cron_secret(x_cron_secret)
     

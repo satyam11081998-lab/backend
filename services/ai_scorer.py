@@ -1,7 +1,7 @@
 """
 AI Scorer - calls OpenAI to evaluate case interview answers.
 
-This service is the bridge between Consilio's submission endpoint
+This service is the bridge between MECE's submission endpoint
 and the OpenAI API. It loads the scoring prompt, sends the user's
 answer for evaluation, parses the response, and returns structured
 feedback.
