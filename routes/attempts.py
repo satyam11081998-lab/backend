@@ -594,7 +594,7 @@ async def submit_attempt(
     ).eq("id", attempt_id).execute()
 
     # ---- Mirror case_attempts + points/badges logic from the legacy /submit ----
-    from datetime import datetime, timedelta, timezone as _tz
+    from datetime import timedelta, timezone as _tz
     IST = _tz(timedelta(hours=5, minutes=30))
     today_ist = datetime.now(IST).date().isoformat()
 
