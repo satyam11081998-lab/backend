@@ -21,7 +21,7 @@ class SubmissionRequest(BaseModel):
     """Data the frontend sends when a user submits a case answer."""
     user_id: str = Field(..., description="Supabase user ID")
     case_id: str = Field(..., description="Case being answered")
-    answer_text: str = Field(..., min_length=50, description="User's answer (min 50 chars)")
+    answer_text: str = Field(..., min_length=200, description="User's answer (min 200 chars)")
 
 
 class SubmissionResponse(BaseModel):
@@ -193,19 +193,38 @@ async def submit_answer(
             backstop=feedback.get("backstop"),
         )
 
-    # Step 4: Update user's points (add the score to their cumulative total)
+    # Step 4: Update user's points and streak (first attempt of the day)
     try:
-        # Fetch current points
-        user_result = supabase.table("users").select("points").eq(
+        # Fetch current points and streak
+        user_result = supabase.table("users").select("points, streak_count, streak_last_date").eq(
             "id", submission.user_id
         ).maybe_single().execute()
 
-        current_points = (user_result.data or {}).get("points", 0)
+        user_data = user_result.data or {}
+        current_points = user_data.get("points", 0)
         new_points = current_points + feedback["score"]
 
-        supabase.table("users").update({
-            "points": new_points
-        }).eq("id", submission.user_id).execute()
+        update_payload = {"points": new_points}
+
+        last_date = user_data.get("streak_last_date")
+        current_streak = user_data.get("streak_count", 0)
+        if last_date != today_ist:
+            from datetime import datetime, timedelta
+            try:
+                last_date_obj = datetime.fromisoformat(last_date).date() if last_date else None
+            except (ValueError, TypeError):
+                last_date_obj = None
+            
+            today_obj = datetime.fromisoformat(today_ist).date()
+            if last_date_obj and last_date_obj == today_obj - timedelta(days=1):
+                new_streak = current_streak + 1
+            else:
+                new_streak = 1
+                
+            update_payload["streak_count"] = new_streak
+            update_payload["streak_last_date"] = today_ist
+
+        supabase.table("users").update(update_payload).eq("id", submission.user_id).execute()
 
         print(f"Updated user {submission.user_id} points: {current_points} -> {new_points}")
     except Exception as e:
