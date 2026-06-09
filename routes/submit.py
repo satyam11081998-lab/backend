@@ -72,6 +72,8 @@ async def submit_answer(
         )
 
     case = case_result.data
+    if case.get("is_active") is False:
+        raise HTTPException(status_code=404, detail="This case is no longer available.")
     case_content = case["content"]
     case_type = case["type"]
 
