@@ -74,16 +74,23 @@ class BriefResponse(BaseModel):
 # ============================================================
 
 @router.get("/headlines", response_model=HeadlinesListResponse)
-async def list_headlines() -> HeadlinesListResponse:
+async def list_headlines(
+    authorization: Optional[str] = Header(default=None),
+) -> HeadlinesListResponse:
     """
     Return today's curated headlines, sorted by:
     - Star headline first (is_star = true)
     - Then descending by gd_worthiness_score
-    
+
     Frontend uses this to render the Inshorts-style list view.
+    GD Briefs is a Lite+ feature — caller must be authenticated and on Lite/Pro.
     """
     supabase = get_supabase_client()
-    
+    # Tier gate (was previously unauthenticated — free users / anon could read).
+    _uid = get_verified_user_id(supabase, authorization)
+    check_rate_limit(f"headlines:{_uid}", max_calls=30, window_seconds=60)
+    assert_tier_at_least(supabase, _uid, "lite")
+
     try:
         # Fetch headlines from last 14 days (cron deletes older)
         headlines_res = supabase.table("news_headlines") \
@@ -285,16 +292,26 @@ async def generate_brief_for_headline(
 # ============================================================
 
 @router.get("/briefs/{headline_id}", response_model=BriefResponse)
-async def get_brief(headline_id: str) -> BriefResponse:
+async def get_brief(
+    headline_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> BriefResponse:
     """
     Fetch an existing brief. Does NOT generate a new one.
     Returns 404 if no brief exists yet for this headline.
-    
+
     Used by frontend when navigating to /gd-briefs/[id] from a list item
     where has_brief=true.
+
+    GD Briefs is a Lite+ feature. This read path was previously UNGATED, so a
+    free/anon caller could pull any cached brief straight from the API. Now it
+    requires a verified JWT and Lite/Pro tier, matching the POST generate path.
     """
     supabase = get_supabase_client()
-    
+    _uid = get_verified_user_id(supabase, authorization)
+    check_rate_limit(f"brief_get:{_uid}", max_calls=30, window_seconds=60)
+    assert_tier_at_least(supabase, _uid, "lite")
+
     try:
         brief_res = supabase.table("gd_briefs") \
             .select("*") \
