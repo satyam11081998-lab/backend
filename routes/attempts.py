@@ -42,7 +42,11 @@ router = APIRouter(prefix="/attempts", tags=["attempts"])
 # Free users only attempt the daily anyway; the same 5-cap reads as fair.
 # -----------------------------------------------------------------------------
 
-CLARIFICATION_QUOTA = {"free": 5, "lite": 5, "pro": 15}
+# Tier -> clarification (AI hint) quota. Free = 0 to match the pricing page
+# ("no AI hints") and TIER_LIMITS.free.maxHintQuestions. Free users can still
+# post structure and get scored on the daily case; they just can't spend AI
+# clarification questions. Lite = 5, Pro = 15.
+CLARIFICATION_QUOTA = {"free": 0, "lite": 5, "pro": 15}
 
 # Soft cap on total messages per attempt — prevents runaway sessions.
 MAX_MESSAGES_PER_ATTEMPT = 200
@@ -136,6 +140,8 @@ def _load_case(supabase, case_id: str) -> dict:
     row = supabase.table("cases").select("*").eq("id", case_id).maybe_single().execute()
     if not row.data:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+    if row.data.get("is_active") is False:
+        raise HTTPException(status_code=404, detail="This case is no longer available.")
     return row.data
 
 
