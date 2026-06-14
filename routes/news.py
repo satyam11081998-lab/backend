@@ -20,6 +20,8 @@ from services.brief_generator import generate_brief, BriefGenerationError
 from services.auth import get_verified_user_id
 from services.access_guard import assert_tier_at_least
 from services.rate_limit import check_rate_limit
+from services.news_pipeline import ensure_fresh_headlines
+from datetime import datetime, timedelta, timezone
 
 
 router = APIRouter(prefix="/news", tags=["news"])
@@ -91,15 +93,33 @@ async def list_headlines(
     check_rate_limit(f"headlines:{_uid}", max_calls=30, window_seconds=60)
     assert_tier_at_least(supabase, _uid, "lite")
 
+    # Self-heal: if the freshest stored headline is >24h old (or none exist),
+    # refresh before returning so the user never lands on stale news. Best-effort —
+    # a news-API hiccup must never break the read path.
     try:
-        # Fetch headlines from last 14 days (cron deletes older)
-        headlines_res = supabase.table("news_headlines") \
-            .select("*") \
-            .order("is_star", desc=True) \
-            .order("gd_worthiness_score", desc=True) \
+        ensure_fresh_headlines()
+    except Exception as e:
+        print(f"Warning: self-heal refresh failed: {e}")
+
+    # Show the LATEST news first (not the highest-scored from the whole retention
+    # window): star pinned -> newest published -> score as tiebreaker. Window to
+    # the last 3 days; fall back to most-recent-regardless if that window is empty.
+    window_start = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+
+    def _query_headlines(windowed: bool):
+        q = supabase.table("news_headlines").select("*")
+        if windowed:
+            q = q.gte("fetched_at", window_start)
+        return q.order("is_star", desc=True) \
             .order("published_at", desc=True) \
+            .order("gd_worthiness_score", desc=True) \
             .limit(20) \
             .execute()
+
+    try:
+        headlines_res = _query_headlines(windowed=True)
+        if not (headlines_res.data or []):
+            headlines_res = _query_headlines(windowed=False)
     except Exception as e:
         raise HTTPException(
             status_code=500,
