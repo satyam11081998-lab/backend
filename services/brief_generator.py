@@ -11,7 +11,7 @@ The brief includes:
 - 2-3 opening lines (how to start the discussion)
 - 3-4 counter-arguments (what the other side would say)
 - 2-3 closing lines (how to wrap)
-- Plain-English summary (2-3 sentences)
+- Neutral context summary (a substantive 5-7 sentence paragraph)
 
 Designed for Indian MBA / PGDM students preparing for placement GDs at
 top consulting, IB, and FMCG firms.
@@ -73,6 +73,15 @@ QUALITY STANDARDS — read carefully:
 5. CLOSING LINES must SYNTHESIZE, not summarize. Pull together threads, name the
    central tension, leave the panel with a memorable takeaway.
 
+6. SUMMARY — this is the candidate's context anchor. It must be a substantive,
+   NEUTRAL paragraph (about 5-7 sentences, 120-180 words), not a one-liner. Give:
+   (a) what actually happened, (b) the essential background needed to understand it,
+   (c) why it is GD-relevant, and (d) the central tension. Represent the issue
+   FAIRLY — state the genuine positions on each side at a factual level; do NOT take
+   a side, editorialise, pre-judge the "right" answer, or flatten the debate into a
+   single viewpoint. A candidate reading only the summary must come away with an
+   accurate, balanced picture of the topic — never a distorted or mis-framed one.
+
 GD TYPE CLASSIFICATION:
 - "Abstract" — topic is broad/philosophical (e.g., "Is regulation always bad?")
 - "Case-based" — topic requires applying frameworks (e.g., "Should Reliance enter X?")
@@ -84,7 +93,7 @@ Avoid corporate clichés. No "synergies", "leverage", "unlock value" without spe
 
 OUTPUT FORMAT: valid JSON object with these exact keys:
 {
-  "summary": "2-3 sentence plain-English summary of the news + GD relevance",
+  "summary": "A substantive, neutral context paragraph (about 5-7 sentences / 120-180 words): what happened, the essential background, why it matters for the GD, and the central tension — fairly stated, without taking a side or omitting the opposing position",
   "gd_type": "Abstract" | "Case-based" | "Opinion" | "Trend-analytical",
   "likely_questions": ["question 1", "question 2", "question 3"],
   "smart_angles": ["angle 1", "angle 2", "angle 3", "angle 4"],
