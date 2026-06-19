@@ -24,6 +24,7 @@ from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user_id
 from services.access_guard import assert_can_attempt, effective_tier
 from services.rate_limit import check_rate_limit
+from services.limits import MESSAGE_MAX_CHARS, RECOMMENDATION_MAX_CHARS
 from services.interview_engine import (
     stream_interviewer_reply,
     complete_interviewer_reply,
@@ -98,12 +99,12 @@ class AttemptDetail(BaseModel):
 
 
 class PostMessageRequest(BaseModel):
-    content: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=MESSAGE_MAX_CHARS)
     kind: str = Field("text", description="text | voice | image | file")
 
 
 class SubmitRequest(BaseModel):
-    final_recommendation: str = Field(..., min_length=20)
+    final_recommendation: str = Field(..., min_length=20, max_length=RECOMMENDATION_MAX_CHARS)
 
 
 class SubmitResponse(BaseModel):

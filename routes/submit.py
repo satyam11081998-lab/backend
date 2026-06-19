@@ -12,6 +12,7 @@ from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
 from services.access_guard import assert_can_attempt
 from services.rate_limit import check_rate_limit
+from services.limits import ANSWER_MAX_CHARS
 
 
 router = APIRouter()
@@ -21,7 +22,7 @@ class SubmissionRequest(BaseModel):
     """Data the frontend sends when a user submits a case answer."""
     user_id: str = Field(..., description="Supabase user ID")
     case_id: str = Field(..., description="Case being answered")
-    answer_text: str = Field(..., min_length=200, description="User's answer (min 200 chars)")
+    answer_text: str = Field(..., min_length=200, max_length=ANSWER_MAX_CHARS, description="User's answer (200..20000 chars)")
 
 
 class SubmissionResponse(BaseModel):
