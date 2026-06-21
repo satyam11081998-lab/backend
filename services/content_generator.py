@@ -96,7 +96,10 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
     if not api_key:
         raise GeneratorError("OPENAI_API_KEY not set")
 
-    client = OpenAI(api_key=api_key)
+    # Bounded so a slow/hung OpenAI call fails FAST (→ daily_scheduler falls back to
+    # existing cases) instead of tying up the Render worker until the cron times out.
+    # max_retries lets the SDK ride out transient 429/5xx before giving up.
+    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=2)
 
     user_prompt = "Generate one challenging MBA-level Case Study and one Guesstimate for today.\n"
     if recent_themes:
@@ -118,9 +121,16 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
             temperature=0.8,
         )
         raw_content = response.choices[0].message.content
+    except Exception as e:
+        raise GeneratorError(f"OpenAI request failed: {type(e).__name__}: {e}")
+
+    if not raw_content or not raw_content.strip():
+        raise GeneratorError("Model returned empty content")
+
+    try:
         return json.loads(raw_content)
     except Exception as e:
-        raise GeneratorError(f"Failed to generate content: {type(e).__name__}: {e}")
+        raise GeneratorError(f"Model returned non-JSON content: {type(e).__name__}: {e}")
 
 
 def _compose_case_row(case: dict) -> dict:
