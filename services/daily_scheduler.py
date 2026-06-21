@@ -73,11 +73,16 @@ def fill_daily_schedule() -> Dict[str, Any]:
     # Step 2: generate (case + guesstimate, both as cases rows)
     try:
         generated = save_generated_content()
-    except GeneratorError as e:
-        # Never leave the daily surface empty — fall back to existing active cases.
+    except Exception as e:
+        # ANY generation failure (GeneratorError, OpenAI rate-limit/timeout, network,
+        # JSON parse, etc.) must NOT leave the daily surface empty — free-tier users
+        # can only attempt the daily pair. Fall back to existing active cases.
         generated = _fallback_from_existing(supabase)
         if not generated:
-            raise RuntimeError(f"AI Generation failed and no fallback case available: {e}")
+            raise RuntimeError(
+                f"AI generation failed ({type(e).__name__}: {e}) and no fallback "
+                f"case/guesstimate available in the bank"
+            )
 
     # Step 3: insert today's schedule row.
     # guesstimate_code stores the guesstimate CASE id (resolved by /daily/today).

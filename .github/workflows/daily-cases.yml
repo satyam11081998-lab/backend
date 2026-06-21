@@ -13,7 +13,7 @@ jobs:
       - name: Wake the backend (Render cold-start guard)
         run: |
           echo "Warming ${{ secrets.API_BASE_URL }} ..."
-          for i in 1 2 3 4 5 6; do
+          for i in 1 2 3 4 5 6 7 8 9 10; do
             code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "${{ secrets.API_BASE_URL }}/health" || true)
             echo "  attempt $i -> HTTP $code"
             [ "$code" = "200" ] && break
@@ -24,8 +24,8 @@ jobs:
         run: |
           curl -X POST "${{ secrets.API_BASE_URL }}/cron/schedule-daily" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-            --max-time 120 \
-            --retry 3 \
+            --max-time 300 \
+            --retry 5 \
             --retry-delay 15 \
             --retry-all-errors \
             --fail-with-body

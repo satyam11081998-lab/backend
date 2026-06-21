@@ -89,6 +89,7 @@ def run_news_refresh() -> dict:
     max_results = 50
     total_fetched = 0
     total_classified = 0
+    fetch_error: Optional[str] = None
 
     while len(top_headlines) < 10 and page <= 5:
         try:
@@ -120,11 +121,12 @@ def run_news_refresh() -> dict:
             max_results = 20
 
         except Exception as e:
-            if page == 1:
-                raise RuntimeError(f"Failed to fetch news on first try: {type(e).__name__}: {e}")
-            else:
-                print(f"Warning: Fetch loop failed on page {page}: {e}")
-                break
+            # Don't fail the whole cron on a transient news-API outage: log it,
+            # stop fetching, and keep whatever we already have. Existing stored
+            # headlines remain; the self-heal path retries later.
+            fetch_error = f"{type(e).__name__}: {e}"
+            print(f"Warning: news fetch failed on page {page}: {fetch_error}")
+            break
 
     # Trim to Top 20 (star first, then by score)
     top_headlines = sorted(
@@ -134,10 +136,12 @@ def run_news_refresh() -> dict:
     if not top_headlines:
         return {
             "status": "warning",
-            "message": "No headlines survived classification or none fetched",
+            "message": "No headlines survived classification or none fetched"
+                       + (f" (fetch error: {fetch_error})" if fetch_error else ""),
             "fetched": total_fetched,
             "classified": total_classified,
             "saved": 0,
+            "fetch_error": fetch_error,
         }
 
     supabase = get_supabase_client()

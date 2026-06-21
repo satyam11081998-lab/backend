@@ -1,26 +1,43 @@
 name: Keep Render Alive
 
+# Pings /health every ~10 min so the free-tier Render dyno never sleeps long
+# enough (Render sleeps after ~15 min idle) to cold-start the daily jobs.
+#
+# Replaces the old `* * * * *` (every-minute) + keep_alive.py "7-minute window"
+# scheme: GitHub heavily throttles/skips minute-level schedules, so the chosen
+# minute was frequently missed → gaps > 15 min → the dyno slept anyway. A plain
+# every-10-min curl is dependency-free and reliable within GitHub's scheduling
+# granularity.
+#
+# Optional secret: API_BASE_URL (falls back to the production URL below).
+# NOTE: GitHub may still delay scheduled runs under load, and disables schedules
+# after 60 days of repo inactivity. For guaranteed always-on, use a paid (non-
+# sleeping) Render instance, or an external uptime pinger (cron-job.org /
+# UptimeRobot) on /health every 5 min.
+
 on:
   schedule:
-    # Every minute; keep_alive.py decides whether to actually ping (7-min window).
-    - cron: '* * * * *'
-  workflow_dispatch: {}  # also runnable on demand from the Actions tab
+    - cron: "*/10 * * * *" # every 10 minutes (< Render's 15-min sleep)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: true
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Ping backend
-        env:
-          # Optional override; defaults to the production URL baked into keep_alive.py.
-          RENDER_URL: ${{ vars.RENDER_URL }}
-        run: python keep_alive.py
+      - name: Ping /health (best-effort, warms the dyno)
+        run: |
+          BASE="${{ secrets.API_BASE_URL }}"
+          [ -z "$BASE" ] && BASE="https://consilio-backend.onrender.com"
+          BASE="${BASE%/}"
+          echo "Pinging $BASE/health"
+          curl -sS -o /dev/null -w 'health: %{http_code} in %{time_total}s\n' \
+            --max-time 90 --retry 3 --retry-all-errors --retry-delay 12 \
+            "$BASE/health" || echo "keep-alive ping failed (non-fatal)"
