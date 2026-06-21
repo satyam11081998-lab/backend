@@ -124,7 +124,9 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
         f"Headlines:\n{json.dumps(headlines_for_ai, ensure_ascii=False, indent=2)}"
     )
     
-    client = OpenAI(api_key=api_key)
+    # Bounded so a hung classify call fails fast (run_news_refresh treats a page
+    # failure as non-fatal) instead of stalling the news cron.
+    client = OpenAI(api_key=api_key, timeout=45.0, max_retries=2)
     
     try:
         response = client.chat.completions.create(

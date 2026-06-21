@@ -85,13 +85,14 @@ async def list_headlines(
     - Then descending by gd_worthiness_score
 
     Frontend uses this to render the Inshorts-style list view.
-    GD Briefs is a Lite+ feature — caller must be authenticated and on Lite/Pro.
+    Visible to all signed-in users (free included); only brief generation/viewing is Lite/Pro.
     """
     supabase = get_supabase_client()
-    # Tier gate (was previously unauthenticated — free users / anon could read).
+    # The NEWS LIST is visible to every signed-in user (free included) — seeing
+    # the day's GD-worthy headlines is free. GENERATING / VIEWING a brief stays
+    # Lite/Pro (gated on the two /briefs/* endpoints below). Auth + rate-limit only.
     _uid = get_verified_user_id(supabase, authorization)
     check_rate_limit(f"headlines:{_uid}", max_calls=30, window_seconds=60)
-    assert_tier_at_least(supabase, _uid, "lite")
 
     # Self-heal: if the freshest stored headline is >24h old (or none exist),
     # refresh before returning so the user never lands on stale news. Best-effort —
