@@ -88,26 +88,11 @@ Example output structure:
 """
 
 
-def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
-    """
-    Classify a batch of raw headlines using OpenAI.
-    
-    Input: list of dicts from news_fetcher (RawHeadline shape)
-    Output: list of ClassifiedHeadline with AI-added fields
-    
-    Strategy: send all headlines in ONE API call (batch) to minimize cost.
-    GPT-4o-mini at ~40 headlines costs ~₹1-2 per classification run.
-    
-    Raises ClassificationError on AI failure. Caller should fall back gracefully.
-    """
-    if not raw_headlines:
-        return []
-    
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ClassificationError("OPENAI_API_KEY not set")
-    
-    # Prepare input: just titles + descriptions for AI context (save tokens)
+CHUNK_SIZE = 20  # keep each OpenAI call small so it finishes well under the timeout
+
+
+def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[ClassifiedHeadline]:
+    """Classify ONE small batch in a single OpenAI call. Raises ClassificationError on failure."""
     headlines_for_ai = [
         {
             "index": i,
@@ -117,20 +102,16 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
         }
         for i, h in enumerate(raw_headlines)
     ]
-    
+
     user_message = (
         f"Classify these {len(raw_headlines)} headlines for MBA GD-worthiness. "
         f"Identify the single most GD-worthy as the star.\n\n"
         f"Headlines:\n{json.dumps(headlines_for_ai, ensure_ascii=False, indent=2)}"
     )
-    
-    # Bounded so a hung classify call fails fast (run_news_refresh treats a page
-    # failure as non-fatal) instead of stalling the news cron.
-    client = OpenAI(api_key=api_key, timeout=45.0, max_retries=2)
-    
+
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # cheap, plenty smart for this task
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -140,26 +121,20 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
         )
     except Exception as e:
         raise ClassificationError(f"OpenAI API call failed: {type(e).__name__}: {e}")
-    
+
     raw_content = response.choices[0].message.content
     if not raw_content:
         raise ClassificationError("OpenAI returned empty response")
-    
+
     try:
         parsed = json.loads(raw_content)
     except json.JSONDecodeError as e:
         raise ClassificationError(f"OpenAI returned invalid JSON: {e}")
-    
+
     classified_array = parsed.get("classified", [])
     if not isinstance(classified_array, list) or len(classified_array) == 0:
         raise ClassificationError(f"Expected 'classified' array, got: {parsed}")
-    
-    # Merge AI output back with original headline data.
-    # PRIMARY KEY = index (each input headline was given an integer "index";
-    # the model echoes it back). GPT lightly rewrites titles, so a title-only
-    # join silently misses → headlines fell to the fallback score → got filtered
-    # out → "saved 0". We now match by index first, then fall back to a
-    # normalized title, then to positional order, then to the neutral default.
+
     def _norm(t: str) -> str:
         return " ".join((t or "").strip().lower().split())
 
@@ -169,23 +144,19 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
         try:
             classified_by_index[int(idx)] = item
         except (TypeError, ValueError):
-            pass  # item had no usable index; title/position fallback will cover it
+            pass
 
     classified_by_title = {_norm(item.get("title", "")): item for item in classified_array}
 
     results: List[ClassifiedHeadline] = []
-    star_found = False
-    
     for i, original in enumerate(raw_headlines):
-        # 1) match by index, 2) by normalized title, 3) by position, 4) default
         ai_data = classified_by_index.get(i)
         if not ai_data:
             ai_data = classified_by_title.get(_norm(original["title"]))
         if not ai_data and i < len(classified_array):
             ai_data = classified_array[i]
-        
+
         if not ai_data:
-            # Fallback: use neutral defaults if AI missed this headline
             print(f"WARNING: AI didn't classify headline: {original['title'][:60]}")
             ai_data = {
                 "gd_worthiness_score": 5,
@@ -193,12 +164,7 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
                 "category": "other",
                 "is_star": False,
             }
-        
-        # Ensure we only have ONE star (defensive — AI sometimes flags multiple)
-        is_star = bool(ai_data.get("is_star", False)) and not star_found
-        if is_star:
-            star_found = True
-        
+
         results.append({
             "title": original["title"],
             "description": original.get("description"),
@@ -209,14 +175,50 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
             "gd_worthiness_score": max(0, min(100, int(ai_data.get("gd_worthiness_score", 50)))),
             "keywords": [str(k).strip() for k in ai_data.get("keywords", [])][:4],
             "category": str(ai_data.get("category", "other")).lower(),
-            "is_star": is_star,
+            "is_star": False,  # star is chosen globally in classify_headlines()
         })
-    
-    # If AI didn't pick a star (rare), promote highest scorer
-    if not star_found and results:
-        top = max(range(len(results)), key=lambda i: results[i]["gd_worthiness_score"])
-        results[top]["is_star"] = True
-    
+
+    return results
+
+
+def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
+    """
+    Classify headlines using OpenAI, in small chunks so a large batch can't blow
+    the per-call timeout. The old single ~60-item call hit APITimeoutError and
+    lost the entire run ("saved 0"); now each chunk of CHUNK_SIZE is classified
+    independently, a failed chunk is skipped (its headlines are dropped) rather
+    than failing everything, and exactly one global star (highest score) is set
+    at the end.
+
+    Raises ClassificationError only if EVERY chunk fails.
+    """
+    if not raw_headlines:
+        return []
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ClassificationError("OPENAI_API_KEY not set")
+
+    # Small chunks -> 60s + 1 retry is ample headroom per call.
+    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
+
+    results: List[ClassifiedHeadline] = []
+    errors: List[str] = []
+    for start in range(0, len(raw_headlines), CHUNK_SIZE):
+        chunk = raw_headlines[start:start + CHUNK_SIZE]
+        try:
+            results.extend(_classify_batch(chunk, client))
+        except ClassificationError as e:
+            errors.append(str(e))
+            print(f"Warning: classification chunk {start // CHUNK_SIZE + 1} failed: {e}")
+            continue
+
+    if not results:
+        raise ClassificationError("All classification chunks failed: " + "; ".join(errors[:3]))
+
+    # Exactly one global star = highest GD score across all surviving chunks.
+    top = max(range(len(results)), key=lambda i: results[i]["gd_worthiness_score"])
+    results[top]["is_star"] = True
     return results
 
 
