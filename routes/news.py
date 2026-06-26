@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from services.supabase_client import get_supabase_client
 from services.brief_generator import generate_brief, BriefGenerationError
+from services.abstract_gd_generator import generate_abstract_brief, AbstractBriefError
 from services.auth import get_verified_user_id
 from services.access_guard import assert_tier_at_least
 from services.rate_limit import check_rate_limit
@@ -383,3 +384,54 @@ async def get_brief(
         closing_lines=b.get("closing_lines") or ([b["how_to_close"]] if b.get("how_to_close") else []),
         created_at=b["created_at"],
     )
+
+
+# ============================================================
+# Endpoint: Abstract GD brief (on-demand, not news-based)
+# ============================================================
+
+class AbstractBriefRequest(BaseModel):
+    topic: str
+
+
+class AbstractBriefResponse(BaseModel):
+    topic: str
+    interpretations: List[str]
+    idea_pool: List[str]
+    lenses: List[str]
+    balanced_for: List[str]
+    balanced_against: List[str]
+    analogies: List[str]
+    sample_structure: List[str]
+    pitfalls: List[str]
+    opening_lines: List[str]
+    closing_lines: List[str]
+
+
+@router.post("/abstract-brief", response_model=AbstractBriefResponse)
+async def generate_abstract_gd_brief(
+    body: AbstractBriefRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> AbstractBriefResponse:
+    """
+    Generate an Abstract GD brief for any abstract topic (a word/phrase/proverb).
+    Teaches how to crack THIS topic and, by repetition, the method for any abstract
+    topic. Lite/Pro gated, rate-limited; generated on demand (not stored).
+    """
+    supabase = get_supabase_client()
+    _uid = get_verified_user_id(supabase, authorization)
+    check_rate_limit(f"abstract_brief:{_uid}", max_calls=10, window_seconds=60)
+    assert_tier_at_least(supabase, _uid, "lite")
+
+    topic = (body.topic or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="Topic is required.")
+    if len(topic) > 160:
+        raise HTTPException(status_code=400, detail="Topic is too long (max 160 chars).")
+
+    try:
+        brief = generate_abstract_brief(topic)
+    except AbstractBriefError as e:
+        raise HTTPException(status_code=502, detail=f"Could not generate brief: {e}")
+
+    return AbstractBriefResponse(**brief)
