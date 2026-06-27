@@ -49,3 +49,5 @@ app.include_router(daily.router)
 app.include_router(transcribe.router, prefix="/transcribe")
 app.include_router(attempts.router)
 app.include_router(vision.router, prefix="/extract-text")
+from routes import resume as _resume
+app.include_router(_resume.router)
