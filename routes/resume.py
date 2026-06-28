@@ -51,6 +51,12 @@ class PointRequest(BaseModel):
     domain: Optional[str] = ""
     max_chars: Optional[int] = 120
     count: Optional[int] = 3
+    instructions: Optional[str] = ""
+
+
+class PointResponse(BaseModel):
+    options: List[Option] = []
+    clarify: Optional[str] = None
 
 
 def _guard(authorization: Optional[str], bucket: str):
@@ -68,15 +74,21 @@ def _cap(n: Optional[int]) -> int:
     return max(40, min(v, MAX_CHARS_CAP))
 
 
-@router.post("/point", response_model=OptionsResponse)
-async def point(body: PointRequest, authorization: Optional[str] = Header(default=None)) -> OptionsResponse:
-    """Achievement -> strict-fit one-line bullets (95-100% of max_chars, never over)."""
+@router.post("/point", response_model=PointResponse)
+async def point(body: PointRequest, authorization: Optional[str] = Header(default=None)) -> PointResponse:
+    """Achievement -> strict-fit one-line bullets (95-100% of max_chars, never over), or a
+    single clarifying question when the achievement is too vague."""
     _guard(authorization, "resume_point")
     try:
-        opts = generate_points(body.achievement or "", body.domain or "", _cap(body.max_chars), body.count or 3)
+        result = generate_points(
+            body.achievement or "", body.domain or "", _cap(body.max_chars),
+            body.count or 3, body.instructions or "",
+        )
     except ResumeAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    return OptionsResponse(options=[Option(**o) for o in opts])
+    if result.get("clarify"):
+        return PointResponse(options=[], clarify=result["clarify"])
+    return PointResponse(options=[Option(**o) for o in result["options"]])
 
 
 @router.post("/refine-bullet", response_model=OptionsResponse)

@@ -322,19 +322,33 @@ def _enforce_band(text: str, max_chars: int, domain: str) -> str:
     return t.strip().rstrip(".")
 
 
-def generate_points(achievement: str, domain: str, max_chars: int, count: int = 3) -> List[BulletOption]:
-    """Achievement text -> up to `count` one-line bullets, each within 95-100% of max_chars."""
+def generate_points(achievement: str, domain: str, max_chars: int, count: int = 3, instructions: str = "") -> dict:
+    """Achievement -> {"options":[...], "clarify": None} where each option is within 95-100% of
+    max_chars. If the achievement is too vague, returns {"options":[], "clarify": "<question>"}.
+    `instructions` are extra user guidance the model must follow strictly."""
     achievement = (achievement or "").strip()
     if len(achievement) < 3:
         raise ResumeAIError("Describe your achievement in a few words first.")
     count = max(1, min(int(count or 3), 3))
+    instructions = (instructions or "").strip()
     lo = _band_lo(max_chars)
+    extra = ""
+    if instructions:
+        extra = (
+            "\nUSER INSTRUCTIONS (follow these STRICTLY; when they conflict with the default style, "
+            f"the user's instructions win):\n{instructions[:800]}\n"
+        )
     sys = _SHARED_RULES + (
         f"\nTASK: Turn the user's achievement into {count} DISTINCT one-line CV bullet options.\n"
         f"CHARACTER TARGET (critical): each option MUST be between {lo} and {max_chars} characters — as close "
         f"to {max_chars} as possible WITHOUT ever exceeding it. Count characters carefully before answering.\n"
         f"Domain flavour: {domain or 'general management'}.\n"
-        'OUTPUT JSON: {"options":[{"text":"...","rationale":"one short why"}, ...]}'
+        + extra +
+        "If (and ONLY if) the achievement is too vague or missing a key fact (what you actually did, the "
+        "outcome, or a number) to write an ACCURATE bullet, do NOT invent details — instead ask ONE short "
+        "clarifying question.\n"
+        'OUTPUT JSON: either {"clarify":"<one short question>"} '
+        'OR {"options":[{"text":"...","rationale":"one short why"}, ...]}'
     )
     resp = _client().chat.completions.create(
         model="gpt-4o",
@@ -342,15 +356,28 @@ def generate_points(achievement: str, domain: str, max_chars: int, count: int = 
         response_format={"type": "json_object"},
         temperature=0.7,
     )
-    parsed = _parse_options(resp.choices[0].message.content, max_chars)
+    raw = resp.choices[0].message.content or ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ResumeAIError(f"Invalid JSON: {e}")
+    clar = str(parsed.get("clarify", "")).strip()
+    arr = parsed.get("options")
+    if clar and not arr:
+        return {"options": [], "clarify": clar[:240]}
+    if not isinstance(arr, list) or not arr:
+        raise ResumeAIError("Could not produce a bullet. Try adding a little more detail.")
     out: List[BulletOption] = []
     seen = set()
-    for o in parsed:
-        t = _enforce_band(o["text"], max_chars, domain)
+    for it in arr:
+        text = str(it.get("text", "")).strip().rstrip(".")
+        if not text:
+            continue
+        t = _enforce_band(text, max_chars, domain)
         key = t.lower()
         if t and key not in seen:
             seen.add(key)
-            out.append({"text": t, "chars": len(t), "rationale": str(o.get("rationale", ""))[:140]})
+            out.append({"text": t, "chars": len(t), "rationale": str(it.get("rationale", ""))[:140]})
     if not out:
         raise ResumeAIError("Could not produce a bullet that fits. Try a shorter achievement or a larger limit.")
-    return out[:count]
+    return {"options": out[:count], "clarify": None}
