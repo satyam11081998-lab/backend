@@ -14,6 +14,7 @@ unless explicitly asked. Uses GPT-4o. Generated on demand.
 
 import os
 import json
+import math
 from typing import List, TypedDict, Optional
 from openai import OpenAI
 
@@ -251,3 +252,105 @@ def rebuild_resume(text: str) -> dict:
             "hobbies": _list_str(ai.get("hobbies")),
         },
     }
+
+
+# ── Strict character-band engine (95–100% of the limit, never over) ──────────
+
+def _band_lo(max_chars: int) -> int:
+    """Lower bound of the fill band: at least 95% of the limit."""
+    return max(1, math.ceil(0.95 * max_chars))
+
+
+def _trim_to_words(text: str, max_chars: int) -> str:
+    """Deterministic, never mid-word: drop trailing words until it fits."""
+    t = (text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    out = ""
+    for w in t.split():
+        cand = (out + " " + w).strip()
+        if len(cand) > max_chars:
+            break
+        out = cand
+    return out.strip().rstrip(",;:-– ")
+
+
+def _one_line(instruction: str, user_text: str, max_chars: int, domain: str, temp: float = 0.4) -> str:
+    sys = _SHARED_RULES + "\n" + instruction + (
+        f"\nDomain flavour: {domain or 'general management'}.\n"
+        'Return ONE option. OUTPUT JSON: {"options":[{"text":"...","rationale":"..."}]}'
+    )
+    resp = _client().chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_text}],
+        response_format={"type": "json_object"},
+        temperature=temp,
+    )
+    raw = resp.choices[0].message.content or ""
+    try:
+        arr = json.loads(raw).get("options", [])
+        return str(arr[0].get("text", "")).strip().rstrip(".") if arr else ""
+    except Exception:
+        return ""
+
+
+def _enforce_band(text: str, max_chars: int, domain: str) -> str:
+    """Coerce a single bullet into [95%, 100%] of max_chars. Never exceeds max_chars."""
+    lo = _band_lo(max_chars)
+    t = (text or "").strip().rstrip(".")
+    # Too long -> ask to compress, then guarantee with a word-boundary trim.
+    if len(t) > max_chars:
+        c = _one_line(
+            f"TASK: Rewrite into ONE line of AT MOST {max_chars} characters (ideally {lo}-{max_chars}). "
+            "Keep every number and the core impact; cut only filler.",
+            f"Bullet: {t}", max_chars, domain, 0.3,
+        )
+        if c and len(c) <= max_chars:
+            t = c
+        if len(t) > max_chars:
+            t = _trim_to_words(t, max_chars)
+    # Too short -> ask to expand once with one concrete detail.
+    if len(t) < lo:
+        e = _one_line(
+            f"TASK: Expand this into ONE line between {lo} and {max_chars} characters by adding ONE concrete, "
+            "plausible detail (scope, %, count, timeframe). Use a tasteful placeholder like X% only if no number "
+            "exists. Do not pad with filler words.",
+            f"Bullet: {t}", max_chars, domain, 0.5,
+        )
+        if e and len(e) > len(t):
+            t = e if len(e) <= max_chars else _trim_to_words(e, max_chars)
+    return t.strip().rstrip(".")
+
+
+def generate_points(achievement: str, domain: str, max_chars: int, count: int = 3) -> List[BulletOption]:
+    """Achievement text -> up to `count` one-line bullets, each within 95-100% of max_chars."""
+    achievement = (achievement or "").strip()
+    if len(achievement) < 3:
+        raise ResumeAIError("Describe your achievement in a few words first.")
+    count = max(1, min(int(count or 3), 3))
+    lo = _band_lo(max_chars)
+    sys = _SHARED_RULES + (
+        f"\nTASK: Turn the user's achievement into {count} DISTINCT one-line CV bullet options.\n"
+        f"CHARACTER TARGET (critical): each option MUST be between {lo} and {max_chars} characters — as close "
+        f"to {max_chars} as possible WITHOUT ever exceeding it. Count characters carefully before answering.\n"
+        f"Domain flavour: {domain or 'general management'}.\n"
+        'OUTPUT JSON: {"options":[{"text":"...","rationale":"one short why"}, ...]}'
+    )
+    resp = _client().chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": f"Achievement: {achievement}"}],
+        response_format={"type": "json_object"},
+        temperature=0.7,
+    )
+    parsed = _parse_options(resp.choices[0].message.content, max_chars)
+    out: List[BulletOption] = []
+    seen = set()
+    for o in parsed:
+        t = _enforce_band(o["text"], max_chars, domain)
+        key = t.lower()
+        if t and key not in seen:
+            seen.add(key)
+            out.append({"text": t, "chars": len(t), "rationale": str(o.get("rationale", ""))[:140]})
+    if not out:
+        raise ResumeAIError("Could not produce a bullet that fits. Try a shorter achievement or a larger limit.")
+    return out[:count]

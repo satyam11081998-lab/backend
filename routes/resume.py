@@ -8,9 +8,8 @@ from typing import List, Optional
 
 from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user_id
-from services.access_guard import assert_tier_at_least
 from services.rate_limit import check_rate_limit
-from services.resume_ai import refine_bullet, generate_bullets, fit_bullet, rebuild_resume, ResumeAIError
+from services.resume_ai import refine_bullet, generate_bullets, fit_bullet, generate_points, rebuild_resume, ResumeAIError
 
 router = APIRouter(prefix="/resume", tags=["resume"])
 
@@ -47,11 +46,18 @@ class FitRequest(BaseModel):
     max_chars: Optional[int] = 120
 
 
+class PointRequest(BaseModel):
+    achievement: str
+    domain: Optional[str] = ""
+    max_chars: Optional[int] = 120
+    count: Optional[int] = 3
+
+
 def _guard(authorization: Optional[str], bucket: str):
     supabase = get_supabase_client()
     uid = get_verified_user_id(supabase, authorization)
+    # Bullet Lab is free for any signed-in user; rate-limit still applies.
     check_rate_limit(f"{bucket}:{uid}", max_calls=20, window_seconds=60)
-    assert_tier_at_least(supabase, uid, "pro")
 
 
 def _cap(n: Optional[int]) -> int:
@@ -60,6 +66,17 @@ def _cap(n: Optional[int]) -> int:
     except (TypeError, ValueError):
         v = 120
     return max(40, min(v, MAX_CHARS_CAP))
+
+
+@router.post("/point", response_model=OptionsResponse)
+async def point(body: PointRequest, authorization: Optional[str] = Header(default=None)) -> OptionsResponse:
+    """Achievement -> strict-fit one-line bullets (95-100% of max_chars, never over)."""
+    _guard(authorization, "resume_point")
+    try:
+        opts = generate_points(body.achievement or "", body.domain or "", _cap(body.max_chars), body.count or 3)
+    except ResumeAIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return OptionsResponse(options=[Option(**o) for o in opts])
 
 
 @router.post("/refine-bullet", response_model=OptionsResponse)
