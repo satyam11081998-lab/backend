@@ -13,8 +13,11 @@ Uses GPT-4o (user-facing). Generated on demand; the caller may cache.
 
 import os
 import json
+import time
 from typing import TypedDict, List
 from openai import OpenAI
+
+from services.ai_usage import log_ai_usage
 
 
 class GeneratedAbstractBrief(TypedDict):
@@ -105,6 +108,7 @@ def generate_abstract_brief(topic: str) -> GeneratedAbstractBrief:
 
     client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -113,7 +117,10 @@ def generate_abstract_brief(topic: str) -> GeneratedAbstractBrief:
             ],
             response_format={"type": "json_object"},
             temperature=0.6,
+            max_tokens=2000,  # 10 array fields (~43 items); headroom so the JSON never truncates mid-object
         )
+        log_ai_usage(endpoint="/news/abstract-brief", model="gpt-4o", response=response,
+                     latency_ms=int((time.time() - t0) * 1000))
     except Exception as e:
         raise AbstractBriefError(f"OpenAI API call failed: {type(e).__name__}: {e}")
 

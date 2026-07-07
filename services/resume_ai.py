@@ -15,8 +15,11 @@ unless explicitly asked. Uses GPT-4o. Generated on demand.
 import os
 import json
 import math
+import time
 from typing import List, TypedDict, Optional
 from openai import OpenAI
+
+from services.ai_usage import log_ai_usage
 
 
 class BulletOption(TypedDict):
@@ -51,6 +54,18 @@ def _client() -> OpenAI:
     return OpenAI(api_key=key, timeout=45.0, max_retries=1)
 
 
+def _chat(endpoint: str, user_id: Optional[str], *, model: str, **kwargs):
+    """Single place every Resume Lab OpenAI call goes through, so all of them are
+    logged to ai_usage_log (cost dashboard + daily-budget backstop)."""
+    t0 = time.time()
+    resp = _client().chat.completions.create(model=model, **kwargs)
+    log_ai_usage(
+        user_id=user_id, endpoint=endpoint, model=model, response=resp,
+        latency_ms=int((time.time() - t0) * 1000),
+    )
+    return resp
+
+
 def _parse_options(raw: Optional[str], max_chars: int) -> List[BulletOption]:
     if not raw:
         raise ResumeAIError("OpenAI returned empty response")
@@ -72,7 +87,7 @@ def _parse_options(raw: Optional[str], max_chars: int) -> List[BulletOption]:
     return out[:3]
 
 
-def refine_bullet(text: str, domain: str, max_chars: int) -> List[BulletOption]:
+def refine_bullet(text: str, domain: str, max_chars: int, user_id: Optional[str] = None) -> List[BulletOption]:
     text = (text or "").strip()
     if not text:
         raise ResumeAIError("Empty bullet")
@@ -81,16 +96,17 @@ def refine_bullet(text: str, domain: str, max_chars: int) -> List[BulletOption]:
         f"Domain flavour: {domain or 'general management'}.\n"
         'OUTPUT JSON: {"options":[{"text":"...","rationale":"one short why"}, ... x3]}'
     )
-    resp = _client().chat.completions.create(
-        model="gpt-4o",
+    resp = _chat(
+        "/resume/refine-bullet", user_id, model="gpt-4o",
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": f"Bullet: {text}"}],
         response_format={"type": "json_object"},
         temperature=0.6,
+        max_tokens=500,
     )
     return _parse_options(resp.choices[0].message.content, max_chars)
 
 
-def generate_bullets(role: str, task: str, result: str, domain: str, count: int, max_chars: int) -> List[BulletOption]:
+def generate_bullets(role: str, task: str, result: str, domain: str, count: int, max_chars: int, user_id: Optional[str] = None) -> List[BulletOption]:
     role = (role or "").strip()
     if not role and not task and not result:
         raise ResumeAIError("Provide at least a role, task, or result")
@@ -101,16 +117,17 @@ def generate_bullets(role: str, task: str, result: str, domain: str, count: int,
         'OUTPUT JSON: {"options":[{"text":"...","rationale":"one short why"}, ...]}'
     )
     user = f"Role: {role}\nTask: {task}\nResult: {result}"
-    resp = _client().chat.completions.create(
-        model="gpt-4o",
+    resp = _chat(
+        "/resume/generate-bullets", user_id, model="gpt-4o",
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         response_format={"type": "json_object"},
         temperature=0.7,
+        max_tokens=600,
     )
     return _parse_options(resp.choices[0].message.content, max_chars)
 
 
-def fit_bullet(text: str, max_chars: int) -> List[BulletOption]:
+def fit_bullet(text: str, max_chars: int, user_id: Optional[str] = None) -> List[BulletOption]:
     text = (text or "").strip()
     if not text:
         raise ResumeAIError("Empty bullet")
@@ -118,11 +135,13 @@ def fit_bullet(text: str, max_chars: int) -> List[BulletOption]:
         f"\nTASK: Tighten the user's bullet to <= {max_chars} characters WITHOUT losing the impact or the numbers.\n"
         'Return 1 option. OUTPUT JSON: {"options":[{"text":"...","rationale":"what you trimmed"}]}'
     )
-    resp = _client().chat.completions.create(
-        model="gpt-4o",
+    # Tightening is a compress task — mini handles it well at a fraction of the cost.
+    resp = _chat(
+        "/resume/fit-bullet", user_id, model="gpt-4o-mini",
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": f"Bullet: {text}"}],
         response_format={"type": "json_object"},
         temperature=0.3,
+        max_tokens=220,
     )
     return _parse_options(resp.choices[0].message.content, max_chars)
 
@@ -181,7 +200,7 @@ def _norm_exp(v):
     return out[:8]
 
 
-def rebuild_resume(text: str) -> dict:
+def rebuild_resume(text: str, user_id: Optional[str] = None) -> dict:
     """Parse a raw résumé into the full MECE ResumeData JSON. Raises ResumeAIError."""
     text = (text or "").strip()
     if len(text) < 40:
@@ -189,14 +208,15 @@ def rebuild_resume(text: str) -> dict:
     if len(text) > 16000:
         text = text[:16000]
 
-    resp = _client().chat.completions.create(
-        model="gpt-4o",
+    resp = _chat(
+        "/resume/rebuild", user_id, model="gpt-4o",
         messages=[
             {"role": "system", "content": _REBUILD_SYSTEM},
             {"role": "user", "content": text},
         ],
         response_format={"type": "json_object"},
         temperature=0.4,
+        max_tokens=4000,  # a densely-packed CV rebuilds into a large JSON; avoid mid-object truncation
     )
     raw = resp.choices[0].message.content
     if not raw:
@@ -275,16 +295,21 @@ def _trim_to_words(text: str, max_chars: int) -> str:
     return out.strip().rstrip(",;:-– ")
 
 
-def _one_line(instruction: str, user_text: str, max_chars: int, domain: str, temp: float = 0.4) -> str:
+def _one_line(instruction: str, user_text: str, max_chars: int, domain: str, temp: float = 0.4,
+              user_id: Optional[str] = None) -> str:
     sys = _SHARED_RULES + "\n" + instruction + (
         f"\nDomain flavour: {domain or 'general management'}.\n"
         'Return ONE option. OUTPUT JSON: {"options":[{"text":"...","rationale":"..."}]}'
     )
-    resp = _client().chat.completions.create(
-        model="gpt-4o",
+    # Band coercion is compress/expand — a mini-strength task. Was gpt-4o (up to 2
+    # calls PER option = the single most expensive path in the app); now mini + at
+    # most ONE call per option (see _enforce_band).
+    resp = _chat(
+        "/resume/band-fix", user_id, model="gpt-4o-mini",
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_text}],
         response_format={"type": "json_object"},
         temperature=temp,
+        max_tokens=220,
     )
     raw = resp.choices[0].message.content or ""
     try:
@@ -294,35 +319,34 @@ def _one_line(instruction: str, user_text: str, max_chars: int, domain: str, tem
         return ""
 
 
-def _enforce_band(text: str, max_chars: int, domain: str) -> str:
-    """Coerce a single bullet into [95%, 100%] of max_chars. Never exceeds max_chars."""
+def _enforce_band(text: str, max_chars: int, domain: str, user_id: Optional[str] = None) -> str:
+    """Coerce a single bullet toward [95%, 100%] of max_chars, never exceeding it.
+
+    COST GUARD: at most ONE AI (mini) call per option. Over-length is fixed for FREE
+    with a deterministic word-boundary trim (no quality loss — it only drops trailing
+    filler); the one AI call is spent only on the harder EXPAND case, where creativity
+    actually helps. Previously this made up to TWO gpt-4o calls per option."""
     lo = _band_lo(max_chars)
     t = (text or "").strip().rstrip(".")
-    # Too long -> ask to compress, then guarantee with a word-boundary trim.
+
+    # Over the limit -> deterministic trim first (free, never mid-word).
     if len(t) > max_chars:
-        c = _one_line(
-            f"TASK: Rewrite into ONE line of AT MOST {max_chars} characters (ideally {lo}-{max_chars}). "
-            "Keep every number and the core impact; cut only filler.",
-            f"Bullet: {t}", max_chars, domain, 0.3,
-        )
-        if c and len(c) <= max_chars:
-            t = c
-        if len(t) > max_chars:
-            t = _trim_to_words(t, max_chars)
-    # Too short -> ask to expand once with one concrete detail.
+        t = _trim_to_words(t, max_chars)
+
+    # Comfortably short -> spend the one allowed AI call to expand with a concrete detail.
     if len(t) < lo:
         e = _one_line(
             f"TASK: Expand this into ONE line between {lo} and {max_chars} characters by adding ONE concrete, "
             "plausible detail (scope, %, count, timeframe). Use a tasteful placeholder like X% only if no number "
             "exists. Do not pad with filler words.",
-            f"Bullet: {t}", max_chars, domain, 0.5,
+            f"Bullet: {t}", max_chars, domain, 0.5, user_id=user_id,
         )
         if e and len(e) > len(t):
             t = e if len(e) <= max_chars else _trim_to_words(e, max_chars)
     return t.strip().rstrip(".")
 
 
-def generate_points(achievement: str, domain: str, max_chars: int, count: int = 3, instructions: str = "") -> dict:
+def generate_points(achievement: str, domain: str, max_chars: int, count: int = 3, instructions: str = "", user_id: Optional[str] = None) -> dict:
     """Achievement -> {"options":[...], "clarify": None} where each option is within 95-100% of
     max_chars. If the achievement is too vague, returns {"options":[], "clarify": "<question>"}.
     `instructions` are extra user guidance the model must follow strictly."""
@@ -350,11 +374,12 @@ def generate_points(achievement: str, domain: str, max_chars: int, count: int = 
         'OUTPUT JSON: either {"clarify":"<one short question>"} '
         'OR {"options":[{"text":"...","rationale":"one short why"}, ...]}'
     )
-    resp = _client().chat.completions.create(
-        model="gpt-4o",
+    resp = _chat(
+        "/resume/point", user_id, model="gpt-4o",
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": f"Achievement: {achievement}"}],
         response_format={"type": "json_object"},
         temperature=0.7,
+        max_tokens=600,
     )
     raw = resp.choices[0].message.content or ""
     try:
@@ -373,7 +398,7 @@ def generate_points(achievement: str, domain: str, max_chars: int, count: int = 
         text = str(it.get("text", "")).strip().rstrip(".")
         if not text:
             continue
-        t = _enforce_band(text, max_chars, domain)
+        t = _enforce_band(text, max_chars, domain, user_id=user_id)
         key = t.lower()
         if t and key not in seen:
             seen.add(key)

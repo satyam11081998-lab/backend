@@ -9,6 +9,7 @@ from typing import List, Optional
 from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user_id
 from services.rate_limit import check_rate_limit
+from services.ai_usage import assert_daily_budget
 from services.resume_ai import refine_bullet, generate_bullets, fit_bullet, generate_points, rebuild_resume, ResumeAIError
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -59,11 +60,13 @@ class PointResponse(BaseModel):
     clarify: Optional[str] = None
 
 
-def _guard(authorization: Optional[str], bucket: str):
+def _guard(authorization: Optional[str], bucket: str) -> str:
     supabase = get_supabase_client()
     uid = get_verified_user_id(supabase, authorization)
     # Bullet Lab is free for any signed-in user; rate-limit still applies.
     check_rate_limit(f"{bucket}:{uid}", max_calls=20, window_seconds=60)
+    assert_daily_budget()  # global spend backstop
+    return uid
 
 
 def _cap(n: Optional[int]) -> int:
@@ -78,11 +81,11 @@ def _cap(n: Optional[int]) -> int:
 async def point(body: PointRequest, authorization: Optional[str] = Header(default=None)) -> PointResponse:
     """Achievement -> strict-fit one-line bullets (95-100% of max_chars, never over), or a
     single clarifying question when the achievement is too vague."""
-    _guard(authorization, "resume_point")
+    uid = _guard(authorization, "resume_point")
     try:
         result = generate_points(
             body.achievement or "", body.domain or "", _cap(body.max_chars),
-            body.count or 3, body.instructions or "",
+            body.count or 3, body.instructions or "", user_id=uid,
         )
     except ResumeAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -93,9 +96,9 @@ async def point(body: PointRequest, authorization: Optional[str] = Header(defaul
 
 @router.post("/refine-bullet", response_model=OptionsResponse)
 async def refine(body: RefineRequest, authorization: Optional[str] = Header(default=None)) -> OptionsResponse:
-    _guard(authorization, "resume_refine")
+    uid = _guard(authorization, "resume_refine")
     try:
-        opts = refine_bullet(body.bullet, body.domain or "", _cap(body.max_chars))
+        opts = refine_bullet(body.bullet, body.domain or "", _cap(body.max_chars), user_id=uid)
     except ResumeAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return OptionsResponse(options=[Option(**o) for o in opts])
@@ -103,9 +106,9 @@ async def refine(body: RefineRequest, authorization: Optional[str] = Header(defa
 
 @router.post("/generate-bullets", response_model=OptionsResponse)
 async def generate(body: GenerateRequest, authorization: Optional[str] = Header(default=None)) -> OptionsResponse:
-    _guard(authorization, "resume_generate")
+    uid = _guard(authorization, "resume_generate")
     try:
-        opts = generate_bullets(body.role or "", body.task or "", body.result or "", body.domain or "", body.count or 3, _cap(body.max_chars))
+        opts = generate_bullets(body.role or "", body.task or "", body.result or "", body.domain or "", body.count or 3, _cap(body.max_chars), user_id=uid)
     except ResumeAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return OptionsResponse(options=[Option(**o) for o in opts])
@@ -113,9 +116,9 @@ async def generate(body: GenerateRequest, authorization: Optional[str] = Header(
 
 @router.post("/fit-bullet", response_model=OptionsResponse)
 async def fit(body: FitRequest, authorization: Optional[str] = Header(default=None)) -> OptionsResponse:
-    _guard(authorization, "resume_fit")
+    uid = _guard(authorization, "resume_fit")
     try:
-        opts = fit_bullet(body.bullet, _cap(body.max_chars))
+        opts = fit_bullet(body.bullet, _cap(body.max_chars), user_id=uid)
     except ResumeAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return OptionsResponse(options=[Option(**o) for o in opts])
@@ -127,9 +130,9 @@ class RebuildRequest(BaseModel):
 
 @router.post("/rebuild")
 async def rebuild(body: RebuildRequest, authorization: Optional[str] = Header(default=None)):
-    _guard(authorization, "resume_rebuild")
+    uid = _guard(authorization, "resume_rebuild")
     try:
-        data = rebuild_resume(body.text)
+        data = rebuild_resume(body.text, user_id=uid)
     except ResumeAIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return {"data": data}

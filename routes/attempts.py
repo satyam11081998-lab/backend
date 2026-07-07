@@ -33,6 +33,7 @@ from services.interview_engine import (
     InterviewEngineError,
 )
 from services.badge_awarder import award_badges_for_submission
+from services.ai_usage import assert_daily_budget
 
 router = APIRouter(prefix="/attempts", tags=["attempts"])
 
@@ -321,6 +322,8 @@ async def post_message(
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
+    assert_daily_budget()  # global spend backstop before any interviewer-turn spend
+
     # Soft cap on total messages.
     count_res = (
         supabase.table("attempt_messages")
@@ -385,6 +388,7 @@ async def post_message(
                 case_type=case["type"],
                 transcript=transcript,
                 new_user_message=body.content,
+                user_id=user_id,
             ):
                 chunks.append(token)
                 # SSE data lines must not contain literal newlines — escape them.
@@ -560,6 +564,7 @@ async def submit_attempt(
             case_type=case["type"],
             transcript=transcript,
             final_recommendation=body.final_recommendation,
+            user_id=user_id,
         )
     except InterviewEngineError as e:
         raise HTTPException(status_code=500, detail=f"Scoring failed: {e}")

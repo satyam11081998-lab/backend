@@ -12,6 +12,7 @@ from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
 from services.access_guard import assert_can_attempt
 from services.rate_limit import check_rate_limit
+from services.ai_usage import assert_daily_budget
 from services.limits import ANSWER_MAX_CHARS
 
 
@@ -80,6 +81,7 @@ async def submit_answer(
 
     # TIER / QUOTA GATE — runs BEFORE any OpenAI spend.
     assert_can_attempt(supabase, submission.user_id, case)
+    assert_daily_budget()  # global spend backstop
 
     # Step 2: Score the answer using OpenAI.
     # Guesstimates use the dedicated 5-dim rubric + deterministic arithmetic backstop
@@ -89,12 +91,14 @@ async def submit_answer(
             feedback = score_guesstimate_answer(
                 case_content=case_content,
                 user_answer=submission.answer_text,
+                user_id=submission.user_id,
             )
         else:
             feedback = score_case_answer(
                 case_content=case_content,
                 case_type=case_type,
                 user_answer=submission.answer_text,
+                user_id=submission.user_id,
             )
     except AIScoringError as e:
         raise HTTPException(

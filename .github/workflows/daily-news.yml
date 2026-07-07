@@ -25,7 +25,7 @@ jobs:
           curl -X POST "${{ secrets.API_BASE_URL }}/cron/fetch-news" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
             --max-time 300 \
-            --retry 5 \
+            --retry 2 \
             --retry-delay 15 \
             --retry-all-errors \
             --fail-with-body

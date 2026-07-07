@@ -16,9 +16,11 @@ as every other case (nothing special needed downstream).
 
 import os
 import json
+import time
 from typing import List, Optional, Tuple
 from openai import OpenAI
 from services.supabase_client import get_supabase_client
+from services.ai_usage import log_ai_usage
 
 
 # These MUST match lib/constants.ts on the frontend.
@@ -111,6 +113,7 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
             )
 
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -119,7 +122,10 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
             ],
             response_format={"type": "json_object"},
             temperature=0.8,
+            max_tokens=2000,  # one case + one guesstimate as JSON; ceiling well above the ~950 typical
         )
+        log_ai_usage(endpoint="/cron/schedule-daily", model="gpt-4o", response=response,
+                     latency_ms=int((time.time() - t0) * 1000))
         raw_content = response.choices[0].message.content
     except Exception as e:
         raise GeneratorError(f"OpenAI request failed: {type(e).__name__}: {e}")

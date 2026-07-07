@@ -8,9 +8,12 @@ iterate over `stream_interviewer_reply(...)` to forward tokens via SSE.
 
 import os
 import json
-from typing import Iterable, Dict, List, Generator, Any
+import time
+from typing import Iterable, Dict, List, Generator, Any, Optional
 from openai import OpenAI
 from dotenv import load_dotenv
+
+from services.ai_usage import log_ai_usage
 
 from prompts.interview_prompts import (
     build_interviewer_messages,
@@ -45,6 +48,7 @@ def stream_interviewer_reply(
     case_type: str,
     transcript: Iterable[Dict[str, str]],
     new_user_message: str,
+    user_id: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """Yield text chunks as the interviewer responds.
 
@@ -58,18 +62,28 @@ def stream_interviewer_reply(
         new_user_message=new_user_message,
     )
     try:
+        t0 = time.time()
         stream = _client.chat.completions.create(
             model=INTERVIEWER_MODEL,
             messages=messages,
             temperature=0.4,
             max_tokens=180,   # cap — interviewer replies must stay short
             stream=True,
+            stream_options={"include_usage": True},  # final chunk carries token usage
         )
     except Exception as e:
         raise InterviewEngineError(f"OpenAI streaming call failed: {e}")
 
+    class _U:  # tiny shim so log_ai_usage can read .usage off a response-like object
+        usage = None
+        id = None
+
+    final = _U()
     try:
         for chunk in stream:
+            if getattr(chunk, "usage", None):
+                final.usage = chunk.usage
+                final.id = getattr(chunk, "id", None)
             try:
                 delta = chunk.choices[0].delta
                 token = getattr(delta, "content", None)
@@ -79,6 +93,9 @@ def stream_interviewer_reply(
                 yield token
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
+    finally:
+        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=INTERVIEWER_MODEL,
+                     response=final, latency_ms=int((time.time() - t0) * 1000))
 
 
 def complete_interviewer_reply(
@@ -143,6 +160,7 @@ def _score_case_conversation(
     case_type: str,
     transcript: Iterable[Dict[str, str]],
     final_recommendation: str,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """General conversation analysis for CASES (not guesstimates).
     The formal case rubric is being developed separately; until it lands this
@@ -156,6 +174,7 @@ def _score_case_conversation(
         final_recommendation=final_recommendation,
     )
     try:
+        t0 = time.time()
         resp = _client.chat.completions.create(
             model=SCORING_MODEL,
             messages=[
@@ -166,6 +185,8 @@ def _score_case_conversation(
             max_tokens=2500,
             response_format={"type": "json_object"},
         )
+        log_ai_usage(user_id=user_id, endpoint="/attempts/submit", model=SCORING_MODEL,
+                     response=resp, latency_ms=int((time.time() - t0) * 1000))
     except Exception as e:
         raise InterviewEngineError(f"Scoring call failed: {e}")
 
@@ -195,6 +216,7 @@ def score_conversation(
     case_type: str,
     transcript: Iterable[Dict[str, str]],
     final_recommendation: str,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Top-level scorer. Branches on case_type:
 
@@ -215,7 +237,7 @@ def score_conversation(
         from services.ai_scorer import score_guesstimate_answer, AIScoringError
         flat = _flatten_for_legacy_scorer(transcript, final_recommendation)
         try:
-            return score_guesstimate_answer(case_content=case_content, user_answer=flat)
+            return score_guesstimate_answer(case_content=case_content, user_answer=flat, user_id=user_id)
         except AIScoringError as e:
             raise InterviewEngineError(f"Guesstimate scoring failed: {e}")
 
@@ -224,6 +246,7 @@ def score_conversation(
         case_type=case_type,
         transcript=transcript,
         final_recommendation=final_recommendation,
+        user_id=user_id,
     )
 
 

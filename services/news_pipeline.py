@@ -68,12 +68,39 @@ def latest_fetched_at(supabase) -> Optional[datetime]:
         return None
 
 
+def last_refresh_attempt_at(supabase) -> Optional[datetime]:
+    """Most recent refresh ATTEMPT (from news_refresh_log), regardless of whether it
+    saved anything. Lets us treat a dedupe-only refresh as 'we just tried', which is
+    what stops the all-day self-heal churn (audit F4)."""
+    try:
+        res = (
+            supabase.table("news_refresh_log")
+            .select("ran_at")
+            .order("ran_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return _parse_iso(rows[0].get("ran_at")) if rows else None
+    except Exception:
+        return None
+
+
 def headlines_are_stale(supabase, max_age_hours: int = STALE_AFTER_HOURS) -> bool:
-    """True if there are no headlines, or the freshest is older than max_age_hours."""
+    """True only if BOTH the freshest headline AND the last refresh attempt are old.
+
+    The old version keyed solely on `fetched_at`; on a day where every fetched URL
+    already exists, inserts dedupe → nothing updates `fetched_at` → it stayed
+    'stale' forever and re-ran the (paid) classifier on every visit. Recording each
+    ATTEMPT in news_refresh_log breaks that loop."""
+    now = datetime.now(timezone.utc)
     latest = latest_fetched_at(supabase)
-    if latest is None:
-        return True
-    return (datetime.now(timezone.utc) - latest) > timedelta(hours=max_age_hours)
+    if latest is not None and (now - latest) <= timedelta(hours=max_age_hours):
+        return False
+    last_try = last_refresh_attempt_at(supabase)
+    if last_try is not None and (now - last_try) <= timedelta(hours=6):
+        return False  # a recent attempt exists — don't re-churn just because inserts deduped
+    return True
 
 
 def run_news_refresh() -> dict:
@@ -134,6 +161,15 @@ def run_news_refresh() -> dict:
     )[:20]
 
     if not top_headlines:
+        # Record the ATTEMPT even when nothing survived, so headlines_are_stale()
+        # doesn't treat this as "never tried" and loop again on the next visit.
+        try:
+            get_supabase_client().table("news_refresh_log").insert(
+                {"source": "auto", "saved": 0,
+                 "details": {"fetched": total_fetched, "classified": total_classified,
+                             "fetch_error": fetch_error}}).execute()
+        except Exception:
+            pass
         return {
             "status": "warning",
             "message": "No headlines survived classification or none fetched"
@@ -181,6 +217,15 @@ def run_news_refresh() -> dict:
     except Exception as e:
         print(f"Warning: failed to demote old stars: {e}")
 
+    # Record the successful attempt (breaks the self-heal churn loop — audit F4).
+    try:
+        supabase.table("news_refresh_log").insert(
+            {"source": "auto", "saved": saved_count,
+             "details": {"fetched": total_fetched, "classified": total_classified,
+                         "skipped": skipped_count}}).execute()
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "message": f"Fetched {total_fetched}, saved {saved_count}, skipped {skipped_count}",
@@ -193,7 +238,7 @@ def run_news_refresh() -> dict:
     }
 
 
-def ensure_fresh_headlines(max_age_hours: int = STALE_AFTER_HOURS, retries: int = 1) -> dict:
+def ensure_fresh_headlines(max_age_hours: int = STALE_AFTER_HOURS, retries: int = 0) -> dict:
     """
     Self-heal: if stored headlines are stale (or absent), run a refresh before the
     caller reads them. Retries once more if still stale after the first refresh, so

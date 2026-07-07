@@ -21,6 +21,7 @@ from services.abstract_gd_generator import generate_abstract_brief, AbstractBrie
 from services.auth import get_verified_user_id
 from services.access_guard import assert_tier_at_least
 from services.rate_limit import check_rate_limit
+from services.ai_usage import assert_daily_budget
 from services.news_pipeline import ensure_fresh_headlines
 from datetime import datetime, timedelta, timezone
 
@@ -245,6 +246,7 @@ async def generate_brief_for_headline(
         )
     
     # Cache miss: generate new brief via AI
+    assert_daily_budget()  # global spend backstop (cache hits above are unaffected)
     try:
         brief = generate_brief(
             headline_title=headline["title"],
@@ -259,9 +261,11 @@ async def generate_brief_for_headline(
             detail=f"Failed to generate brief: {str(e)}"
         )
     
-    # Save the generated brief to Supabase
+    # Save the generated brief to Supabase. UPSERT on headline_id so a concurrent
+    # cache-miss race (two users generating the same headline at once) collapses to
+    # one row instead of raising against the new unique index — migration 0036.
     try:
-        insert_res = supabase.table("gd_briefs").insert({
+        insert_res = supabase.table("gd_briefs").upsert({
             "headline_id": headline_id,
             "topic": headline["title"],
             "summary": brief["summary"],
@@ -278,7 +282,7 @@ async def generate_brief_for_headline(
             "points_against": brief["counter_arguments"],
             "how_to_open": brief["opening_lines"][0] if brief["opening_lines"] else "",
             "how_to_close": brief["closing_lines"][0] if brief["closing_lines"] else "",
-        }).execute()
+        }, on_conflict="headline_id").execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -429,9 +433,27 @@ async def generate_abstract_gd_brief(
     if len(topic) > 160:
         raise HTTPException(status_code=400, detail="Topic is too long (max 160 chars).")
 
+    # Cache (migration 0036): abstract briefs are deterministic-enough that the same
+    # topic must never re-bill gpt-4o. Preset topic chips guarantee repeats.
+    topic_key = " ".join(topic.lower().split())
+    try:
+        hit = supabase.table("abstract_briefs").select("brief").eq("topic_key", topic_key).maybe_single().execute()
+        if hit and hit.data and hit.data.get("brief"):
+            return AbstractBriefResponse(**hit.data["brief"])
+    except Exception:
+        pass  # cache is best-effort — fall through to generate
+
+    assert_daily_budget()  # global spend backstop (only on a real cache miss)
     try:
         brief = generate_abstract_brief(topic)
     except AbstractBriefError as e:
         raise HTTPException(status_code=502, detail=f"Could not generate brief: {e}")
+
+    try:
+        supabase.table("abstract_briefs").upsert(
+            {"topic_key": topic_key, "topic": topic, "brief": brief}, on_conflict="topic_key"
+        ).execute()
+    except Exception:
+        pass  # caching failure must not break the response
 
     return AbstractBriefResponse(**brief)

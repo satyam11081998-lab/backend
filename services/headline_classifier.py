@@ -12,8 +12,11 @@ not user-facing output, so we don't need GPT-4o quality).
 
 import os
 import json
+import time
 from typing import List, TypedDict, Optional
 from openai import OpenAI
+
+from services.ai_usage import log_ai_usage
 
 
 class ClassifiedHeadline(TypedDict):
@@ -110,6 +113,7 @@ def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[Classifie
     )
 
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -118,7 +122,10 @@ def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[Classifie
             ],
             response_format={"type": "json_object"},
             temperature=0.3,
+            max_tokens=3500,  # 20 items echo their (sometimes long) titles; headroom so JSON never truncates
         )
+        log_ai_usage(endpoint="/news/classify", model="gpt-4o-mini", response=response,
+                     latency_ms=int((time.time() - t0) * 1000), meta={"batch": len(raw_headlines)})
     except Exception as e:
         raise ClassificationError(f"OpenAI API call failed: {type(e).__name__}: {e}")
 

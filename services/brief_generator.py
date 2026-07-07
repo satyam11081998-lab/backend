@@ -19,8 +19,11 @@ top consulting, IB, and FMCG firms.
 
 import os
 import json
+import time
 from typing import TypedDict, List, Optional
 from openai import OpenAI
+
+from services.ai_usage import log_ai_usage
 
 
 class GeneratedBrief(TypedDict):
@@ -146,10 +149,13 @@ def generate_brief(
     )
     
     user_message = "\n".join(context_parts)
-    
-    client = OpenAI(api_key=api_key)
-    
+
+    # Bounded client — previously used the SDK's 600s/2-retry defaults, so a hung
+    # call could tie up the worker and a retried timeout could double-bill.
+    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
+
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -158,7 +164,10 @@ def generate_brief(
             ],
             response_format={"type": "json_object"},
             temperature=0.4,
+            max_tokens=1600,  # typical brief ~1,000 tokens; headroom so a rich JSON brief never truncates
         )
+        log_ai_usage(endpoint="/news/briefs", model="gpt-4o", response=response,
+                     latency_ms=int((time.time() - t0) * 1000))
     except Exception as e:
         raise BriefGenerationError(f"OpenAI API call failed: {type(e).__name__}: {e}")
     

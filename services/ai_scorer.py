@@ -12,9 +12,12 @@ The model and prompt logic are isolated here so we can swap providers
 
 import os
 import json
-from typing import Dict, Any
+import time
+from typing import Dict, Any, Optional
 from openai import OpenAI
 from dotenv import load_dotenv
+
+from services.ai_usage import log_ai_usage
 
 from prompts.scoring_prompt import SCORING_SYSTEM_PROMPT, build_scoring_user_prompt
 from prompts.guesstimate_scoring_prompt import (
@@ -50,6 +53,7 @@ def score_case_answer(
     case_content: str,
     case_type: str,
     user_answer: str,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Send a case answer to OpenAI for scoring and return structured feedback.
@@ -72,6 +76,7 @@ def score_case_answer(
     )
 
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model=SCORING_MODEL,
             messages=[
@@ -82,6 +87,8 @@ def score_case_answer(
             max_tokens=2500,  # Cap output to prevent runaway generation
             response_format={"type": "json_object"},  # Force JSON output
         )
+        log_ai_usage(user_id=user_id, endpoint="/submit", model=SCORING_MODEL,
+                     response=response, latency_ms=int((time.time() - t0) * 1000))
     except Exception as e:
         raise AIScoringError(f"OpenAI API call failed: {str(e)}")
 
@@ -124,6 +131,7 @@ def score_case_answer(
 def score_guesstimate_answer(
     case_content: str,
     user_answer: str,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Score a GUESSTIMATE answer: one gpt-4o-mini call returns the 5 rubric dims +
@@ -142,6 +150,7 @@ def score_guesstimate_answer(
     )
 
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model=GUESSTIMATE_SCORING_MODEL,
             messages=[
@@ -152,6 +161,8 @@ def score_guesstimate_answer(
             max_tokens=2500,  # Cap output to prevent runaway generation
             response_format={"type": "json_object"},
         )
+        log_ai_usage(user_id=user_id, endpoint="/submit", model=GUESSTIMATE_SCORING_MODEL,
+                     response=response, latency_ms=int((time.time() - t0) * 1000))
     except Exception as e:
         raise AIScoringError(f"OpenAI API call failed (guesstimate): {str(e)}")
 
