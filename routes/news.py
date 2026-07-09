@@ -297,11 +297,10 @@ async def generate_brief_for_headline(
             detail=f"Failed to generate brief: {str(e)}"
         )
     
-    # Save the generated brief to Supabase. UPSERT on headline_id so a concurrent
-    # cache-miss race (two users generating the same headline at once) collapses to
-    # one row instead of raising against the new unique index — migration 0036.
+    # Save the generated brief to Supabase. Using insert and handling UniqueViolation (23505)
+    # to gracefully resolve concurrent cache-miss races, bypassing the 42P10 partial index issue.
     try:
-        insert_res = supabase.table("gd_briefs").upsert({
+        insert_res = supabase.table("gd_briefs").insert({
             "headline_id": headline_id,
             "topic": headline["title"],
             "summary": brief["summary"],
@@ -318,18 +317,28 @@ async def generate_brief_for_headline(
             "points_against": brief["counter_arguments"],
             "how_to_open": brief["opening_lines"][0] if brief["opening_lines"] else "",
             "how_to_close": brief["closing_lines"][0] if brief["closing_lines"] else "",
-        }, on_conflict="headline_id").execute()
+        }).execute()
+        
+        if not insert_res.data or len(insert_res.data) == 0:
+            raise HTTPException(status_code=500, detail="Supabase returned empty insert result")
+            
+        saved = insert_res.data[0]
+        
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save brief: {type(e).__name__}: {e}"
-        )
+        error_str = str(e)
+        if "23505" in error_str or "duplicate key" in error_str.lower() or "42P10" in error_str:
+            # A concurrent request already saved this brief, fetch it instead.
+            fetch_res = supabase.table("gd_briefs").select("*").eq("headline_id", headline_id).execute()
+            if not fetch_res.data or len(fetch_res.data) == 0:
+                raise HTTPException(status_code=500, detail="Failed to fetch existing brief after conflict")
+            saved = fetch_res.data[0]
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save brief: {type(e).__name__}: {e}"
+            )
     
-    if not insert_res.data or len(insert_res.data) == 0:
-        raise HTTPException(status_code=500, detail="Supabase returned empty insert result")
-    
-    saved = insert_res.data[0]
-    
+
     return BriefResponse(
         id=saved["id"],
         headline_id=headline_id,
