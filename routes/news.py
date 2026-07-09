@@ -133,6 +133,24 @@ async def list_headlines(
     
     if not raw_headlines:
         return HeadlinesListResponse(headlines=[], count=0)
+
+    # Deduplicate headlines by normalized title — different sources often report
+    # the same story, producing near-identical rows. Keep the one with the
+    # highest gd_worthiness_score (star trumps non-star).
+    seen_titles: dict[str, dict] = {}
+    for h in raw_headlines:
+        norm = h["title"].strip().lower()
+        existing = seen_titles.get(norm)
+        if existing is None:
+            seen_titles[norm] = h
+        else:
+            # Prefer: star > non-star, then higher score, then newer
+            h_star = h.get("is_star", False)
+            e_star = existing.get("is_star", False)
+            if (h_star and not e_star) or \
+               (h_star == e_star and (h.get("gd_worthiness_score") or 0) > (existing.get("gd_worthiness_score") or 0)):
+                seen_titles[norm] = h
+    raw_headlines = list(seen_titles.values())
     
     # For each headline, check if a brief already exists
     headline_ids = [h["id"] for h in raw_headlines]
