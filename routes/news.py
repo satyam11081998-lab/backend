@@ -19,7 +19,7 @@ from services.supabase_client import get_supabase_client
 from services.brief_generator import generate_brief, BriefGenerationError
 from services.abstract_gd_generator import generate_abstract_brief, AbstractBriefError
 from services.auth import get_verified_user_id
-from services.access_guard import assert_tier_at_least
+from services.access_guard import assert_tier_at_least, effective_tier
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget
 from services.news_pipeline import ensure_fresh_headlines
@@ -148,13 +148,14 @@ async def list_headlines(
     
     briefs_with_headlines = {b["headline_id"] for b in (briefs_res.data or []) if b.get("headline_id")}
     
+    tier = effective_tier(supabase, _uid)
     headlines_response = [
         HeadlineResponse(
             id=h["id"],
             title=h["title"],
             description=h.get("description"),
             thumbnail_url=h.get("thumbnail_url"),
-            source_url=h["source_url"],
+            source_url="" if tier == "free" else h["source_url"],
             source_name=h["source_name"],
             published_at=h["published_at"],
             keywords=h.get("keywords") or [],
@@ -166,6 +167,41 @@ async def list_headlines(
     ]
     
     return HeadlinesListResponse(headlines=headlines_response, count=len(headlines_response))
+
+
+# ============================================================
+# Helper: check brief access for Free tier
+# ============================================================
+
+def check_brief_access(supabase, user_id: str, headline_id: str) -> None:
+    tier = effective_tier(supabase, user_id)
+    if tier in ("lite", "pro"):
+        return
+        
+    try:
+        unlock_res = supabase.table("gd_brief_unlocks").select("headline_id").eq("user_id", user_id).execute()
+    except Exception:
+        raise HTTPException(500, "Failed to check brief unlocks")
+        
+    unlocks = unlock_res.data or []
+    if len(unlocks) > 0:
+        if unlocks[0]["headline_id"] == headline_id:
+            return
+        raise HTTPException(403, "You have already used your 1 free brief on another headline. Upgrade to Lite for unlimited access.")
+        
+    try:
+        supabase.table("gd_brief_unlocks").upsert({"user_id": user_id, "headline_id": headline_id}, on_conflict="user_id,headline_id").execute()
+    except Exception:
+        pass
+        
+    try:
+        unlock_res = supabase.table("gd_brief_unlocks").select("headline_id").eq("user_id", user_id).execute()
+    except Exception:
+        pass
+    unlocks = unlock_res.data or []
+    if len(unlocks) > 1:
+        supabase.table("gd_brief_unlocks").delete().eq("user_id", user_id).eq("headline_id", headline_id).execute()
+        raise HTTPException(403, "You have already used your 1 free brief on another headline.")
 
 
 # ============================================================
@@ -189,7 +225,7 @@ async def generate_brief_for_headline(
     # GD briefs are a Lite+ feature — verify the caller and their tier.
     _uid = get_verified_user_id(supabase, authorization)
     check_rate_limit(f"brief:{_uid}", max_calls=10, window_seconds=60)
-    assert_tier_at_least(supabase, _uid, "lite")
+    check_brief_access(supabase, _uid, headline_id)
 
     # Step 1: Check if brief already exists (cache hit = no AI call)
     try:
@@ -336,7 +372,7 @@ async def get_brief(
     supabase = get_supabase_client()
     _uid = get_verified_user_id(supabase, authorization)
     check_rate_limit(f"brief_get:{_uid}", max_calls=30, window_seconds=60)
-    assert_tier_at_least(supabase, _uid, "lite")
+    check_brief_access(supabase, _uid, headline_id)
 
     try:
         brief_res = supabase.table("gd_briefs") \

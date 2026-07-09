@@ -98,11 +98,30 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
 
     # ---- non-daily case/guesstimate ----
     if tier == "free":
-        raise HTTPException(
-            status_code=403,
-            detail="Free tier can only attempt today's daily case and guesstimate. "
-                   "Upgrade to Lite to practise the full bank.",
-        )
+        rows = supabase.table("case_attempts").select(
+            "case_id, counted_for_daily"
+        ).eq("user_id", user_id).eq("is_first_attempt", True).execute()
+        
+        candidate_ids = [
+            r["case_id"] for r in ((rows.data or []) if rows else [])
+            if not r.get("counted_for_daily") and r.get("case_id") not in daily_ids
+        ]
+        used = 0
+        if candidate_ids:
+            types = supabase.table("cases").select("id, type").in_("id", candidate_ids).execute()
+            for t in ((types.data or []) if types else []):
+                tb = "guesstimate" if t.get("type") == "guesstimate" else "case"
+                if tb == bucket:
+                    used += 1
+
+        if used >= 1:
+            label = "guesstimate" if bucket == "guesstimate" else "case"
+            raise HTTPException(
+                status_code=403,
+                detail=f"Free tier allows one extra {label} lifetime. "
+                       f"Upgrade to Lite to practise the full bank.",
+            )
+        return
 
     # tier == "lite"
     if not is_first_attempt:
