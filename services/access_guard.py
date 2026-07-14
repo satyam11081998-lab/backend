@@ -114,12 +114,25 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
                 if tb == bucket:
                     used += 1
 
-        if used >= 1:
+        # LinkedIn follow perk (2026-07): a one-time claim permanently raises
+        # the free bank by +1 case and +1 guesstimate. Mirrors lib/access.ts
+        # and LINKEDIN_FOLLOW_PERK in lib/constants.ts — keep in sync.
+        perk = supabase.table("users").select(
+            "linkedin_follow_claimed_at"
+        ).eq("id", user_id).maybe_single().execute()
+        claimed = bool((((perk.data or {}) if perk else {})).get("linkedin_follow_claimed_at"))
+        cap = 1 + (1 if claimed else 0)
+
+        if used >= cap:
             label = "guesstimate" if bucket == "guesstimate" else "case"
+            hint = (
+                "Upgrade to Lite to practise the full bank."
+                if claimed
+                else "Follow MECE on LinkedIn to unlock one more, or upgrade to Lite for the full bank."
+            )
             raise HTTPException(
                 status_code=403,
-                detail=f"Free tier allows one extra {label} lifetime. "
-                       f"Upgrade to Lite to practise the full bank.",
+                detail=f"You've used your free bank {label}s. {hint}",
             )
         return
 
