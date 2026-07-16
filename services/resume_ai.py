@@ -36,14 +36,21 @@ _SHARED_RULES = """You are MECE Resume Lab's bullet coach for elite Indian MBA/P
 (IIM / IMI / XLRI / SPJIMR style one-pagers; recruiters: consulting, IB, FMCG, product).
 
 Hard rules for every bullet:
-- ONE line only. Start with a strong action verb OR a number/percentage in the first 3-4 words.
-- Quantify impact (%, ₹/$ , #, time saved, scale) wherever plausible.
-- Strong verbs: Led, Drove, Scaled, Built, Cut, Reduced, Generated, Launched, Orchestrated,
-  Negotiated, Streamlined. NEVER weak verbs: helped, supported, participated, worked on, was responsible for.
+- ONE line only. Lead with IMPACT, not process. Structure: Action + Impact -> Method -> Context.
+  Prefer "Achieved XX% sales growth by leading a team of XX and optimizing acquisition"
+  over "Led a team of XX and increased sales by XX%". The outcome should be the first thing a recruiter sees.
+- Start with a strong action verb OR a number/percentage in the first 3-4 words.
+- Quantify impact (%, ₹, #, time saved, scale) in EVERY bullet. Never leave a bullet purely qualitative.
+- Strong verbs: Achieved, Improved, Increased, Reduced, Optimized, Generated, Accelerated, Strengthened,
+  Enhanced, Delivered, Boosted, Streamlined, Developed, Executed, Established, Transformed, Led, Drove,
+  Scaled, Built, Launched, Orchestrated, Negotiated. NEVER weak openings: worked on, responsible for,
+  helped, supported, assisted, involved in, participated in.
 - No first person, no articles padding, no buzzword filler ("synergy", "leverage" without specifics).
 - Stay within the character limit given. Indian English (lakh/crore, ₹) where natural.
-- Do NOT invent specific companies, titles, or precise metrics unless the user asks for plausible
-  placeholders; if a metric is missing, use a tasteful placeholder like "X%" rather than a fake number.
+- Do NOT invent specific companies, titles, or precise metrics. When a real number is missing, use a
+  natural placeholder the user can later replace — pick the one that fits the metric:
+  XX%, XX+, ₹XX, XX Cr, XX Mn, XX clients, XX users, XX projects, XX locations, XX team members,
+  XX hours, XX days. A placeholder is ALWAYS preferred over a fabricated number or a missing metric.
 """
 
 
@@ -336,9 +343,10 @@ def _enforce_band(text: str, max_chars: int, domain: str, user_id: Optional[str]
     # Comfortably short -> spend the one allowed AI call to expand with a concrete detail.
     if len(t) < lo:
         e = _one_line(
-            f"TASK: Expand this into ONE line between {lo} and {max_chars} characters by adding ONE concrete, "
-            "plausible detail (scope, %, count, timeframe). Use a tasteful placeholder like X% only if no number "
-            "exists. Do not pad with filler words.",
+            f"TASK: Expand this into ONE line between {lo} and {max_chars} characters by adding ONE concrete "
+            "detail (scope, %, count, timeframe). If no real number exists, use a natural placeholder "
+            "(XX%, XX+, ₹XX, XX Cr, XX clients, XX team members) instead of inventing one. Do not pad with "
+            "filler words.",
             f"Bullet: {t}", max_chars, domain, 0.5, user_id=user_id,
         )
         if e and len(e) > len(t):
@@ -363,15 +371,22 @@ def generate_points(achievement: str, domain: str, max_chars: int, count: int = 
             f"the user's instructions win):\n{instructions[:800]}\n"
         )
     sys = _SHARED_RULES + (
-        f"\nTASK: Turn the user's achievement into {count} DISTINCT one-line CV bullet options.\n"
+        f"\nTASK: Turn the user's achievement into {count} DISTINCT one-line CV bullet options. Make the "
+        "options genuinely different in angle (e.g. consulting / business-impact / leadership / analytics / "
+        "product framing) so the user has real choices, not reworded twins.\n"
         f"CHARACTER TARGET (critical): each option MUST be between {lo} and {max_chars} characters — as close "
         f"to {max_chars} as possible WITHOUT ever exceeding it. Count characters carefully before answering.\n"
         f"Domain flavour: {domain or 'general management'}.\n"
         + extra +
-        "If (and ONLY if) the achievement is too vague or missing a key fact (what you actually did, the "
-        "outcome, or a number) to write an ACCURATE bullet, do NOT invent details — instead ask ONE short "
-        "clarifying question.\n"
-        'OUTPUT JSON: either {"clarify":"<one short question>"} '
+        "MISSING NUMBERS ARE NOT A REASON TO ASK. If a metric, percentage, team size, revenue, client count, "
+        "or timeframe is missing, DO NOT ask for it and DO NOT invent one — write the bullet with a natural "
+        "placeholder (XX%, XX+, ₹XX, XX Cr, XX clients, XX team members, ...) the user can replace later. "
+        "Every bullet must still carry quantified impact via these placeholders.\n"
+        "Ask a clarifying question ONLY when the ROLE or FUNCTION itself is genuinely ambiguous — i.e. you "
+        "cannot tell what kind of work this was (e.g. sales vs operations vs marketing) and that ambiguity "
+        "would make the bullet inaccurate. In that case ask ONE short question about the function, never about "
+        "numbers.\n"
+        'OUTPUT JSON: either {"clarify":"<one short question about the role/function>"} '
         'OR {"options":[{"text":"...","rationale":"one short why"}, ...]}'
     )
     resp = _chat(
