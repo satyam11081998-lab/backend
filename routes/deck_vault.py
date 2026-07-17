@@ -25,6 +25,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 
+from services import gdrive
 from services.auth import get_verified_user_id
 from services.rate_limit import check_rate_limit
 from services.supabase_client import get_supabase_client
@@ -139,22 +140,50 @@ async def submit_deck(
     deck_bytes, deck_ext, deck_ct = await _read_validated(deck, DECK_FORMATS, MAX_DECK_BYTES, "Deck")
     cert_bytes, cert_ext, cert_ct = await _read_validated(certificate, CERT_FORMATS, MAX_CERT_BYTES, "Certificate")
 
-    # ── Store files in the private vault bucket ──────────────────────────────
+    # ── Store files in the vault ─────────────────────────────────────────────
+    # Primary: the MECE Google Drive vault (same folder + `gdrive:<id>` path
+    # convention as the Deck Vault library, so the web app's admin/streaming
+    # routes read these files natively). Fallback: the private Supabase bucket,
+    # used only when Drive env isn't configured — a submission must never fail
+    # because of missing ops setup.
     import uuid as _uuid
 
     submission_id = str(_uuid.uuid4())
-    deck_path = f"{uid}/{submission_id}/deck{deck_ext}"
-    cert_path = f"{uid}/{submission_id}/certificate{cert_ext}"
-    storage = supabase.storage.from_(BUCKET)
+
+    def _cleanup(paths_or_ids: list[str]) -> None:
+        for p in paths_or_ids:
+            try:
+                if p.startswith(gdrive.GDRIVE_PREFIX):
+                    gdrive.delete_file(p[len(gdrive.GDRIVE_PREFIX):])
+                else:
+                    supabase.storage.from_(BUCKET).remove([p])
+            except Exception:
+                pass
+
+    stored: list[str] = []
     try:
-        storage.upload(deck_path, deck_bytes, file_options={"content-type": deck_ct})
-        storage.upload(cert_path, cert_bytes, file_options={"content-type": cert_ct})
+        if gdrive.is_configured():
+            deck_id = gdrive.upload_bytes(
+                f"submission_{submission_id}_deck{deck_ext}", deck_bytes, deck_ct)
+            deck_path = f"{gdrive.GDRIVE_PREFIX}{deck_id}"
+            stored.append(deck_path)
+            cert_id = gdrive.upload_bytes(
+                f"submission_{submission_id}_certificate{cert_ext}", cert_bytes, cert_ct)
+            cert_path = f"{gdrive.GDRIVE_PREFIX}{cert_id}"
+            stored.append(cert_path)
+        else:
+            deck_path = f"{uid}/{submission_id}/deck{deck_ext}"
+            cert_path = f"{uid}/{submission_id}/certificate{cert_ext}"
+            storage = supabase.storage.from_(BUCKET)
+            storage.upload(deck_path, deck_bytes, file_options={"content-type": deck_ct})
+            stored.append(deck_path)
+            storage.upload(cert_path, cert_bytes, file_options={"content-type": cert_ct})
+            stored.append(cert_path)
+    except HTTPException:
+        raise
     except Exception:
-        # Best-effort cleanup so a retry never hits a half-written path.
-        try:
-            storage.remove([deck_path, cert_path])
-        except Exception:
-            pass
+        # Best-effort cleanup so a retry never hits a half-written state.
+        _cleanup(stored)
         raise HTTPException(status_code=502, detail="Could not store your files — please try again in a minute.")
 
     # ── Record the submission ────────────────────────────────────────────────
@@ -175,10 +204,7 @@ async def submit_deck(
             "status": "pending",
         }).execute()
     except Exception:
-        try:
-            storage.remove([deck_path, cert_path])
-        except Exception:
-            pass
+        _cleanup(stored)
         # Most likely cause: the one-pending unique index raced a double-click.
         raise HTTPException(status_code=409, detail="Could not record the submission — you may already have one under review.")
 

@@ -20,7 +20,11 @@ import httpx
 
 def _send_sync(text: str) -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+    # Accept both names — an env-var name mismatch must not silently kill alerts.
+    chat_id = (
+        os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+        or os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    )
     if not token or not chat_id:
         return
     try:
