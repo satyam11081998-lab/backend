@@ -63,16 +63,33 @@ If the candidate says they're done, prompt them: "Great - what's your final numb
 INTERVIEWER_SYSTEM_PROMPT = CASE_INTERVIEWER_SYSTEM_PROMPT
 
 
+# Appended when the candidate has spent every clarification on this attempt.
+# The interviewer must NOT go silent (that used to happen server-side and read
+# as a broken app) — it stays in character and redirects them to assume and
+# move on, which is what a real interviewer does when a candidate over-asks.
+CLARIFICATIONS_EXHAUSTED_DIRECTIVE = """IMPORTANT — the candidate has used all of their clarification questions for this session.
+
+Do NOT answer the factual content of their question. Instead, in ONE short sentence, tell them they've used their clarifications and ask them to state a reasonable assumption themselves and carry on — e.g. "You've used your clarifications — make an assumption you're comfortable defending and take me through your structure."
+
+Do not mention quotas, plans, upgrades, billing or the word "quota". Stay in character as the interviewer. Keep it to one or two sentences.
+"""
+
+
 def build_interviewer_messages(
     case_content: str,
     case_type: str,
     transcript: Iterable[Dict[str, str]],
     new_user_message: str,
+    clarifications_exhausted: bool = False,
 ) -> List[Dict[str, str]]:
     """Build the OpenAI messages array for a single interviewer turn.
 
     System prompt is chosen by case_type: guesstimate gets a sizing-focused
     interviewer; everything else gets the general consulting interviewer.
+
+    `clarifications_exhausted` appends a directive telling the interviewer to
+    decline the clarification and redirect, instead of the server silently
+    returning no reply at all.
     """
     system_prompt = (
         GUESSTIMATE_INTERVIEWER_SYSTEM_PROMPT
@@ -89,6 +106,8 @@ def build_interviewer_messages(
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": case_context},
     ]
+    if clarifications_exhausted:
+        messages.append({"role": "system", "content": CLARIFICATIONS_EXHAUSTED_DIRECTIVE})
     for turn in transcript:
         role = turn.get("role") or "user"
         content = (turn.get("content") or "").strip()

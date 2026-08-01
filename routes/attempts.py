@@ -39,16 +39,21 @@ router = APIRouter(prefix="/attempts", tags=["attempts"])
 
 
 # -----------------------------------------------------------------------------
-# Tier -> clarification quota.
-# Free/Lite = 5, Pro = 15. The spec says "Lite Users: Max 5 / Pro Users: Max 15".
-# Free users only attempt the daily anyway; the same 5-cap reads as fair.
+# Tier -> clarification (AI hint) quota, PER ATTEMPT.
+#
+# 2026-08-01: free was 0, which made the free experience broken rather than
+# limited — count_clarifications() fires on any '?' , so a free user's very
+# first question (or even a structure containing a question mark) hit the
+# exhausted branch, got NO interviewer reply at all, and only a toast saying
+# "Clarification quota used up" before they had asked anything. Free tier's
+# limit is CASE ACCESS (daily pair + 1 lifetime extra, enforced in
+# services/access_guard.py), not conversation quality: once a free user is
+# inside a case they are entitled to a real interview.
+#
+# Ladder is monotonic. MUST stay in sync with TIER_LIMITS.maxHintQuestions in
+# the frontend's lib/tier.ts and with the pricing-page copy.
 # -----------------------------------------------------------------------------
-
-# Tier -> clarification (AI hint) quota. Free = 0 to match the pricing page
-# ("no AI hints") and TIER_LIMITS.free.maxHintQuestions. Free users can still
-# post structure and get scored on the daily case; they just can't spend AI
-# clarification questions. Lite = 5, Pro = 15.
-CLARIFICATION_QUOTA = {"free": 0, "lite": 5, "pro": 15}
+CLARIFICATION_QUOTA = {"free": 7, "lite": 12, "pro": 20}
 
 # Soft cap on total messages per attempt — prevents runaway sessions.
 MAX_MESSAGES_PER_ATTEMPT = 200
@@ -360,35 +365,44 @@ async def post_message(
     )
     user_msg = user_row.data[0]
 
-    # If quota is exhausted AND they asked a question, do not invoke AI.
-    # Spec: "Further clarification questions should be disabled" but the
-    # workspace stays open — the user can still post notes/calcs.
-    if clar_count > 0 and quota_exhausted:
-        return {
-            "user_message": user_msg,
-            "assistant_message": None,
-            "clarification_remaining": 0,
-            "quota_exhausted": True,
-            "reason": "Clarification quota exhausted — keep building your notes; the conversation will be evaluated when you submit.",
-        }
+    # Clarifications are exhausted for this turn?  We used to return early here
+    # with NO assistant reply at all — the user's message just hung in the
+    # thread forever, unanswered, with a toast that vanished on refresh. That
+    # read as a broken product, not a paywall (2026-08-01 fix).
+    #
+    # Now the interviewer ALWAYS replies. When the quota is spent it is told
+    # not to answer clarifications — it acknowledges and pushes the candidate
+    # to state an assumption and keep going, which is what a real interviewer
+    # does anyway. The turn costs one AI call but the session never dead-ends.
+    clarifications_spent = clar_count > 0 and quota_exhausted
 
-    # Decrement quota if this counted.
-    if clar_count > 0:
-        new_used = attempt["clarification_used"] + clar_count
+    # Decrement quota if this counted. Clamp to the quota: count_clarifications
+    # counts every '?', so a single packed turn could previously push
+    # clarification_used past clarification_quota and drive `remaining`
+    # negative (masked by max(0, ...) on the way out, but wrong in the DB).
+    if clar_count > 0 and not quota_exhausted:
+        new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
         supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
-        remaining -= clar_count
+        remaining = attempt["clarification_quota"] - new_used
 
     # ---------- Stream assistant reply ----------
     def event_stream():
         chunks: List[str] = []
         try:
-            yield f"event: meta\ndata: {{\"clarification_remaining\": {max(0, remaining)}, \"is_clarification\": {str(clar_count > 0).lower()}}}\n\n"
+            yield (
+                f"event: meta\ndata: {{"
+                f"\"clarification_remaining\": {max(0, remaining)}, "
+                f"\"is_clarification\": {str(clar_count > 0 and not quota_exhausted).lower()}, "
+                f"\"clarifications_spent\": {str(clarifications_spent).lower()}"
+                f"}}\n\n"
+            )
             for token in stream_interviewer_reply(
                 case_content=case["content"],
                 case_type=case["type"],
                 transcript=transcript,
                 new_user_message=body.content,
                 user_id=user_id,
+                clarifications_exhausted=clarifications_spent,
             ):
                 chunks.append(token)
                 # SSE data lines must not contain literal newlines — escape them.

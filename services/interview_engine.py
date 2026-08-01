@@ -49,17 +49,22 @@ def stream_interviewer_reply(
     transcript: Iterable[Dict[str, str]],
     new_user_message: str,
     user_id: Optional[str] = None,
+    clarifications_exhausted: bool = False,
 ) -> Generator[str, None, None]:
     """Yield text chunks as the interviewer responds.
 
     Intended to be wrapped in an SSE StreamingResponse. Each yielded chunk
     is a partial string suitable for client-side concatenation.
+
+    `clarifications_exhausted` makes the interviewer decline the clarification
+    and redirect, rather than the caller returning no reply at all.
     """
     messages = build_interviewer_messages(
         case_content=case_content,
         case_type=case_type,
         transcript=transcript,
         new_user_message=new_user_message,
+        clarifications_exhausted=clarifications_exhausted,
     )
     try:
         t0 = time.time()
@@ -103,6 +108,7 @@ def complete_interviewer_reply(
     case_type: str,
     transcript: Iterable[Dict[str, str]],
     new_user_message: str,
+    clarifications_exhausted: bool = False,
 ) -> str:
     """Non-streaming variant — used when SSE is not available."""
     messages = build_interviewer_messages(
@@ -110,6 +116,7 @@ def complete_interviewer_reply(
         case_type=case_type,
         transcript=transcript,
         new_user_message=new_user_message,
+        clarifications_exhausted=clarifications_exhausted,
     )
     try:
         resp = _client.chat.completions.create(
