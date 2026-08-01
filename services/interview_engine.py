@@ -34,6 +34,22 @@ _client = OpenAI(api_key=_OPENAI_API_KEY)
 INTERVIEWER_MODEL = "gpt-4o-mini"
 SCORING_MODEL = "gpt-4o"
 
+# Live-turn sampling. Was 0.4, which — combined with a prompt that literally
+# contained the words "say 'Let's assume X'" — made the interviewer open EVERY
+# reply with that exact phrase. A whole 7-question transcript read as one
+# sentence repeated with different nouns. 0.75 buys phrasing variety without
+# loosening the behavioural rules (those live in the system prompt, and the
+# 1-3 sentence cap plus max_tokens still bound the reply).
+# Scoring deliberately stays at its own low temperature — do NOT reuse this.
+INTERVIEWER_TEMPERATURE = 0.75
+
+# Repetition pressure at the sampler level, belt-and-braces with the prompt's
+# "never open two consecutive replies the same way" rule. Small values only:
+# these penalise token reuse, and the interviewer legitimately needs to repeat
+# domain nouns (revenue, market, segment) turn after turn.
+INTERVIEWER_FREQUENCY_PENALTY = 0.35
+INTERVIEWER_PRESENCE_PENALTY = 0.25
+
 
 class InterviewEngineError(Exception):
     pass
@@ -71,7 +87,9 @@ def stream_interviewer_reply(
         stream = _client.chat.completions.create(
             model=INTERVIEWER_MODEL,
             messages=messages,
-            temperature=0.4,
+            temperature=INTERVIEWER_TEMPERATURE,
+            frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
+            presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
             max_tokens=180,   # cap — interviewer replies must stay short
             stream=True,
             stream_options={"include_usage": True},  # final chunk carries token usage
@@ -122,7 +140,9 @@ def complete_interviewer_reply(
         resp = _client.chat.completions.create(
             model=INTERVIEWER_MODEL,
             messages=messages,
-            temperature=0.4,
+            temperature=INTERVIEWER_TEMPERATURE,
+            frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
+            presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
             max_tokens=180,
         )
     except Exception as e:
