@@ -41,11 +41,38 @@ def _effective_tier_from_row(row: dict) -> str:
     return tier
 
 
+def effective_tier_and_guest(supabase, user_id: str) -> tuple[str, bool]:
+    """Tier + guest flag from ONE users read.
+
+    DEPLOY-ORDER SAFETY: `is_guest` does not exist until migration 0045 has been
+    run. Selecting a missing column makes PostgREST return 400 and supabase-py
+    raise — and this function sits under `assert_can_attempt`, so an unguarded
+    select would turn "backend deployed a few minutes before the migration" into
+    "nobody can start a case". The fallback re-reads without the column and
+    reports is_guest=False, which is exactly the pre-0045 behaviour.
+
+    Deliberately NOT a bare `except Exception` around the whole body: a genuine
+    outage must still surface. Only the missing-column case degrades.
+    """
+    try:
+        u = supabase.table("users").select(
+            "subscription_tier, subscription_expires_at, is_guest"
+        ).eq("id", user_id).maybe_single().execute()
+        data = (u.data or {}) if u else {}
+        return _effective_tier_from_row(data), bool(data.get("is_guest"))
+    except Exception as exc:  # noqa: BLE001 — narrowed by the re-raise below
+        if "is_guest" not in str(exc):
+            raise
+        u = supabase.table("users").select(
+            "subscription_tier, subscription_expires_at"
+        ).eq("id", user_id).maybe_single().execute()
+        data = (u.data or {}) if u else {}
+        return _effective_tier_from_row(data), False
+
+
 def effective_tier(supabase, user_id: str) -> str:
-    u = supabase.table("users").select(
-        "subscription_tier, subscription_expires_at"
-    ).eq("id", user_id).maybe_single().execute()
-    return _effective_tier_from_row((u.data or {}) if u else {})
+    tier, _ = effective_tier_and_guest(supabase, user_id)
+    return tier
 
 
 def assert_tier_at_least(supabase, user_id: str, minimum: str) -> None:
@@ -65,7 +92,11 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
     bucket = "guesstimate" if case_type == "guesstimate" else "case"
     today = _today_ist()
 
-    tier = effective_tier(supabase, user_id)
+    # ONE users read for both facts. Do not re-query for is_guest further down:
+    # this function is on the hot path of every attempt start, and the guest
+    # check was originally written as a second effective_tier_and_guest() call,
+    # which silently doubled the round-trip on the non-daily branch.
+    tier, is_guest = effective_tier_and_guest(supabase, user_id)
     if tier == "pro":
         return
 
@@ -87,6 +118,15 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
         "user_id", user_id
     ).eq("case_id", case_id).limit(1).execute()
     is_first_attempt = not (prior and prior.data)
+
+    # Guests get today's daily pair and nothing else. A guest is a free-tier
+    # user whose one-time non-daily extras are zero — the daily branch below
+    # is reached unchanged, so no separate guest quota exists anywhere.
+    if not is_daily and is_guest:
+        raise HTTPException(
+            status_code=403,
+            detail="Sign up free to practise beyond today's case and guesstimate.",
+        )
 
     if is_daily:
         if tier == "free" and not is_first_attempt:

@@ -6,8 +6,8 @@ POST /deck-vault/submit  (multipart)  — deck + certificate + competition detai
 GET  /deck-vault/status               — caller's latest submission + live coupon, for the UI.
 
 Policy (defaults; admin can override the % at approval time in /admin/deck-vault):
-  corporate competition podium (winner / runner-up / 2nd runner-up) -> 60% off Pro
-  b-school  competition podium                                      -> 40% off Pro
+  corporate competition podium (winner / runner-up / 2nd runner-up) -> 35% off Pro
+  b-school  competition podium                                      -> 25% off Pro
 
 Security model:
   - Caller is identified ONLY from the verified Supabase JWT (never a body field).
@@ -26,7 +26,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 
 from services import gdrive
-from services.auth import get_verified_user_id
+from services.auth import get_verified_user, get_verified_user_id, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.supabase_client import get_supabase_client
 from services.telegram_notify import notify_deck_submission
@@ -34,13 +34,14 @@ from services.telegram_notify import notify_deck_submission
 router = APIRouter(prefix="/deck-vault", tags=["deck-vault"])
 
 BUCKET = "deck-vault-submissions"
-TNC_VERSION = "2026-07-17"
+TNC_VERSION = "2026-07-18"  # bumped: discount numbers in the displayed terms changed (35/25)
 
 MAX_DECK_BYTES = 20 * 1024 * 1024   # PDFs/PPTX of real competition decks run big
 MAX_CERT_BYTES = 10 * 1024 * 1024
 
 # Default discount matrix — mirrored in the frontend copy and admin UI.
-DEFAULT_PCT = {"corporate": 60, "bschool": 40}
+# (rev 2026-07-18: launched at 60/40, revised to 35/25 by owner.)
+DEFAULT_PCT = {"corporate": 35, "bschool": 25}
 
 VALID_TYPES = {"corporate", "bschool"}
 VALID_POSITIONS = {"winner", "runner_up", "second_runner_up"}
@@ -100,7 +101,9 @@ async def submit_deck(
     authorization: Optional[str] = Header(default=None),
 ):
     supabase = get_supabase_client()
-    uid = get_verified_user_id(supabase, authorization)
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403, detail="Create an account to submit decks.")
     # Tight cap: nobody legitimately submits more than a few times an hour.
     check_rate_limit(f"deckvault:{uid}", max_calls=4, window_seconds=3600)
 
@@ -239,7 +242,9 @@ async def submit_deck(
 async def deck_vault_status(authorization: Optional[str] = Header(default=None)):
     """Latest submission + live coupon for the signed-in user (drives the UI states)."""
     supabase = get_supabase_client()
-    uid = get_verified_user_id(supabase, authorization)
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403, detail="Create an account to submit decks.")
     check_rate_limit(f"deckvault-status:{uid}", max_calls=30, window_seconds=60)
 
     submission = None

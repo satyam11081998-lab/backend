@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 from services.supabase_client import get_supabase_client
-from services.auth import get_verified_user_id
+from services.auth import get_verified_user, get_verified_user_id, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget
 from services.access_guard import effective_tier
@@ -63,7 +63,9 @@ class PointResponse(BaseModel):
 
 def _guard(authorization: Optional[str], bucket: str):
     supabase = get_supabase_client()
-    uid = get_verified_user_id(supabase, authorization)
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403, detail="Create an account to use Bullet Lab.")
     # Bullet Lab is free for any signed-in user; rate-limit still applies.
     check_rate_limit(f"{bucket}:{uid}", max_calls=20, window_seconds=60)
     assert_daily_budget()  # global spend backstop

@@ -7,7 +7,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from services.supabase_client import get_supabase_client
-from services.auth import get_verified_user_id
+from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import (
     assert_ocr_quota,
@@ -44,7 +44,9 @@ async def extract_text(
     per-tier daily image quota, payload-size-capped, and logged to ai_usage_log.
     """
     supabase = get_supabase_client()
-    uid = get_verified_user_id(supabase, authorization)          # 401 if missing/invalid
+    uid, user_obj = get_verified_user(supabase, authorization)          # 401 if missing/invalid
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403, detail="Create an account to use image input.")
     check_rate_limit(f"ocr:{uid}", max_calls=12, window_seconds=60)
     assert_daily_budget()                                        # 503 if global cap hit
     assert_ocr_quota(supabase, uid)                             # 429 if user out of images

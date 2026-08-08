@@ -11,8 +11,8 @@ from typing import Optional
 from fastapi import HTTPException
 
 
-def get_verified_user_id(supabase, authorization: Optional[str]) -> str:
-    """Validate the Bearer access token and return the authenticated user id.
+def get_verified_user(supabase, authorization: Optional[str]):
+    """Validate the Bearer access token and return (uid, user_object).
 
     Raises HTTPException(401) if the header is missing or the token is invalid.
     """
@@ -21,9 +21,23 @@ def get_verified_user_id(supabase, authorization: Optional[str]) -> str:
         raise HTTPException(status_code=401, detail="Missing authentication token")
     try:
         res = supabase.auth.get_user(token)
-        uid = getattr(getattr(res, "user", None), "id", None)
+        user = getattr(res, "user", None)
+        uid = getattr(user, "id", None)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
     if not uid:
         raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+    return uid, user
+
+
+def get_verified_user_id(supabase, authorization: Optional[str]) -> str:
+    """Validate the Bearer access token and return the authenticated user id.
+
+    Raises HTTPException(401) if the header is missing or the token is invalid.
+    """
+    uid, _ = get_verified_user(supabase, authorization)
     return uid
+
+
+def is_guest_user(user) -> bool:
+    return getattr(user, 'is_anonymous', False) is True
