@@ -53,3 +53,5 @@ app.include_router(usage.router)
 app.include_router(deck_vault.router)
 from routes import resume as _resume
 app.include_router(_resume.router)
+from routes import certificates as _certificates
+app.include_router(_certificates.router)
