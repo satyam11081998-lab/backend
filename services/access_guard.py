@@ -75,6 +75,29 @@ def effective_tier(supabase, user_id: str) -> str:
     return tier
 
 
+def assert_can_submit(supabase, user_id: str) -> None:
+    """Raise 403 if an anonymous guest tries to submit for scoring.
+
+    GUEST MODE (0045). This is THE wall. A guest works the whole case for free —
+    clarifications, structure, arithmetic, recommendation — and is asked for an
+    account at the one moment it buys them something: the score.
+
+    It must be enforced here and not only in the UI. `submitAttempt` is a plain
+    authenticated call and an anonymous JWT is a perfectly valid one, so a guest
+    who skips the dialog would otherwise get scoring — the most expensive call
+    in the product — for free and unbounded.
+
+    Conversion keeps the SAME auth.users row, so by the time this passes, the
+    attempt being submitted is already theirs. Nothing is re-parented.
+    """
+    _, is_guest = effective_tier_and_guest(supabase, user_id)
+    if is_guest:
+        raise HTTPException(
+            status_code=403,
+            detail="Create a free account to see your score. Your answer is saved.",
+        )
+
+
 def assert_tier_at_least(supabase, user_id: str, minimum: str) -> None:
     """Raise 403 if the user's effective tier is below `minimum`."""
     tier = effective_tier(supabase, user_id)
@@ -129,6 +152,12 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
         )
 
     if is_daily:
+        # GUEST MODE (0045): unlimited re-attempts at the daily pair. The wall
+        # is at SUBMIT (see assert_can_submit), so a guest has never been
+        # scored and the free-tier one-attempt rule has nothing to protect.
+        # Blocking here would strand a half-finished conversation instead.
+        if is_guest:
+            return
         if tier == "free" and not is_first_attempt:
             raise HTTPException(
                 status_code=403,

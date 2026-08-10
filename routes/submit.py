@@ -10,7 +10,7 @@ from services.supabase_client import get_supabase_client
 from services.ai_scorer import score_case_answer, score_guesstimate_answer, AIScoringError
 from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
-from services.access_guard import assert_can_attempt
+from services.access_guard import assert_can_attempt, assert_can_submit
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget
 from services.limits import ANSWER_MAX_CHARS
@@ -80,6 +80,13 @@ async def submit_answer(
     case_type = case["type"]
 
     # TIER / QUOTA GATE — runs BEFORE any OpenAI spend.
+    # GUEST MODE (0045): the guest wall sits here, first. Scoring is the most
+    # expensive call in the product, and an anonymous JWT is a valid one — so
+    # without this a guest who bypasses the client dialog gets it free and
+    # unbounded. Ordered before assert_can_attempt so the guest gets the
+    # "create an account" message rather than a tier message that makes no
+    # sense to someone who has no account yet.
+    assert_can_submit(supabase, submission.user_id)
     assert_can_attempt(supabase, submission.user_id, case)
     assert_daily_budget()  # global spend backstop
 

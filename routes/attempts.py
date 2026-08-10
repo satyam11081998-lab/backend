@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from services.supabase_client import get_supabase_client
-from services.auth import get_verified_user_id
+from services.auth import get_verified_user_id, get_verified_user, is_guest_user
 from services.access_guard import assert_can_attempt, effective_tier
 from services.rate_limit import check_rate_limit
 from services.limits import MESSAGE_MAX_CHARS, RECOMMENDATION_MAX_CHARS
@@ -57,6 +57,17 @@ CLARIFICATION_QUOTA = {"free": 7, "lite": 12, "pro": 20}
 
 # Soft cap on total messages per attempt — prevents runaway sessions.
 MAX_MESSAGES_PER_ATTEMPT = 200
+
+# GUEST MODE (0045). A guest reaches the interviewer with no email, no payment
+# method and nothing to rate-limit against except a cookie they can clear — and
+# every turn is a real LLM call. 200 is a sane ceiling for an account we can
+# trace; for an anonymous session it is an open tab on the AI bill.
+#
+# 40 is deliberately generous against real use: a full 15-minute case runs
+# 15-20 user turns, so a genuine candidate never sees this. It exists to bound
+# the worst case, not to shape the good one. Raise it if real transcripts start
+# hitting it; do not remove it.
+GUEST_MAX_MESSAGES_PER_ATTEMPT = 40
 
 # Upload caps (matching schema notes).
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -320,8 +331,17 @@ async def post_message(
     authorization: Optional[str] = Header(default=None),
 ):
     supabase = get_supabase_client()
-    user_id = get_verified_user_id(supabase, authorization)
-    check_rate_limit(f"attempts:msg:{user_id}", max_calls=60, window_seconds=60)
+    # One token read for both the id and the guest flag — get_verified_user_id
+    # would repeat this round-trip, and this is the hottest path in the app.
+    user_id, user_obj = get_verified_user(supabase, authorization)
+    is_guest = is_guest_user(user_obj)
+
+    # Guests get a tighter turn rate. A human types; a script does not wait.
+    check_rate_limit(
+        f"attempts:msg:{user_id}",
+        max_calls=20 if is_guest else 60,
+        window_seconds=60,
+    )
 
     attempt = _load_attempt(supabase, attempt_id, user_id)
     if attempt["status"] != "active":
@@ -337,8 +357,19 @@ async def post_message(
         .execute()
     )
     total = getattr(count_res, "count", None) or len(count_res.data or [])
-    if total >= MAX_MESSAGES_PER_ATTEMPT:
-        raise HTTPException(status_code=400, detail="Message limit reached for this attempt")
+    cap = GUEST_MAX_MESSAGES_PER_ATTEMPT if is_guest else MAX_MESSAGES_PER_ATTEMPT
+    if total >= cap:
+        # Phrased as an invitation rather than a wall: a guest who genuinely
+        # reached 40 turns is deeply engaged, and this is the best possible
+        # moment to ask for the account.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "You've reached the practice limit for this session. Create a free account to keep going."
+                if is_guest
+                else "Message limit reached for this attempt"
+            ),
+        )
 
     case = _load_case(supabase, attempt["case_id"])
     transcript = _fetch_transcript(supabase, attempt_id)
