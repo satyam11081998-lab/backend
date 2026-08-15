@@ -375,7 +375,7 @@ async def post_message(
     transcript = _fetch_transcript(supabase, attempt_id)
 
     # Does this turn consume clarification quota?
-    clar_count = count_clarifications(body.content)
+    clar_count = count_clarifications(body.content, body.kind)
     remaining = attempt["clarification_quota"] - attempt["clarification_used"]
     quota_exhausted = remaining <= 0
 

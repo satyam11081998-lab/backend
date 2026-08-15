@@ -33,6 +33,15 @@ PRICES = {  # (input $/1M, output $/1M)
 }
 WHISPER_PER_MIN = 0.006
 
+# TTS is priced per CHARACTER, not per token — it must NOT go in PRICES (those
+# are token tuples and _est_cost would read a TTS call as 0, because a speech
+# response carries no `usage`). A silently-zero cost would make voice mode
+# invisible to spend_today_usd(), which is exactly what assert_daily_budget()
+# reads — the global kill switch would not see the most expensive thing we do.
+# tts-1 is $15/1M chars; at ~900 spoken chars/min that is ~$0.0135/min.
+TTS_CHARS_PER_MIN = 900.0
+TTS_PER_MIN = 0.015
+
 # ---------------------------------------------------------------------------
 # Per-tier daily allowances (env-overridable — tune without a redeploy).
 # Defaults chosen to keep worst-case per-user cost a small fraction of tier
@@ -55,6 +64,20 @@ OCR_IMG_PER_DAY = {
     "free": _int_env("AI_OCR_IMG_FREE", 5),
     "lite": _int_env("AI_OCR_IMG_LITE", 20),
     "pro":  _int_env("AI_OCR_IMG_PRO", 100),
+}
+# Talk mode (Pro only). This meter is SEPARATE from VOICE_MIN_PER_DAY: that one
+# counts the candidate's speech into Whisper, this one counts the interviewer's
+# speech out of TTS. Keeping them apart means dictation and talk mode do not
+# quietly eat each other's allowance.
+#
+# NOTE: a full spoken case is 20-40 min of candidate audio, so talk mode also
+# consumes VOICE_MIN_PER_DAY. Raise AI_VOICE_MIN_PRO alongside AI_TTS_MIN_PRO
+# (both env-tunable) before unflagging talk mode, or a Pro user's second case of
+# the day 429s mid-interview.
+TTS_MIN_PER_DAY = {
+    "free": _int_env("AI_TTS_MIN_FREE", 0),
+    "lite": _int_env("AI_TTS_MIN_LITE", 0),
+    "pro":  _int_env("AI_TTS_MIN_PRO", 60),
 }
 
 DAILY_BUDGET_USD = float(os.getenv("AI_DAILY_BUDGET_USD", "10.0"))
@@ -100,6 +123,11 @@ def log_ai_usage(
 
         if model == "whisper-1" and audio_minutes is not None:
             cost = audio_minutes * WHISPER_PER_MIN
+        elif model.startswith("tts") and audio_minutes is not None:
+            # Character-priced, no usage object — see TTS_PER_MIN. Without this
+            # branch every /speak row would book $0 and hide talk-mode spend
+            # from the daily-budget kill switch.
+            cost = audio_minutes * TTS_PER_MIN
         else:
             cost = _est_cost(model, pt, ct)
 
@@ -147,13 +175,24 @@ def ocr_images_used_today(supabase, user_id: str) -> int:
     return len(_rows_today(supabase, user_id, "/extract-text"))
 
 
+def speak_minutes_used_today(supabase, user_id: str) -> float:
+    """Interviewer TTS minutes spoken to this user today (talk mode).
+
+    Reads `/speak` rows only, so it cannot pollute — or be polluted by — the
+    `/transcribe` voice meter above.
+    """
+    return round(sum(float(r.get("audio_minutes") or 0) for r in _rows_today(supabase, user_id, "/speak")), 3)
+
+
 def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
     """Full quota snapshot for the frontend 'X min / Y images left today' UI."""
     tier = effective_tier(supabase, user_id)
     v_limit = VOICE_MIN_PER_DAY.get(tier, VOICE_MIN_PER_DAY["free"])
     o_limit = OCR_IMG_PER_DAY.get(tier, OCR_IMG_PER_DAY["free"])
+    s_limit = TTS_MIN_PER_DAY.get(tier, TTS_MIN_PER_DAY["free"])
     v_used = voice_minutes_used_today(supabase, user_id)
     o_used = ocr_images_used_today(supabase, user_id)
+    s_used = speak_minutes_used_today(supabase, user_id)
     return {
         "tier": tier,
         "voice": {
@@ -166,6 +205,13 @@ def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
             "limit": o_limit,
             "remaining": max(0, o_limit - o_used),
         },
+        # Additive key (talk mode). Existing "voice" and "images" blocks are
+        # untouched, so every current reader keeps working unchanged.
+        "speak": {
+            "used_min": round(s_used, 2),
+            "limit_min": s_limit,
+            "remaining_min": max(0.0, round(s_limit - s_used, 2)),
+        },
     }
 
 
@@ -177,6 +223,26 @@ def assert_voice_quota(supabase, user_id: str) -> float:
             status_code=429,
             detail=f"Daily voice-to-text limit reached ({q['limit_min']} min). "
                    f"Resets at midnight IST — you can still type your answer.",
+        )
+    return q["remaining_min"]
+
+
+def assert_tts_quota(supabase, user_id: str) -> float:
+    """Raise 429 if today's talk-mode minutes are used up. Returns remaining minutes.
+
+    Kept for symmetry with assert_voice_quota / assert_ocr_quota and for any
+    caller that does not already hold a quota snapshot. `/speak` deliberately
+    does NOT use it: that route needs the tier AND the meter AND a remaining
+    figure for its response header, and calling three separate helpers costs
+    nine Supabase round-trips per spoken sentence. It takes one snapshot and
+    reads all three off it.
+    """
+    q = get_ai_input_quota(supabase, user_id)["speak"]
+    if q["remaining_min"] <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily voice-interview limit reached ({q['limit_min']} min). "
+                   f"Resets at midnight IST — you can carry on in the chat.",
         )
     return q["remaining_min"]
 

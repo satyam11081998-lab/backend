@@ -175,7 +175,12 @@ def _flatten_for_legacy_scorer(
         content = (t.get("content") or "").strip()
         if not content:
             continue
-        prefix = role if kind == "text" else f"{role} ({kind})"
+        # Voice is collapsed to text for SCORING (owner decision 2026-08-13): a
+        # spoken attempt must be judged on the same document as a typed one, or
+        # talk mode quietly becomes a different exam. image/file stay tagged —
+        # those genuinely change what the turn means (a chart was uploaded).
+        display_kind = "text" if kind == "voice" else kind
+        prefix = role if display_kind == "text" else f"{role} ({display_kind})"
         lines.append(f"[{prefix}] {content}")
     lines.append("")
     lines.append(f"[FINAL] {final_recommendation.strip()}")
@@ -280,29 +285,8 @@ def score_conversation(
 # -----------------------------------------------------------------------------
 # Clarification classifier
 # -----------------------------------------------------------------------------
-
-def count_clarifications(text: str) -> int:
-    """Heuristic — counts how many clarification questions are in the turn.
-
-    Counts question marks. If none, but it opens with an interrogative phrase,
-    counts as 1. Prevents users from packing 5 questions into a single message
-    and only consuming 1 quota point.
-    """
-    if not text:
-        return 0
-    
-    q_count = text.count("?")
-    if q_count > 0:
-        return q_count
-        
-    stripped = text.strip().lower()
-    openers = (
-        "what ", "why ", "how ", "when ", "where ", "who ",
-        "is ", "are ", "do ", "does ", "did ", "can ", "could ",
-        "should ", "would ", "may ", "might ",
-    )
-    first = stripped.split("\n", 1)[0]
-    if any(first.startswith(o) for o in openers):
-        return 1
-        
-    return 0
+# Lives in services/clarification_counter.py — a pure string heuristic with no
+# OpenAI dependency, moved out so it can be tested without an API key (this
+# module builds a client at import time and raises without one). Re-exported
+# here so every existing importer keeps working unchanged.
+from services.clarification_counter import count_clarifications  # noqa: E402,F401

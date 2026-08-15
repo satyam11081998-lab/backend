@@ -236,8 +236,14 @@ def build_conversation_scoring_user_prompt(
             continue
         turn_idx += 1
         tag = f"[{turn_idx}] {role}"
-        if kind != "text":
-            tag += f" ({kind})"
+        # Voice is collapsed to text for SCORING (owner decision 2026-08-13).
+        # Talk mode makes EVERY candidate turn 'voice', so without this the
+        # scorer would receive a visibly different document for a spoken attempt
+        # than for a typed one — same rubric, different input. image/file keep
+        # their tag because the scorer should know a chart was uploaded.
+        display_kind = "text" if kind == "voice" else kind
+        if display_kind != "text":
+            tag += f" ({display_kind})"
         lines.append(tag)
         lines.append(content)
         lines.append("")
