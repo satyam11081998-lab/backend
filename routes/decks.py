@@ -82,6 +82,51 @@ def _effective_free_pages(supabase, deck_id: str, fallback_page_count: Optional[
     return 1
 
 
+def _assert_is_pdf(data: bytes, deck: dict) -> None:
+    """Fail with a USEFUL message before pdfium says 'Data format error'.
+
+    pdfium reports every non-PDF input identically, which tells you nothing
+    about which of the three actual causes you have. All three are real here:
+
+      1. The deck is a PPTX/PPT/XLSX. The admin uploader accepts
+         `.pdf,.pptx,.ppt,.xlsx`, but the renderer is PDF-only — Office files
+         start with 'PK' because they are zip archives.
+      2. The download returned an HTML error page instead of a file, which is
+         what a failed Google Drive auth looks like from here.
+      3. The file is genuinely corrupt or empty.
+
+    Reading the first bytes distinguishes them in one line.
+    """
+    if not data:
+        raise HTTPException(status_code=422, detail="Deck file is empty — re-upload it.")
+
+    head = data[:5]
+    if head.startswith(b"%PDF"):
+        return
+
+    ext = (deck.get("file_type") or "").lower()
+    if head.startswith(b"PK"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This deck is a {ext.upper() if ext else 'PowerPoint/Office'} file, not a PDF. "
+                "Slide rendering is PDF-only — export the deck to PDF and re-upload it."
+            ),
+        )
+    if head.lstrip()[:1] in (b"<",):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Storage returned an HTML page instead of the deck file. This is usually "
+                "Google Drive auth failing on the backend — check GOOGLE_DRIVE_* env vars."
+            ),
+        )
+    raise HTTPException(
+        status_code=422,
+        detail=f"Deck file is not a readable PDF (starts with {head!r}). Re-upload it as a PDF.",
+    )
+
+
 def _fetch_deck_bytes(storage_path: str, supabase) -> bytes:
     """Download binary bytes from Google Drive or Supabase storage."""
     if not storage_path:
@@ -128,8 +173,17 @@ async def process_deck(
     try:
         if pdf is not None:
             pdf_bytes = await pdf.read()
+            _assert_is_pdf(pdf_bytes, deck)
         else:
             pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+            _assert_is_pdf(pdf_bytes, deck)
+    except HTTPException:
+        # _assert_is_pdf already produced the precise, actionable message
+        # ("this is a PPTX", "Drive returned HTML"). Letting the generic handler
+        # below re-wrap it would bury that inside "Could not load PDF bytes:
+        # 422: ..." and hand the admin back exactly the kind of opaque error
+        # this guard exists to replace.
+        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Could not load PDF bytes: {e}")
 
@@ -158,6 +212,8 @@ async def process_deck(
         )
     except DeckAIError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         summary = deck.get("summary") or ""
 
@@ -188,8 +244,17 @@ async def render_only(
     try:
         if pdf is not None:
             pdf_bytes = await pdf.read()
+            _assert_is_pdf(pdf_bytes, deck)
         else:
             pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+            _assert_is_pdf(pdf_bytes, deck)
+    except HTTPException:
+        # _assert_is_pdf already produced the precise, actionable message
+        # ("this is a PPTX", "Drive returned HTML"). Letting the generic handler
+        # below re-wrap it would bury that inside "Could not load PDF bytes:
+        # 422: ..." and hand the admin back exactly the kind of opaque error
+        # this guard exists to replace.
+        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Could not load PDF bytes: {e}")
 
@@ -229,6 +294,8 @@ async def summarize_only(
         raise HTTPException(status_code=404, detail="Deck not found")
 
     pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+
+    _assert_is_pdf(pdf_bytes, deck)
 
     try:
         summary = generate_deck_summary(
