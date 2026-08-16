@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from routes import submit, news, cron, daily, transcribe, attempts, vision, usage, deck_vault, speak
+from routes import submit, news, cron, daily, transcribe, attempts, vision, usage, deck_vault, speak, realtime
 import os
 
 load_dotenv()
@@ -48,6 +48,7 @@ app.include_router(cron.router)
 app.include_router(daily.router)
 app.include_router(transcribe.router, prefix="/transcribe")
 app.include_router(speak.router, prefix="/speak")
+app.include_router(realtime.router, prefix="/realtime")
 app.include_router(attempts.router)
 app.include_router(vision.router, prefix="/extract-text")
 app.include_router(usage.router)

@@ -33,7 +33,7 @@ from services.interview_engine import (
     InterviewEngineError,
 )
 from services.badge_awarder import award_badges_for_submission
-from services.ai_usage import assert_daily_budget
+from services.ai_usage import assert_daily_budget, log_realtime_usage
 
 router = APIRouter(prefix="/attempts", tags=["attempts"])
 
@@ -118,6 +118,24 @@ class AttemptDetail(BaseModel):
 class PostMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=MESSAGE_MAX_CHARS)
     kind: str = Field("text", description="text | voice | image | file")
+
+
+class RealtimeTurnRequest(BaseModel):
+    """One turn reported by a realtime (WebRTC) voice session.
+
+    Realtime runs the conversation at the far end, so the model has ALREADY
+    replied by the time we hear about it — unlike /messages, this endpoint must
+    not call the interviewer. Its only job is to land the same
+    `attempt_messages` rows the typed path produces, so scoring reads one
+    format regardless of transport.
+    """
+    role: str = Field(..., description="user | assistant")
+    content: str = Field(..., min_length=1, max_length=MESSAGE_MAX_CHARS)
+    # Audio-token usage from the client's `response.done`. Optional because a
+    # user turn carries none; when present it is what makes realtime spend
+    # visible to the daily-budget kill switch.
+    audio_input_tokens: Optional[int] = None
+    audio_output_tokens: Optional[int] = None
 
 
 class SubmitRequest(BaseModel):
@@ -467,6 +485,87 @@ async def post_message(
 # =============================================================================
 # POST /attempts/{id}/uploads  — image/doc attachment
 # =============================================================================
+
+@router.post("/{attempt_id}/realtime-turn")
+async def post_realtime_turn(
+    attempt_id: str,
+    body: RealtimeTurnRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Persist one turn from a realtime voice session, and meter its cost.
+
+    Deliberately NOT a variant of post_message: that function's whole body is
+    "call the interviewer and stream the reply", which realtime has already
+    done. What must NOT diverge is the row that lands in `attempt_messages` —
+    same table, same `kind='voice'`, so a spoken attempt is scored on the same
+    document as a typed one.
+    """
+    supabase = get_supabase_client()
+    user_id, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403, detail="Create an account to use voice interview mode.")
+
+    # Two turns per exchange, and the far end can be quick — looser than
+    # /messages, still bounded.
+    check_rate_limit(f"attempts:rt:{user_id}", max_calls=120, window_seconds=60)
+
+    attempt = _load_attempt(supabase, attempt_id, user_id)
+    if attempt["status"] != "active":
+        raise HTTPException(status_code=400, detail="Attempt already submitted")
+
+    role = body.role if body.role in ("user", "assistant") else "user"
+
+    count_res = (
+        supabase.table("attempt_messages")
+        .select("id", count="exact")
+        .eq("attempt_id", attempt_id)
+        .execute()
+    )
+    total = getattr(count_res, "count", None) or len(count_res.data or [])
+    if total >= MAX_MESSAGES_PER_ATTEMPT:
+        raise HTTPException(status_code=400, detail="Message limit reached for this attempt")
+
+    # C9 v2 still applies to spoken turns. We cannot refuse mid-stream the way
+    # post_message does — the far end has already answered — so this records
+    # consumption rather than gating it. See the C9 open item in the realtime
+    # handoff before changing this.
+    clar_count = 0
+    if role == "user":
+        clar_count = count_clarifications(body.content, "voice")
+        if clar_count > 0:
+            new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
+            supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
+
+    saved = (
+        supabase.table("attempt_messages")
+        .insert(
+            {
+                "attempt_id": attempt_id,
+                "role": role,
+                "kind": "voice",
+                "content": body.content,
+                "is_clarification": clar_count > 0,
+            }
+        )
+        .execute()
+    )
+
+    # Meter it. gpt-realtime bills audio per token: input 1 tok/100ms, output
+    # 1 tok/50ms. Booking a real cost here is the ONLY thing that makes voice
+    # spend visible to spend_today_usd(), which is what assert_daily_budget()
+    # reads. If this books zero, the global kill switch is blind to the most
+    # expensive thing the product does.
+    if body.audio_input_tokens or body.audio_output_tokens:
+        log_realtime_usage(
+            user_id=user_id,
+            input_tokens=body.audio_input_tokens or 0,
+            output_tokens=body.audio_output_tokens or 0,
+            meta={"attempt_id": attempt_id, "role": role},
+        )
+
+    return {"message_id": saved.data[0]["id"] if saved.data else None}
+
 
 @router.post("/{attempt_id}/uploads")
 async def upload_file(

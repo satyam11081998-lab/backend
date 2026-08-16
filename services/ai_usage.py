@@ -42,6 +42,16 @@ WHISPER_PER_MIN = 0.006
 TTS_CHARS_PER_MIN = 900.0
 TTS_PER_MIN = 0.015
 
+# Realtime (speech-to-speech) audio pricing, verified 2026-08-16.
+# Input $32/1M audio tokens, output $64/1M. Rates: user audio is 1 token per
+# 100ms (600 tok/min), assistant audio 1 token per 50ms (1200 tok/min).
+# Priced per TOKEN, like TTS is priced per character — neither belongs in
+# PRICES, which _est_cost() reads as (input, output) per-1M-TEXT-token tuples.
+REALTIME_AUDIO_IN_PER_1M = 32.00
+REALTIME_AUDIO_OUT_PER_1M = 64.00
+REALTIME_IN_TOK_PER_MIN = 600.0
+REALTIME_OUT_TOK_PER_MIN = 1200.0
+
 # ---------------------------------------------------------------------------
 # Per-tier daily allowances (env-overridable — tune without a redeploy).
 # Defaults chosen to keep worst-case per-user cost a small fraction of tier
@@ -173,6 +183,51 @@ def voice_minutes_used_today(supabase, user_id: str) -> float:
 
 def ocr_images_used_today(supabase, user_id: str) -> int:
     return len(_rows_today(supabase, user_id, "/extract-text"))
+
+
+def log_realtime_usage(
+    user_id: Optional[str],
+    input_tokens: int,
+    output_tokens: int,
+    meta: Optional[dict] = None,
+) -> None:
+    """Book the cost of one realtime turn so the daily-budget guard can see it.
+
+    Realtime usage arrives from the BROWSER (the `response.done` event), which
+    is the one place in the product where spend is reported by the client. That
+    makes this function load-bearing: if it books zero — the way a TTS call
+    would have, had it been routed through _est_cost() — then
+    `spend_today_usd()` under-reports and `assert_daily_budget()` never trips.
+    """
+    cost = (
+        input_tokens * REALTIME_AUDIO_IN_PER_1M / 1e6
+        + output_tokens * REALTIME_AUDIO_OUT_PER_1M / 1e6
+    )
+    # Recorded as minutes too, so the /realtime meter reads like the others.
+    minutes = (
+        input_tokens / REALTIME_IN_TOK_PER_MIN + output_tokens / REALTIME_OUT_TOK_PER_MIN
+    )
+    try:
+        get_supabase_client().table("ai_usage_log").insert({
+            "user_id": user_id,
+            "endpoint": "/realtime",
+            "model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "audio_minutes": round(minutes, 3),
+            "est_cost_usd": round(cost, 6),
+            "success": True,
+            "meta": meta or {},
+        }).execute()
+    except Exception:
+        pass  # never let metering break a live interview
+
+
+def realtime_minutes_used_today(supabase, user_id: str) -> float:
+    """Realtime voice minutes today. Unmetered per-user by owner decision
+    (2026-08-16) — exposed so a cap can be switched on from data, not guesswork."""
+    return round(sum(float(r.get("audio_minutes") or 0) for r in _rows_today(supabase, user_id, "/realtime")), 3)
 
 
 def speak_minutes_used_today(supabase, user_id: str) -> float:
