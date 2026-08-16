@@ -60,24 +60,21 @@ def _apply_watermark(image: Image.Image, watermark_text: str) -> Image.Image:
 
     pad_x = int(width * 0.02)
     pad_y = int(height * 0.02)
-    bar_padding = 8
 
-    x1 = width - pad_x - text_w - (bar_padding * 2)
-    y1 = height - pad_y - text_h - (bar_padding * 2)
-    x2 = width - pad_x
-    y2 = height - pad_y
+    x = width - pad_x - text_w
+    y = height - pad_y - text_h
 
-    draw.rounded_rectangle(
-        [x1, y1, x2, y2],
-        radius=6,
-        fill=(15, 23, 42, 180),  # slate-900 at ~70% opacity
-    )
-    draw.text(
-        (x1 + bar_padding, y1 + bar_padding - bbox[1]),
-        label,
-        font=font,
-        fill=(255, 255, 255, 230),  # bright white at ~90% opacity
-    )
+    # LIGHT watermark (owner decision, 2026-08-16). The previous version painted
+    # a solid slate bar at 70% opacity with near-opaque white text, which read as
+    # damage to the slide on a public marketing page. This is the trade-off being
+    # made deliberately: a watermark cannot PREVENT a screenshot, it makes one
+    # traceable — and a light mark survives a screenshot just as well as a heavy
+    # one while leaving the slide readable enough to sell the upgrade.
+    #
+    # A 1px dark offset keeps it legible on both white and dark slides without
+    # needing a background bar.
+    draw.text((x + 1, y - bbox[1] + 1), label, font=font, fill=(15, 23, 42, 70))
+    draw.text((x, y - bbox[1]), label, font=font, fill=(255, 255, 255, 110))
 
     composited = Image.alpha_composite(base, overlay)
     result = composited.convert("RGB")
