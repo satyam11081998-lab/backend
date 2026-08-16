@@ -7,6 +7,7 @@ Provides endpoints for:
 - Full end-to-end deck processing.
 """
 
+import os
 from typing import Optional
 
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
