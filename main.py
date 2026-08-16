@@ -57,3 +57,5 @@ from routes import resume as _resume
 app.include_router(_resume.router)
 from routes import certificates as _certificates
 app.include_router(_certificates.router)
+from routes import decks as _decks
+app.include_router(_decks.router)

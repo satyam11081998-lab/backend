@@ -166,3 +166,15 @@ def delete_file(file_id: str) -> None:
     )
     if resp.status_code not in (200, 204, 404):
         resp.raise_for_status()
+
+
+def download_file_bytes(file_id: str) -> bytes:
+    """Download full binary bytes of a file from Google Drive."""
+    token = _access_token()
+    resp = httpx.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    return resp.content
