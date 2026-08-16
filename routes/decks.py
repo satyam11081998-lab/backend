@@ -110,6 +110,7 @@ def _fetch_deck_bytes(storage_path: str, supabase) -> bytes:
 @router.post("/{deck_id}/process")
 async def process_deck(
     deck_id: str,
+    pdf: Optional[UploadFile] = File(None),
     authorization: Optional[str] = Header(default=None),
 ):
     """End-to-end processing: renders WebP pages and generates verified AI summary."""
@@ -123,16 +124,25 @@ async def process_deck(
     if not deck:
         raise HTTPException(status_code=404, detail="Deck not found")
 
-    pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+    try:
+        if pdf is not None:
+            pdf_bytes = await pdf.read()
+        else:
+            pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not load PDF bytes: {e}")
 
     # 1. Render pages
     free_pages = _effective_free_pages(supabase, deck_id, deck.get("page_count"))
-    render_result = render_deck_pages(
-        deck_id=deck["id"],
-        pdf_bytes=pdf_bytes,
-        slug=deck.get("slug") or "",
-        effective_free_pages=free_pages,
-    )
+    try:
+        render_result = render_deck_pages(
+            deck_id=deck["id"],
+            pdf_bytes=pdf_bytes,
+            slug=deck.get("slug") or "",
+            effective_free_pages=free_pages,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Page rendering failed: {e}")
 
     # 2. Generate summary
     try:
@@ -147,6 +157,8 @@ async def process_deck(
         )
     except DeckAIError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        summary = deck.get("summary") or ""
 
     return {
         "success": True,
@@ -159,6 +171,7 @@ async def process_deck(
 @router.post("/{deck_id}/render")
 async def render_only(
     deck_id: str,
+    pdf: Optional[UploadFile] = File(None),
     authorization: Optional[str] = Header(default=None),
 ):
     """Rasterise and store WebP page images."""
@@ -171,15 +184,25 @@ async def render_only(
     if not deck:
         raise HTTPException(status_code=404, detail="Deck not found")
 
-    pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+    try:
+        if pdf is not None:
+            pdf_bytes = await pdf.read()
+        else:
+            pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not load PDF bytes: {e}")
+
     free_pages = _effective_free_pages(supabase, deck_id, deck.get("page_count"))
 
-    render_result = render_deck_pages(
-        deck_id=deck["id"],
-        pdf_bytes=pdf_bytes,
-        slug=deck.get("slug") or "",
-        effective_free_pages=free_pages,
-    )
+    try:
+        render_result = render_deck_pages(
+            deck_id=deck["id"],
+            pdf_bytes=pdf_bytes,
+            slug=deck.get("slug") or "",
+            effective_free_pages=free_pages,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Page rendering failed: {e}")
 
     return {
         "success": True,
