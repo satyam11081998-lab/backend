@@ -11,6 +11,7 @@ ensure link previews on social/chat platforms and AI search scrapers render
 reliably without WebP compatibility issues.
 """
 
+import gc
 import io
 import time
 from typing import Optional
@@ -78,8 +79,18 @@ def _apply_watermark(image: Image.Image, watermark_text: str) -> Image.Image:
         fill=(255, 255, 255, 230),  # bright white at ~90% opacity
     )
 
-    watermarked = Image.alpha_composite(base, overlay)
-    return watermarked.convert("RGB")
+    composited = Image.alpha_composite(base, overlay)
+    result = composited.convert("RGB")
+    # This function allocates FOUR full-size images (base, overlay, composited,
+    # result) and only the last is returned. Leaving the other three to the
+    # garbage collector is ~13MB per watermarked page at 1600px, on an instance
+    # that already ran out of memory once.
+    for tmp in (composited, overlay, base):
+        try:
+            tmp.close()
+        except Exception:
+            pass
+    return result
 
 
 def render_deck_pages(
@@ -103,46 +114,87 @@ def render_deck_pages(
 
     watermark_url = f"mece.in/decks/{slug}" if slug else "mece.in/decks"
 
+    # MEMORY: this loop uploads each page immediately and keeps nothing — but it
+    # must also RELEASE each page explicitly. A pdfium bitmap holds a native
+    # buffer that Python's refcount does not free promptly, and at 1600px a
+    # single 16:9 slide costs ~5.8MB for the bitmap plus ~4.3MB per PIL copy.
+    # Around 14MB live per page: ~40 slides is 576MB, which is how a 512MB
+    # instance died. Closing each handle keeps the whole run flat at ~20MB
+    # regardless of deck length, so this does NOT need a bigger instance.
     for i in range(page_count):
         page_num = i + 1
         page = pdf[i]
+        bitmap = None
+        img = None
+        watermarked = None
+        try:
+            w, h = page.get_size()
+            scale = TARGET_WIDTH / w if w > 0 else 2.0
+            bitmap = page.render(scale=scale)
+            img = bitmap.to_pil()
 
-        w, h = page.get_size()
-        scale = TARGET_WIDTH / w if w > 0 else 2.0
-        bitmap = page.render(scale=scale)
-        img = bitmap.to_pil()
+            # _apply_watermark returns a NEW image; keep both references so both
+            # get closed. Rebinding `img` would leak the original.
+            render_target = img
+            if page_num <= effective_free_pages:
+                watermarked = _apply_watermark(img, watermark_url)
+                render_target = watermarked
 
-        if page_num <= effective_free_pages:
-            img = _apply_watermark(img, watermark_url)
-
-        # 1. Save WebP: <deck_id>/<page_num>.webp
-        webp_buffer = io.BytesIO()
-        img.save(webp_buffer, format="WEBP", quality=WEBP_QUALITY, method=4)
-        webp_bytes = webp_buffer.getvalue()
-
-        dest_path = f"{deck_id}/{page_num}.webp"
-        storage.upload(
-            dest_path,
-            webp_bytes,
-            file_options={"content-type": "image/webp", "upsert": "true"},
-        )
-
-        # 2. For Slide 1, also render JPEG for social/AI scrapers (OG preview)
-        if page_num == 1:
-            jpeg_buffer = io.BytesIO()
-            img.save(jpeg_buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            jpeg_bytes = jpeg_buffer.getvalue()
+            # 1. Save WebP: <deck_id>/<page_num>.webp
+            with io.BytesIO() as webp_buffer:
+                render_target.save(webp_buffer, format="WEBP", quality=WEBP_QUALITY, method=4)
+                webp_bytes = webp_buffer.getvalue()
 
             storage.upload(
-                f"{deck_id}/og.jpg",
-                jpeg_bytes,
-                file_options={"content-type": "image/jpeg", "upsert": "true"},
+                f"{deck_id}/{page_num}.webp",
+                webp_bytes,
+                file_options={"content-type": "image/webp", "upsert": "true"},
             )
-            storage.upload(
-                f"{deck_id}/1.jpg",
-                jpeg_bytes,
-                file_options={"content-type": "image/jpeg", "upsert": "true"},
-            )
+            del webp_bytes
+
+            # 2. For Slide 1, also render JPEG for social/AI scrapers (OG preview)
+            if page_num == 1:
+                with io.BytesIO() as jpeg_buffer:
+                    render_target.save(jpeg_buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+                    jpeg_bytes = jpeg_buffer.getvalue()
+
+                for name in ("og.jpg", "1.jpg"):
+                    storage.upload(
+                        f"{deck_id}/{name}",
+                        jpeg_bytes,
+                        file_options={"content-type": "image/jpeg", "upsert": "true"},
+                    )
+                del jpeg_bytes
+        finally:
+            # Release in reverse order of allocation. Native handles first.
+            for handle in (watermarked, img):
+                try:
+                    if handle is not None:
+                        handle.close()
+                except Exception:
+                    pass
+            try:
+                if bitmap is not None:
+                    bitmap.close()
+            except Exception:
+                pass
+            try:
+                page.close()
+            except Exception:
+                pass
+            # pdfium buffers live outside Python's refcount, so a periodic
+            # collect is what actually returns the memory on a long deck.
+            if page_num % 10 == 0:
+                gc.collect()
+
+    # The PdfDocument holds the parsed document AND a reference to pdf_bytes,
+    # which can be 100MB on a large deck. Closing it is what actually returns
+    # that memory before the summary step runs on the same instance.
+    try:
+        pdf.close()
+    except Exception:
+        pass
+    gc.collect()
 
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     supabase.table("deck_skeletons").update({
