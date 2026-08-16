@@ -1,4 +1,4 @@
-﻿"""
+"""
 Deck page renderer using pypdfium2 (BSD/Apache-2.0).
 
 Rasterises every page of a competition deck PDF to WebP at ~1600px width with

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Deck summary generator with strict zero-hallucination number verification.
 
 Extracts text from the PDF text layer using pypdfium2 (BSD/Apache-2.0), drafts a
@@ -71,19 +71,67 @@ def _chat(endpoint: str, user_id: Optional[str], *, model: str, **kwargs):
 
 def _extract_text_and_numbers(pdf_bytes: bytes) -> tuple[str, Set[str]]:
     """Extract raw text and all numbers from the PDF text layer using pypdfium2."""
+    # Same leak that OOM'd the 512MB instance during rendering: pdfium handles
+    # hold native memory outside Python's refcount. This runs immediately AFTER
+    # render_deck_pages on the same request, so an unclosed document here lands
+    # on top of whatever rendering peaked at.
     pdf = pdfium.PdfDocument(pdf_bytes)
     pages_text = []
-    for page in pdf:
-        textpage = page.get_textpage()
-        text = textpage.get_text_range() or ""
-        pages_text.append(text)
+    try:
+        for page in pdf:
+            textpage = None
+            try:
+                textpage = page.get_textpage()
+                pages_text.append(textpage.get_text_range() or "")
+            finally:
+                for handle in (textpage, page):
+                    try:
+                        if handle is not None:
+                            handle.close()
+                    except Exception:
+                        pass
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
     full_text = "\n".join(pages_text).strip()
-    numbers = set(re.findall(r"\d+(?:\.\d+)?", full_text))
+    numbers = _numbers_in_text(full_text)
     return full_text, numbers
 
 
+# Thousands separators only — a comma BETWEEN digits with three digits after.
+# Deliberately not a blanket comma strip, which would join "3, 4" into "34".
+_THOUSANDS_SEP = re.compile(r"(?<=\d),(?=\d{3}(?:\D|$))")
+
+
 def _numbers_in_text(text: str) -> Set[str]:
-    return set(re.findall(r"\d+(?:\.\d+)?", text or ""))
+    """Numbers in `text`, normalised by VALUE rather than formatting.
+
+    The naive version compared raw regex tokens, which rejected summaries that
+    were entirely correct:
+
+      deck "Rs 1,200 crore" -> {"1", "200"}   summary "Rs 1200 crore" -> {"1200"}
+      deck "15% share"      -> {"15"}         summary "15.0% share"   -> {"15.0"}
+
+    Both were reported as hallucinated figures, so a faithful summary could
+    never pass and every deck failed with a 422. Normalising thousands
+    separators and trailing decimal zeros compares what the number MEANS, which
+    is what the guard was always trying to check — and it still catches a
+    genuinely invented figure, because an invented value has no match at all.
+    """
+    cleaned = _THOUSANDS_SEP.sub("", text or "")
+    out: Set[str] = set()
+    for token in re.findall(r"\d+(?:\.\d+)?", cleaned):
+        try:
+            value = float(token)
+        except ValueError:
+            out.add(token)
+            continue
+        # 15.0 -> "15", 15.50 -> "15.5", 1200.0 -> "1200"
+        out.add(str(int(value)) if value == int(value) else repr(value).rstrip("0").rstrip("."))
+    return out
 
 
 def _clean_summary(text: str) -> str:
