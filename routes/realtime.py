@@ -29,9 +29,17 @@ REALTIME_VOICE = os.getenv("REALTIME_VOICE", "alloy")
 # realtime voice for everyone WITHOUT a redeploy.
 REALTIME_ENABLED = os.getenv("REALTIME_ENABLED", "1") != "0"
 
-# Server-side ceiling on one session, matching MAX_SESSION_MS in the client.
-# The client enforces the good-citizen version; this is the one a tampered
-# client cannot lengthen. Audio bills as it streams, silence included.
+# Session ceiling, matching MAX_SESSION_MS in the client.
+#
+# HONEST SCOPE: this value is ADVISORY. It is returned to the client, which
+# enforces it. Nothing here stops a tampered client from holding a peer
+# connection open longer — once the SDP handshake completes, the audio flows
+# browser-to-OpenAI and this process is not in the path to cut it off.
+#
+# What actually bounds a hostile client is the ephemeral token's own expiry
+# (below) and `assert_daily_budget()` catching the spend after the fact. If a
+# hard server-side cap is ever needed, it has to come from a short token TTL,
+# not from this constant.
 MAX_SESSION_SECONDS = int(os.getenv("REALTIME_MAX_SESSION_SECONDS", "600"))
 
 

@@ -514,6 +514,16 @@ async def post_realtime_turn(
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
+    # TRUST BOUNDARY. In realtime the transcript originates in the BROWSER, so
+    # a crafted request can post any text as either role — including inventing
+    # the interviewer's side. Accepted deliberately (owner decision): the only
+    # thing a candidate gains is a fake score on their own practice attempt.
+    # It is NOT acceptable anywhere money or another user's data is involved,
+    # so this endpoint must never grow beyond writing attempt_messages.
+    #
+    # Deliberately NOT calling assert_daily_budget() here: the audio has already
+    # been spent at the far end, and refusing the write would lose the
+    # transcript while keeping the cost. Spend is metered below instead.
     role = body.role if body.role in ("user", "assistant") else "user"
 
     count_res = (
