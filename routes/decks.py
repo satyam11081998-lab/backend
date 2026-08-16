@@ -7,7 +7,6 @@ Provides endpoints for:
 - Full end-to-end deck processing.
 """
 
-import math
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
@@ -42,12 +41,38 @@ def _require_admin(authorization: Optional[str]) -> str:
     return uid
 
 
-def _calc_effective_free_pages(free_pages: Optional[int], page_count: Optional[int]) -> int:
-    """Exact replica of the SQL effective_free_pages function."""
-    if free_pages is not None:
-        return free_pages
-    count = page_count or 1
-    return min(4, max(1, math.ceil(count * 0.25)))
+def _effective_free_pages(supabase, deck_id: str, fallback_page_count: Optional[int]) -> int:
+    """Ask POSTGRES for the free-page count. Never recompute it here.
+
+    This was a hand-written "exact replica of the SQL function", which is the
+    same thing three copies of the clarification quota were before they drifted
+    and produced the 2026-08-01 P0 (CONTRACTS.md C9). A replica is only exact
+    until someone edits one of them.
+
+    It decides which pages get a watermark, so a drift here would silently
+    watermark the wrong slides — or leave a paid slide unmarked. Reading the
+    computed column means the rule has exactly one definition, in
+    `public.effective_free_pages`, which the image route and the public page
+    already read.
+    """
+    try:
+        res = (
+            supabase.table("deck_skeletons")
+            .select("effective_free_pages")
+            .eq("id", deck_id)
+            .single()
+            .execute()
+        )
+        val = (res.data or {}).get("effective_free_pages")
+        if val is not None:
+            return int(val)
+    except Exception as e:  # noqa: BLE001
+        print(f"[decks] could not read effective_free_pages for {deck_id}: {e}")
+
+    # Fail CLOSED. If the rule cannot be read, watermark only the first page
+    # rather than guessing generously — an over-marked preview is a cosmetic
+    # problem, an under-marked one gives away unwatermarked paid slides.
+    return 1
 
 
 def _fetch_deck_bytes(storage_path: str, supabase) -> bytes:
@@ -95,7 +120,7 @@ async def process_deck(
     pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
 
     # 1. Render pages
-    free_pages = _calc_effective_free_pages(deck.get("free_pages"), deck.get("page_count"))
+    free_pages = _effective_free_pages(supabase, deck_id, deck.get("page_count"))
     render_result = render_deck_pages(
         deck_id=deck["id"],
         pdf_bytes=pdf_bytes,
@@ -141,7 +166,7 @@ async def render_only(
         raise HTTPException(status_code=404, detail="Deck not found")
 
     pdf_bytes = _fetch_deck_bytes(deck["storage_path"], supabase)
-    free_pages = _calc_effective_free_pages(deck.get("free_pages"), deck.get("page_count"))
+    free_pages = _effective_free_pages(supabase, deck_id, deck.get("page_count"))
 
     render_result = render_deck_pages(
         deck_id=deck["id"],
