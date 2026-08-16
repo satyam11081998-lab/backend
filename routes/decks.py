@@ -24,7 +24,13 @@ router = APIRouter(prefix="/decks", tags=["decks"])
 
 
 def _require_admin(authorization: Optional[str]) -> str:
-    """Validate Bearer token and enforce is_admin. Fail closed."""
+    """Validate Bearer token and enforce is_admin or trusted service/cron key."""
+    token = (authorization or "").replace("Bearer ", "").strip()
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    cron_secret = os.environ.get("CRON_SECRET", "").strip()
+    if (service_key and token == service_key) or (cron_secret and token == cron_secret):
+        return "system_service"
+
     supabase = get_supabase_client()
     uid, user_obj = get_verified_user(supabase, authorization)
     if is_guest_user(user_obj):
