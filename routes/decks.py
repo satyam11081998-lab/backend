@@ -120,7 +120,7 @@ async def process_deck(
     assert_daily_budget()
 
     supabase = get_supabase_client()
-    deck_res = supabase.table("deck_skeletons").select("*").eq("id", deck_id).maybeSingle().execute()
+    deck_res = supabase.table("deck_skeletons").select("*").eq("id", deck_id).maybe_single().execute()
     deck = deck_res.data
     if not deck:
         raise HTTPException(status_code=404, detail="Deck not found")
@@ -180,7 +180,7 @@ async def render_only(
     check_rate_limit(f"deck_render:{uid}", max_calls=60, window_seconds=3600)
 
     supabase = get_supabase_client()
-    deck_res = supabase.table("deck_skeletons").select("*").eq("id", deck_id).maybeSingle().execute()
+    deck_res = supabase.table("deck_skeletons").select("*").eq("id", deck_id).maybe_single().execute()
     deck = deck_res.data
     if not deck:
         raise HTTPException(status_code=404, detail="Deck not found")
@@ -223,7 +223,7 @@ async def summarize_only(
     assert_daily_budget()
 
     supabase = get_supabase_client()
-    deck_res = supabase.table("deck_skeletons").select("*").eq("id", deck_id).maybeSingle().execute()
+    deck_res = supabase.table("deck_skeletons").select("*").eq("id", deck_id).maybe_single().execute()
     deck = deck_res.data
     if not deck:
         raise HTTPException(status_code=404, detail="Deck not found")
