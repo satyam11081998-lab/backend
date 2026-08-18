@@ -59,3 +59,5 @@ from routes import certificates as _certificates
 app.include_router(_certificates.router)
 from routes import decks as _decks
 app.include_router(_decks.router)
+from routes import deck_ingestion as _deck_ingestion
+app.include_router(_deck_ingestion.router)
