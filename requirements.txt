@@ -25,6 +25,10 @@ mdurl==0.1.2
 mmh3==5.2.1
 multidict==6.7.1
 openai==2.37.0
+# Deck Vault AI enrichment runs on Google Gemini (free tier). Without this package
+# installed, deck_ai_gemini.py raises on import and every deck silently falls back to
+# generic template text — the root cause of the "generic 2024 deck" summaries.
+google-generativeai==0.8.3
 packaging==26.2
 postgrest==2.30.0
 propcache==0.5.2
