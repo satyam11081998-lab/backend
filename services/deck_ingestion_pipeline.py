@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from services import gdrive
-from services.deck_ai import generate_deck_synthesis
+from services.deck_ai_gemini import generate_deck_synthesis
 from services.deck_classifier import classify_deck_rules
 from services.deck_extractor import compute_file_hash, extract_deck
 from services.deck_render import render_deck_pages
@@ -29,6 +29,25 @@ BASELINE_COLUMNS = {
 }
 
 _migration_notice_printed = False
+
+
+def _ensure_seo_description(ai_synthesis: Dict[str, Any], classification: Dict[str, Any]) -> str:
+    """Guarantee a 120-160 char meta description. Gemini sometimes returns one that
+    is too short, which reads poorly in search results and trips the audit's SEO
+    check. Fall back to a richer template built from the deck's own metadata."""
+    desc = (ai_synthesis.get("seo_description") or "").strip()
+    if len(desc) < 120:
+        comp = ai_synthesis.get("competition") or classification.get("competition") or "Case Competition"
+        res = ai_synthesis.get("result") or classification.get("result") or "Finalist"
+        yr = classification.get("year") or ""
+        case_type = ai_synthesis.get("case_type") or classification.get("case_type") or "strategy"
+        company = ai_synthesis.get("company") or classification.get("company") or ""
+        tail = f" for {company}" if company and company.lower() not in ("company", "corporate") else ""
+        desc = (
+            f"Verified {str(res).lower()} presentation for {comp} ({yr}). "
+            f"Explore the full {case_type} case framework{tail} on MECE Deck Vault."
+        )
+    return desc[:160]
 
 
 def _safe_db_write(supabase, table_name: str, payload: Dict[str, Any], deck_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -103,9 +122,16 @@ def process_single_deck(
     user_id: Optional[str] = None,
     supabase=None,
     progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    no_llm: bool = False,
+    rename_files: bool = True,
 ) -> Dict[str, Any]:
     """
     Process a single deck through all pipeline stages with fault isolation.
+
+    no_llm:       skip the Gemini call and use deterministic local synthesis (the
+                  result is generic and will be held for review, never indexed).
+    rename_files: when False, skip the Google Drive normalise/upload step and keep a
+                  local storage path (useful for local dry testing without Drive).
     """
     filename = os.path.basename(file_path)
     if progress_callback:
@@ -148,6 +174,7 @@ def process_single_deck(
             rule_classification=classification,
             user_id=user_id,
             force_refresh=force,
+            no_llm=no_llm,
         )
 
         # 5. Deterministic File Naming & Target Drive Hierarchy
@@ -163,7 +190,23 @@ def process_single_deck(
         company_folder = ai_synthesis.get("company") or classification["company"]
         target_drive_path = f"Case Decks / {year_str} / {company_folder} / {normalized_filename}"
 
-        status = "needs_review" if classification["needs_review"] else "completed"
+        # Fail loud: a deck is only "completed" (and therefore publishable/indexable)
+        # when BOTH the rule classifier is confident AND the summary came from a real,
+        # number-verified Gemini read of the deck. If Gemini was unavailable (missing
+        # key/package, quota, parse error) the synthesis is generic template text — that
+        # must be held for human review, never silently published to a public page.
+        synthesis_source = ai_synthesis.get("_synthesis_source", "unknown")
+        ai_ok = synthesis_source == "gemini"
+        needs_review = bool(classification["needs_review"]) or not ai_ok
+        status = "needs_review" if needs_review else "completed"
+        if not ai_ok:
+            review_reason = (
+                "AI summary fell back to generic template text "
+                f"(synthesis_source={synthesis_source}); Gemini did not produce a "
+                "verified summary. Check GEMINI_API_KEY and that google-generativeai "
+                "is installed."
+            )
+            print(f"[pipeline] HELD FOR REVIEW: {filename} -> {review_reason}")
 
         result_item = {
             "status": status,
@@ -191,7 +234,7 @@ def process_single_deck(
             "executive_summary": ai_synthesis.get("executive_summary", ""),
             "gist": ai_synthesis.get("gist", {}),
             "seo_title": ai_synthesis.get("seo_title", ""),
-            "seo_description": ai_synthesis.get("seo_description", ""),
+            "seo_description": _ensure_seo_description(ai_synthesis, classification),
             "ai_summary": ai_synthesis.get("ai_summary", ""),
             "confidence": classification["confidence"],
             "field_confidences": classification["field_confidences"],
@@ -212,7 +255,7 @@ def process_single_deck(
 
         drive_info = {"gdrive_file_id": None, "gdrive_folder_id": None, "gdrive_url": None, "gdrive_path": target_drive_path}
         storage_path = ""
-        if gdrive.is_configured():
+        if rename_files and gdrive.is_configured():
             try:
                 drive_sync_res = upload_or_sync_deck(
                     normalized_filename=normalized_filename,
@@ -271,7 +314,13 @@ def process_single_deck(
             "classification_confidence": result_item["field_confidences"],
             "metadata_confidence": result_item["confidence"],
             "is_active": True,
-            "is_indexable": True,
+            # Only fully-verified decks are exposed to search engines. Anything held
+            # for review stays out of the index (and off the public page) until a
+            # human clears it, so generic/low-confidence text can never rank.
+            "is_indexable": status == "completed",
+            "error_message": None if ai_ok else (
+                f"synthesis_source={synthesis_source}; held for review"
+            ),
             "processed_at": now_iso,
         }
 
@@ -298,11 +347,16 @@ def process_single_deck(
             try:
                 if progress_callback:
                     progress_callback("rendering_slides", {"file": normalized_filename})
+                # This count only controls which preview pages get a watermark.
+                # The ACCESS boundary is enforced server-side by the SQL function
+                # public.effective_free_pages() in the image route — never here, and
+                # never trusted from the client. Kept as 25% (clamped 1-5) so the
+                # watermark set matches the default the DB will serve.
                 render_deck_pages(
                     deck_id=deck_id,
                     pdf_bytes=file_bytes,
                     slug=result_item.get("slug", ""),
-                    effective_free_pages=min(4, max(1, int(extracted["slide_count"] * 0.25))),
+                    effective_free_pages=min(5, max(1, round(extracted["slide_count"] * 0.25))),
                 )
             except Exception as render_err:
                 print(f"[pipeline] Slide rendering warning for {deck_id}: {render_err}")

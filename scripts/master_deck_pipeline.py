@@ -1,3 +1,7 @@
+
+
+
+
 """
 MECE Master Deck Pipeline — Single-Run Audit, Enrich, Upload & SEO Optimise.
 
@@ -68,7 +72,10 @@ from services.deck_taxonomy import (
 # Constants
 # ---------------------------------------------------------------------------
 SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".ppt")
-DEFAULT_FREE_PAGES = 2  # User requested: show exactly 2 free pages by default
+# Free preview pages are computed by public.effective_free_pages() in SQL as 25%
+# of page_count (clamp 1-5). The pipeline no longer writes a fixed free_pages value;
+# leaving it NULL lets that computed default apply. An admin can still override per
+# deck from the Deck Vault admin screen.
 CONFIDENCE_REVIEW_THRESHOLD = 0.70
 
 
@@ -427,20 +434,21 @@ def audit_existing_decks(
     - Rename files on Drive with proper names
     - Run adversarial SEO checks
     - Flag low-confidence decks for review (is_active=False for public, visible in admin)
-    - Set free_pages to DEFAULT_FREE_PAGES
+    - Leave free_pages NULL (DB computes the 25% default at read time)
     """
-    supabase = get_supabase_client() if not dry_run else None
+    # Read the catalogue even on a dry run — a dry run must SHOW what it would do,
+    # which is impossible without reading the decks first. All WRITES (DB update,
+    # Drive rename) stay guarded by `not dry_run` further down, so this stays safe.
+    supabase = get_supabase_client()
 
     print("\n" + "=" * 80)
     print("  PHASE 1: AUDIT & ENRICH ALL EXISTING DECKS")
     print("=" * 80)
 
-    if not dry_run:
-        res = supabase.table("deck_skeletons").select("*").order("created_at", desc=True).execute()
-        decks = res.data or []
-    else:
-        print("  [DRY RUN] Would fetch all decks from database")
-        decks = []
+    res = supabase.table("deck_skeletons").select("*").order("created_at", desc=True).execute()
+    decks = res.data or []
+    if dry_run:
+        print("  [DRY RUN] Read-only: reading the catalogue, but no DB/Drive writes will be made")
 
     print(f"  Total decks to audit: {len(decks)}\n")
 
@@ -587,6 +595,15 @@ def audit_existing_decks(
             res_label = classification["result"]
             clean_title = f"{comp} {yr} - {res_label} Deck"
 
+            # Prefer the company Gemini actually read from the deck over the rule-based
+            # guess, which frequently defaults to a generic "Corporate". Guard against
+            # Gemini itself returning a placeholder value.
+            gem_company = (synthesis.get("company") or "").strip()
+            if gem_company and gem_company.lower() not in (
+                "company", "corporate", "n/a", "none", "unknown", "the company"
+            ):
+                classification["company"] = gem_company
+
             # --- Step 7: Build slug ---
             base_slug = f"{slugify(comp)}-{yr}-{slugify(res_label)}"
 
@@ -595,10 +612,15 @@ def audit_existing_decks(
             if len(seo_title) > 65:
                 seo_title = f"{comp} {yr} Deck | {res_label}"
 
-            seo_desc = synthesis.get("seo_description") or (
-                f"Verified {res_label.lower()} presentation for {comp} ({yr}). "
-                f"Explore the full {classification['case_type']} framework on MECE Deck Vault."
-            )
+            # Gemini sometimes returns a too-short meta description (<120 chars), which
+            # trips the adversarial SEO check. Fall back to the richer template when it
+            # is missing OR too short so every deck ships a 120-160 char description.
+            seo_desc = (synthesis.get("seo_description") or "").strip()
+            if len(seo_desc) < 120:
+                seo_desc = (
+                    f"Verified {res_label.lower()} presentation for {comp} ({yr}). "
+                    f"Explore the full {classification['case_type']} framework on MECE Deck Vault."
+                )
             if len(seo_desc) > 160:
                 seo_desc = seo_desc[:157] + "..."
 
@@ -622,8 +644,14 @@ def audit_existing_decks(
                     print(f"      [SEO] {issue}")
 
             # --- Step 10: Determine visibility ---
-            # Low confidence or no content -> flag for review (hidden from public)
+            # A deck is published + indexed ONLY when the classifier is confident AND
+            # the summary is a real, number-verified Gemini read of the deck. A generic
+            # fallback ("local_fallback"/"unknown", incl. --no-llm mode) is held for
+            # review so it never reaches a public, Google-indexed page. "kept" means an
+            # existing good summary we deliberately did not regenerate.
             overall_confidence = classification.get("confidence", 0.8)
+            synthesis_source = synthesis.get("_synthesis_source", "kept")
+            ai_ok = synthesis_source in ("gemini", "kept")
             is_active = True
             is_indexable = True
 
@@ -632,6 +660,20 @@ def audit_existing_decks(
                 is_indexable = False
                 stats["flagged_for_review"] += 1
                 print(f"      [REVIEW] Flagged — confidence {overall_confidence:.0%}")
+
+            if not ai_ok:
+                # Keep it visible in the library but out of the public search index
+                # until a human clears the summary.
+                is_indexable = False
+                stats["flagged_for_review"] += 1
+                err = synthesis.get("_synthesis_error")
+                detail = f" Last error: {err}" if err else (
+                    " Check GEMINI_API_KEY and that google-generativeai is installed."
+                )
+                print(
+                    f"      [REVIEW] Summary is generic (synthesis_source="
+                    f"{synthesis_source}) — held out of the index.{detail}"
+                )
 
             # --- Step 11: Build update payload ---
             update_payload = {
@@ -653,8 +695,11 @@ def audit_existing_decks(
                 "description": synthesis.get("description", f"{classification['company']} case solution for {comp}."),
                 "is_active": is_active,
                 "is_indexable": is_indexable,
-                "free_pages": DEFAULT_FREE_PAGES,
-                "processing_status": "needs_review" if not is_active else "completed",
+                # NOTE: free_pages is intentionally NOT written here. Leaving it NULL
+                # lets public.effective_free_pages() compute the 25% default (clamp
+                # 1-5) at read time. Writing a number makes it a permanent admin
+                # override — that is exactly how migration 0051 pinned every deck to 2.
+                "processing_status": "needs_review" if (not is_active or not is_indexable) else "completed",
             }
 
             # Preserve industry/function if available
@@ -673,7 +718,7 @@ def audit_existing_decks(
                     fallback = {k: v for k, v in update_payload.items()
                                 if k in {"title", "competition", "result", "case_type",
                                          "year", "summary", "tags", "is_active", "is_indexable",
-                                         "free_pages", "description"}}
+                                         "description"}}
                     try:
                         supabase.table("deck_skeletons").update(fallback).eq("id", deck_id).execute()
                         print(f"      [DB] Updated (baseline): {clean_title}")
@@ -895,14 +940,9 @@ def ingest_new_decks(
             st = result.get("status")
             if st == "completed":
                 stats["ingested"] += 1
-                # Set free_pages to 2 for new decks
-                if not dry_run and result.get("deck_id"):
-                    try:
-                        supabase.table("deck_skeletons").update(
-                            {"free_pages": DEFAULT_FREE_PAGES}
-                        ).eq("id", result["deck_id"]).execute()
-                    except Exception:
-                        pass
+                # free_pages is left NULL so public.effective_free_pages() computes the
+                # 25% default (clamp 1-5) at read time. Do NOT write a fixed number
+                # here — that becomes a permanent admin override (the 0051 mistake).
                 print(f"      [OK] {result.get('normalized_filename', filename)}")
             elif st == "skipped":
                 stats["skipped"] += 1
@@ -947,7 +987,9 @@ def main():
     args = parser.parse_args()
 
     if not args.audit and not args.dir:
-        parser.print_help()
+        print("Usage:")
+        print("  python scripts/master_deck_pipeline.py --audit [--dry-run] [--force] [--no-llm]")
+        print("  python scripts/master_deck_pipeline.py --dir <path> [--dry-run] [--batch-size N]")
         print("\nError: Specify --audit and/or --dir to run the pipeline.")
         sys.exit(1)
 
@@ -956,7 +998,7 @@ def main():
         print(f"  Mode           : {'DRY RUN' if args.dry_run else 'LIVE'}")
         print(f"  Gemini AI      : {'DISABLED (free local)' if args.no_llm else 'ENABLED'}")
         print(f"  Force Refresh  : {args.force}")
-        print(f"  Free Pages     : {DEFAULT_FREE_PAGES} (default for all decks)")
+        print("  Free Pages     : 25% of pages (clamp 1-5), computed by the DB at read time")
         if args.dir:
             print(f"  New Decks Dir  : {args.dir}")
         print("-" * 80)
@@ -1019,9 +1061,15 @@ def main():
         print(f"    Failed                  : {i.get('failed', 0)}")
 
     print(f"\n  Total Time: {elapsed}s")
-    print(f"  Free Preview Pages: {DEFAULT_FREE_PAGES} (set for all decks)")
+    print("  Free Preview Pages: 25% of pages (clamp 1-5), computed by the DB")
     print("=" * 80)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
