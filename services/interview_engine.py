@@ -187,6 +187,26 @@ def _flatten_for_legacy_scorer(
     return "\n".join(lines)
 
 
+def _candidate_text(
+    transcript: Iterable[Dict[str, str]],
+    final_recommendation: str,
+) -> str:
+    """Only the CANDIDATE's own words + their final recommendation, for the
+    validity screen — the interviewer's coherent prods must not make a gibberish
+    session read as a genuine attempt."""
+    parts: List[str] = []
+    for t in transcript:
+        if (t.get("role") or "user") != "user":
+            continue
+        c = (t.get("content") or "").strip()
+        if c:
+            parts.append(c)
+    fr = (final_recommendation or "").strip()
+    if fr:
+        parts.append(fr)
+    return "\n".join(parts)
+
+
 def _score_case_conversation(
     case_content: str,
     case_type: str,
@@ -194,16 +214,31 @@ def _score_case_conversation(
     final_recommendation: str,
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """General conversation analysis for CASES (not guesstimates).
-    The formal case rubric is being developed separately; until it lands this
-    returns a holistic { score, breakdown:{overall}, strengths, improvements,
-    summary } dict that the legacy submissions table can store unchanged.
+    """Evidence-based scoring for CASE sessions (not guesstimates).
+
+    Reuses the same hardening as the single-answer scorer: a validity gate
+    (gibberish/off-topic sessions score 0), then a 6-dimension evidence-based
+    rubric with per-dimension feedback / red_flags / model_answer, then
+    deterministic enforcement (clamp each dimension, recompute the total from the
+    breakdown). Returns the standard case feedback shape.
     """
+    # Lazy imports — avoid a hard dep on ai_scorer at module load, matching the
+    # existing guesstimate branch and keeping this file unit-testable in isolation.
+    from services.answer_validity import screen_answer
+    from services.ai_scorer import _enforce_case, _rejection_case, _is_hard_reject
+
+    validity = screen_answer(
+        case_content, case_type, _candidate_text(transcript, final_recommendation), user_id
+    )
+    if _is_hard_reject(validity):
+        return _rejection_case(case_type, validity)
+
     user_prompt = build_conversation_scoring_user_prompt(
         case_content=case_content,
         case_type=case_type,
         transcript=transcript,
         final_recommendation=final_recommendation,
+        thin=validity["verdict"] in ("thin", "off_topic"),
     )
     try:
         t0 = time.time()
@@ -214,7 +249,7 @@ def _score_case_conversation(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=2500,
+            max_tokens=4000,  # richer output (per-dimension feedback + model answer)
             response_format={"type": "json_object"},
         )
         log_ai_usage(user_id=user_id, endpoint="/attempts/submit", model=SCORING_MODEL,
@@ -232,15 +267,12 @@ def _score_case_conversation(
     missing = required - set(feedback.keys())
     if missing:
         raise InterviewEngineError(f"Scorer missing keys: {missing}")
-    try:
-        feedback["score"] = max(0, min(100, int(feedback["score"])))
-    except (TypeError, ValueError):
-        raise InterviewEngineError("Scorer returned non-integer score")
-    # Ensure breakdown is a dict — required by the SubmitResponse contract.
     if not isinstance(feedback.get("breakdown"), dict):
-        feedback["breakdown"] = {"overall": feedback["score"]}
-    feedback.setdefault("rubric", "case")
-    return feedback
+        raise InterviewEngineError("Scorer 'breakdown' is not an object")
+
+    # Enforce marking deterministically (clamp dims, recompute total, attach the
+    # richer fields + validity). Missing dimensions default to 0 inside _enforce_case.
+    return _enforce_case(feedback, validity)
 
 
 def score_conversation(
