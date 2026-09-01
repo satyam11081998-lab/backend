@@ -257,7 +257,9 @@ def score_guesstimate_answer(
     if not isinstance(dims, dict):
         raise AIScoringError("Guesstimate response missing 'dimensions'")
 
-    llm_dims = {d: _clamp_int(dims.get(d, 3), 1, 5) for d in GUESSTIMATE_DIMS}
+    # Each guesstimate dimension is now scored 0-100 (was 1-5); the backstop still
+    # overrides arithmetic and caps the total, all on the 0-100 scale.
+    llm_dims = {d: _clamp_int(dims.get(d, 60), 0, 100) for d in GUESSTIMATE_DIMS}
 
     # Deterministic backstop: recompute the chain, override arithmetic, cap total.
     final = apply_backstop(llm_dims, chain, band=None)
@@ -265,6 +267,7 @@ def score_guesstimate_answer(
     return {
         "score": int(final["total"]),
         "breakdown": final["dimensions"],
+        "scale": 100,  # guesstimate dimensions are on a 0-100 scale
         "strengths": _str_list(parsed.get("strengths"), limit=6),
         "improvements": _str_list(parsed.get("improvements"), limit=6),
         "red_flags": _str_list(parsed.get("red_flags"), limit=6),
@@ -348,7 +351,8 @@ def _rejection_guesstimate(validity: Dict[str, Any]) -> Dict[str, Any]:
     label = "off-topic" if validity["verdict"] == "off_topic" else "not a genuine attempt"
     return {
         "score": 0,
-        "breakdown": {d: 1 for d in GUESSTIMATE_DIMS},  # min on the 1-5 scale
+        "breakdown": {d: 0 for d in GUESSTIMATE_DIMS},  # 0 on the 0-100 scale
+        "scale": 100,
         "strengths": [],
         "improvements": _REJECT_STEPS_GUESSTIMATE,
         "red_flags": [f"Scored 0 — {label}. {reason}"],
