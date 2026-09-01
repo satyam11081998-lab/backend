@@ -151,6 +151,14 @@ class SubmitResponse(BaseModel):
     improvements: List[str]
     summary: str
     rubric: str = "case"
+    # Additive (2026-09-01) — richer, evidence-based feedback + gibberish gate.
+    # All optional; the results page reads the full feedback_json from the DB, so
+    # these are for parity and any direct response reader. C2 unchanged.
+    backstop: Optional[Dict[str, Any]] = None
+    dimension_feedback: Optional[Dict[str, Any]] = None
+    red_flags: Optional[List[str]] = None
+    model_answer: Optional[str] = None
+    validity: Optional[Dict[str, Any]] = None
 
 
 # =============================================================================
@@ -848,4 +856,9 @@ async def submit_attempt(
         improvements=feedback["improvements"],
         summary=feedback["summary"],
         rubric=feedback.get("rubric", "case"),
+        backstop=feedback.get("backstop"),
+        dimension_feedback=feedback.get("dimension_feedback"),
+        red_flags=feedback.get("red_flags"),
+        model_answer=feedback.get("model_answer"),
+        validity=feedback.get("validity"),
     )
