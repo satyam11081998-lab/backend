@@ -88,13 +88,19 @@ def award_badges_for_submission(
     if score >= 90 and "first-90" not in existing_ids:
         newly_awarded.append("first-90")
     
-    structure_score = feedback_breakdown.get("structure", 0)
-    if structure_score >= 25 and "perfect-structure" not in existing_ids:
-        newly_awarded.append("perfect-structure")
-    
-    quant_score = feedback_breakdown.get("quantitative", 0)
-    if quant_score >= 20 and "perfect-quant" not in existing_ids:
-        newly_awarded.append("perfect-quant")
+    # These two badges are defined on the 6-dimension CASE rubric (structure /25,
+    # quantitative /20). Guesstimates use a different 0-100 rubric and have no
+    # 'quantitative' dim, so gate on case_type to avoid false awards now that
+    # guesstimate dimensions are also 0-100 (a 0-100 'structure' would trip >=25).
+    is_case = (case_type or "").lower() != "guesstimate"
+    if is_case:
+        structure_score = feedback_breakdown.get("structure", 0)
+        if structure_score >= 25 and "perfect-structure" not in existing_ids:
+            newly_awarded.append("perfect-structure")
+
+        quant_score = feedback_breakdown.get("quantitative", 0)
+        if quant_score >= 20 and "perfect-quant" not in existing_ids:
+            newly_awarded.append("perfect-quant")
     
     # === Streak badges (based on case_attempts dates) ===
     if not {"streak-3", "streak-7", "streak-14", "streak-30"}.issubset(existing_ids):

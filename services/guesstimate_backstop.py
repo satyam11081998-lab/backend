@@ -243,10 +243,11 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
         summary = ("Arithmetic could not be independently recomputed from the steps provided, "
                    "so the interviewer's assessment stands for this dimension.")
     elif n == 0:
-        arithmetic_score = 5
+        arithmetic_score = 100
         summary = "Arithmetic verified: every recomputable step checks out within tolerance."
     else:
-        arithmetic_score = 3 if n == 1 else 2 if n == 2 else 1
+        # 0-100 scale (was 1-5). Each independently-found error drops the band.
+        arithmetic_score = 60 if n == 1 else 40 if n == 2 else 20
         summary = (f"{n} arithmetic issue(s) found by independent recomputation of the steps "
                    "that could be verified — these are deterministic, not opinion.")
 
@@ -271,7 +272,9 @@ def _weighted_total(d: Dict[str, float]) -> float:
         + d["arithmetic"] * GUESSTIMATE_WEIGHTS["arithmetic"]
         + d["sanity"] * GUESSTIMATE_WEIGHTS["sanity"]
     )
-    return (t / 5) * 100
+    # Dimensions are 0-100 and the weights sum to 1.0, so the weighted sum is
+    # already the 0-100 total (previously dims were 1-5, hence the old /5 * 100).
+    return t
 
 
 def apply_backstop(
@@ -285,9 +288,9 @@ def apply_backstop(
     bs_score = backstop["arithmeticScore"]
     if bs_score is None:
         try:
-            corrected["arithmetic"] = max(1, min(5, int(round(float(llm_dims.get("arithmetic", 3))))))
+            corrected["arithmetic"] = max(0, min(100, int(round(float(llm_dims.get("arithmetic", 60))))))
         except (TypeError, ValueError):
-            corrected["arithmetic"] = 3
+            corrected["arithmetic"] = 60
         arithmetic_overridden = False
     else:
         corrected["arithmetic"] = bs_score
