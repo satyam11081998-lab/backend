@@ -40,6 +40,12 @@ class SubmissionResponse(BaseModel):
     summary: str
     rubric: str = "case"
     backstop: Optional[Dict[str, Any]] = None
+    # Additive (2026-09-01) — richer, evidence-based feedback. Optional so a stale
+    # client and older stored submissions both keep working (C2 unchanged).
+    dimension_feedback: Optional[Dict[str, Any]] = None
+    red_flags: Optional[List[str]] = None
+    model_answer: Optional[str] = None
+    validity: Optional[Dict[str, Any]] = None
 
 
 @router.post("/submit", response_model=SubmissionResponse)
@@ -205,6 +211,10 @@ async def submit_answer(
             summary=feedback["summary"],
             rubric=feedback.get("rubric", "case"),
             backstop=feedback.get("backstop"),
+            dimension_feedback=feedback.get("dimension_feedback"),
+            red_flags=feedback.get("red_flags"),
+            model_answer=feedback.get("model_answer"),
+            validity=feedback.get("validity"),
         )
 
     # Step 4: Update user's points and streak (first attempt of the day)
@@ -271,4 +281,8 @@ async def submit_answer(
         summary=feedback["summary"],
         rubric=feedback.get("rubric", "case"),
         backstop=feedback.get("backstop"),
+        dimension_feedback=feedback.get("dimension_feedback"),
+        red_flags=feedback.get("red_flags"),
+        model_answer=feedback.get("model_answer"),
+        validity=feedback.get("validity"),
     )
