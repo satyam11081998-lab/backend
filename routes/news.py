@@ -191,11 +191,59 @@ async def list_headlines(
 # Helper: check brief access for Free tier
 # ============================================================
 
+# Lite is no longer unlimited GD briefs — it gets this many NEW briefs per day
+# (re-viewing a brief already unlocked is always free). Pro stays unlimited.
+LITE_GD_BRIEFS_PER_DAY = 2
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _enforce_lite_daily_gd_cap(supabase, user_id: str, headline_id: str) -> None:
+    """Allow a Lite user up to LITE_GD_BRIEFS_PER_DAY NEW briefs per IST day.
+    A brief they have already unlocked is free to re-open and never counts again.
+    Fails OPEN on an infra read hiccup — a metering glitch must not lock a paying
+    Lite user out of the feature."""
+    # Already unlocked this headline before? Free re-view, does not consume quota.
+    try:
+        existing = supabase.table("gd_brief_unlocks").select("headline_id") \
+            .eq("user_id", user_id).eq("headline_id", headline_id).limit(1).execute()
+        if existing.data:
+            return
+    except Exception:
+        return  # fail-open
+
+    # Count DISTINCT new briefs unlocked so far TODAY (IST midnight boundary).
+    today_start = datetime.now(_IST).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        todays = supabase.table("gd_brief_unlocks").select("headline_id") \
+            .eq("user_id", user_id).gte("created_at", today_start).execute()
+        used_today = len(todays.data or [])
+    except Exception:
+        used_today = 0  # fail-open
+
+    if used_today >= LITE_GD_BRIEFS_PER_DAY:
+        raise HTTPException(
+            403,
+            f"Lite includes {LITE_GD_BRIEFS_PER_DAY} GD briefs per day — you've used today's. "
+            "Upgrade to Pro for unlimited briefs, or come back tomorrow.",
+        )
+
+    # Record this new unlock so it counts toward today's cap (and is free to re-view later).
+    try:
+        supabase.table("gd_brief_unlocks").upsert(
+            {"user_id": user_id, "headline_id": headline_id}, on_conflict="user_id,headline_id"
+        ).execute()
+    except Exception:
+        pass
+
+
 def check_brief_access(supabase, user_id: str, headline_id: str) -> None:
     tier = effective_tier(supabase, user_id)
-    if tier in ("lite", "pro"):
+    if tier == "pro":
         return
-        
+    if tier == "lite":
+        _enforce_lite_daily_gd_cap(supabase, user_id, headline_id)
+        return
+
     try:
         unlock_res = supabase.table("gd_brief_unlocks").select("headline_id").eq("user_id", user_id).execute()
     except Exception:
@@ -205,7 +253,7 @@ def check_brief_access(supabase, user_id: str, headline_id: str) -> None:
     if len(unlocks) > 0:
         if unlocks[0]["headline_id"] == headline_id:
             return
-        raise HTTPException(403, "You have already used your 1 free brief on another headline. Upgrade to Lite for unlimited access.")
+        raise HTTPException(403, "You have already used your 1 free brief on another headline. Upgrade to Lite (2 briefs/day) or Pro (unlimited).")
         
     try:
         supabase.table("gd_brief_unlocks").upsert({"user_id": user_id, "headline_id": headline_id}, on_conflict="user_id,headline_id").execute()
