@@ -89,8 +89,8 @@ FEATURES: Dict[str, Dict[str, Any]] = {
     },
     "voice_mode": {
         "label": "Voice interview mode",
-        "providers": ["realtime", "pipeline"],
-        "default": "realtime",  # "the real one" — ChatGPT-style speech-to-speech; toggle to pipeline to cut cost
+        "providers": ["pipeline", "realtime"],
+        "default": "pipeline",  # Groq pipeline (Groq STT + Groq LLM + Google TTS): cheap, no OpenAI. "realtime" = OpenAI speech-to-speech, kept as an option.
         "models": {"realtime": "gpt-realtime-2.1", "pipeline": "whisper + llm + tts"},
     },
     "scoring": {
