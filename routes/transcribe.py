@@ -20,6 +20,42 @@ load_dotenv()
 # Bounded client: a hung Whisper call fails fast instead of tying up the worker.
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=60.0, max_retries=1)
 
+# Optional Groq Whisper — the SAME Whisper model, ~9x cheaper ($0.04/hr vs $0.36/hr)
+# and faster, exposed on an OpenAI-compatible endpoint so it is a drop-in. If
+# GROQ_API_KEY is unset we transparently stay on OpenAI; if a Groq call fails at
+# request time we fall back to OpenAI, so the cheaper provider can never break voice.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+_groq_client = (
+    OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=60.0, max_retries=1)
+    if GROQ_API_KEY else None
+)
+_STT_PROMPT = (
+    "Consulting case interview answer. Expected terms: EBITDA, CAGR, profitability, "
+    "revenues, fixed costs, variable costs, market size, competitors."
+)
+
+
+def _run_stt(filename: str, file_bytes: bytes):
+    """Transcribe via Groq when configured, else OpenAI. On any Groq error, fall
+    back to OpenAI so a cheaper provider can never break voice input.
+    Returns (transcription, model_name_used)."""
+    if _groq_client is not None:
+        try:
+            tr = _groq_client.audio.transcriptions.create(
+                model=GROQ_STT_MODEL, file=(filename, file_bytes),
+                response_format="verbose_json", prompt=_STT_PROMPT,
+            )
+            return tr, GROQ_STT_MODEL
+        except Exception as e:
+            print(f"[transcribe] Groq STT failed ({e}); falling back to OpenAI whisper-1")
+    tr = client.audio.transcriptions.create(
+        model="whisper-1", file=(filename, file_bytes),
+        response_format="verbose_json", prompt=_STT_PROMPT,
+    )
+    return tr, "whisper-1"
+
+
 router = APIRouter()
 
 # ~6 MB ≈ 5-6 min of webm/opus — comfortably covers a spoken case answer while
@@ -63,13 +99,8 @@ async def transcribe_audio(
 
         t0 = time.time()
         # verbose_json returns the exact `duration` (seconds) so we bill real minutes,
-        # not a byte-size estimate.
-        transcription = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=(filename, file_bytes),
-            response_format="verbose_json",
-            prompt="Consulting case interview answer. Expected terms: EBITDA, CAGR, profitability, revenues, fixed costs, variable costs, market size, competitors.",
-        )
+        # not a byte-size estimate. Routes to Groq when configured (see _run_stt).
+        transcription, stt_model = _run_stt(filename, file_bytes)
         latency_ms = int((time.time() - t0) * 1000)
 
         duration_s = getattr(transcription, "duration", None)
@@ -77,9 +108,9 @@ async def transcribe_audio(
         text = getattr(transcription, "text", "") or ""
 
         log_ai_usage(
-            user_id=uid, endpoint="/transcribe", model="whisper-1",
+            user_id=uid, endpoint="/transcribe", model=stt_model,
             audio_minutes=minutes, latency_ms=latency_ms, success=True,
-            meta={"bytes": len(file_bytes)},
+            meta={"bytes": len(file_bytes), "provider": "groq" if stt_model != "whisper-1" else "openai"},
         )
 
         return {"text": text, "quota": get_ai_input_quota(supabase, uid)}

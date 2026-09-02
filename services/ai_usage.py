@@ -32,6 +32,9 @@ PRICES = {  # (input $/1M, output $/1M)
     "gpt-4o-mini": (0.15, 0.60),
 }
 WHISPER_PER_MIN = 0.006
+# Groq's whisper-large-v3-turbo is ~$0.04/hr ≈ $0.000667/min — ~9x cheaper than
+# OpenAI Whisper, same underlying model. Used when transcribe routes to Groq.
+GROQ_WHISPER_PER_MIN = float(os.getenv("GROQ_WHISPER_PER_MIN", "0.000667"))
 
 # TTS is priced per CHARACTER, not per token — it must NOT go in PRICES (those
 # are token tuples and _est_cost would read a TTS call as 0, because a speech
@@ -131,8 +134,10 @@ def log_ai_usage(
             tt = getattr(usage, "total_tokens", None)
             openai_id = getattr(response, "id", None)
 
-        if model == "whisper-1" and audio_minutes is not None:
-            cost = audio_minutes * WHISPER_PER_MIN
+        if "whisper" in model and audio_minutes is not None:
+            # OpenAI Whisper is $0.006/min; Groq's whisper-large-v3* is ~9x cheaper.
+            # Any non-"whisper-1" whisper model is assumed to be the Groq endpoint.
+            cost = audio_minutes * (WHISPER_PER_MIN if model == "whisper-1" else GROQ_WHISPER_PER_MIN)
         elif model.startswith("tts") and audio_minutes is not None:
             # Character-priced, no usage object — see TTS_PER_MIN. Without this
             # branch every /speak row would book $0 and hide talk-mode spend
