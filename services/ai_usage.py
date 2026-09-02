@@ -256,17 +256,41 @@ def speak_minutes_used_today(supabase, user_id: str) -> float:
     return round(sum(float(r.get("audio_minutes") or 0) for r in _rows_today(supabase, user_id, "/speak")), 3)
 
 
+# A large sentinel that reads as "effectively unlimited" to every remaining-min /
+# remaining-image computation without special-casing None everywhere.
+_ADMIN_UNLIMITED = 10 ** 6
+
+
+def _is_admin_user(supabase, user_id: str) -> bool:
+    """True for the owner/admins. They must never be personally capped while
+    testing the product — mirrors how admin traffic is excluded from analytics.
+    Usage is still LOGGED, so the global daily-budget guard still sees the spend;
+    only the per-USER daily quotas are lifted. Fail-safe: any read error -> not
+    admin (so a hiccup can only make the check stricter, never looser)."""
+    try:
+        res = supabase.table("users").select("is_admin").eq("id", user_id).single().execute()
+        return bool((res.data or {}).get("is_admin"))
+    except Exception:
+        return False
+
+
 def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
     """Full quota snapshot for the frontend 'X min / Y images left today' UI."""
     tier = effective_tier(supabase, user_id)
-    v_limit = VOICE_MIN_PER_DAY.get(tier, VOICE_MIN_PER_DAY["free"])
-    o_limit = OCR_IMG_PER_DAY.get(tier, OCR_IMG_PER_DAY["free"])
-    s_limit = TTS_MIN_PER_DAY.get(tier, TTS_MIN_PER_DAY["free"])
+    admin = _is_admin_user(supabase, user_id)
+    if admin:
+        # Owner/admin testing: lift the personal caps (still metered + logged).
+        v_limit = o_limit = s_limit = _ADMIN_UNLIMITED
+    else:
+        v_limit = VOICE_MIN_PER_DAY.get(tier, VOICE_MIN_PER_DAY["free"])
+        o_limit = OCR_IMG_PER_DAY.get(tier, OCR_IMG_PER_DAY["free"])
+        s_limit = TTS_MIN_PER_DAY.get(tier, TTS_MIN_PER_DAY["free"])
     v_used = voice_minutes_used_today(supabase, user_id)
     o_used = ocr_images_used_today(supabase, user_id)
     s_used = speak_minutes_used_today(supabase, user_id)
     return {
         "tier": tier,
+        "admin": admin,
         "voice": {
             "used_min": round(v_used, 2),
             "limit_min": v_limit,

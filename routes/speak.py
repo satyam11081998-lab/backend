@@ -136,7 +136,7 @@ async def speak(
     # is 20-30 round-trips per turn on the one path where latency is the whole
     # product. This is four.
     quota = get_ai_input_quota(supabase, uid)
-    if quota["tier"] != "pro":
+    if quota["tier"] != "pro" and not quota.get("admin"):
         raise HTTPException(
             status_code=403,
             detail="Voice interview mode is a Pro feature. Upgrade to talk through a case out loud.",
