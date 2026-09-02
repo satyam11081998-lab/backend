@@ -38,6 +38,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from services.ai_usage import log_ai_usage
+from services.ai_providers import chat_with_fallback
 
 load_dotenv()
 
@@ -134,8 +135,11 @@ CANDIDATE SUBMISSION:
 Decide the verdict. Return ONLY the JSON."""
     try:
         t0 = time.time()
-        resp = _client.chat.completions.create(
-            model=VALIDITY_MODEL,
+        # Provider chosen by the admin toggle ("validity"): Groq when selected/available,
+        # else OpenAI. On ANY Groq error (incl. JSON-mode quirks) it falls back to OpenAI,
+        # so the gate can never silently vanish.
+        resp, used_model, _prov = chat_with_fallback(
+            "validity",
             messages=[
                 {"role": "system", "content": _SCREEN_SYSTEM},
                 {"role": "user", "content": user},
@@ -144,7 +148,7 @@ Decide the verdict. Return ONLY the JSON."""
             max_tokens=200,
             response_format={"type": "json_object"},
         )
-        log_ai_usage(user_id=user_id, endpoint="/submit", model=VALIDITY_MODEL,
+        log_ai_usage(user_id=user_id, endpoint="/submit", model=used_model,
                      response=resp, latency_ms=int((time.time() - t0) * 1000))
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception:

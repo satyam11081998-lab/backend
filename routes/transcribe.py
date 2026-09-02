@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
+from services.ai_providers import current_provider
 from services.ai_usage import (
     assert_voice_quota,
     assert_daily_budget,
@@ -40,7 +41,7 @@ def _run_stt(filename: str, file_bytes: bytes):
     """Transcribe via Groq when configured, else OpenAI. On any Groq error, fall
     back to OpenAI so a cheaper provider can never break voice input.
     Returns (transcription, model_name_used)."""
-    if _groq_client is not None:
+    if _groq_client is not None and current_provider("stt") == "groq":
         try:
             tr = _groq_client.audio.transcriptions.create(
                 model=GROQ_STT_MODEL, file=(filename, file_bytes),

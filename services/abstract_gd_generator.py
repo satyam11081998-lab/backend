@@ -18,6 +18,7 @@ from typing import TypedDict, List
 from openai import OpenAI
 
 from services.ai_usage import log_ai_usage
+from services.ai_providers import chat_with_fallback
 
 
 class GeneratedAbstractBrief(TypedDict):
@@ -106,11 +107,12 @@ def generate_abstract_brief(topic: str) -> GeneratedAbstractBrief:
         "10-minute placement Group Discussion. Be specific to this exact topic."
     )
 
-    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
     try:
         t0 = time.time()
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        # Defaults to OpenAI gpt-4o ("abstract_brief"); admin can toggle to Groq to
+        # A/B cost. Any Groq/JSON error falls back to OpenAI automatically.
+        response, used_model, _prov = chat_with_fallback(
+            "abstract_brief",
             messages=[
                 {"role": "system", "content": ABSTRACT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -119,10 +121,10 @@ def generate_abstract_brief(topic: str) -> GeneratedAbstractBrief:
             temperature=0.6,
             max_tokens=2000,  # 10 array fields (~43 items); headroom so the JSON never truncates mid-object
         )
-        log_ai_usage(endpoint="/news/abstract-brief", model="gpt-4o", response=response,
+        log_ai_usage(endpoint="/news/abstract-brief", model=used_model, response=response,
                      latency_ms=int((time.time() - t0) * 1000))
     except Exception as e:
-        raise AbstractBriefError(f"OpenAI API call failed: {type(e).__name__}: {e}")
+        raise AbstractBriefError(f"Abstract brief call failed: {type(e).__name__}: {e}")
 
     raw = response.choices[0].message.content
     if not raw:

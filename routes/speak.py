@@ -17,6 +17,7 @@ from services.ai_usage import (
     log_ai_usage,
     TTS_CHARS_PER_MIN,
 )
+from services.ai_providers import current_provider
 
 load_dotenv()
 
@@ -32,6 +33,65 @@ router = APIRouter()
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 TTS_FORMAT = "mp3"
+
+# --- Google Cloud WaveNet TTS (admin-toggleable "tts" feature) ---------------
+# WaveNet dropped to $4 / 1M chars in early 2026 — ~3.75x cheaper than OpenAI
+# tts-1 ($15 / 1M) at equal-or-better naturalness. Selected via the admin toggle
+# (current_provider("tts") == "google"); on ANY Google error we fall back to
+# OpenAI so the cheaper voice can never break interview mode. The SDK + a
+# service-account key (GOOGLE_APPLICATION_CREDENTIALS) are required; if either is
+# missing the lazy client stays None and we transparently use OpenAI.
+GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "en-US-Wavenet-D")
+GOOGLE_TTS_LANG = os.getenv("GOOGLE_TTS_LANG", "en-US")
+
+_google_tts_client = None
+_google_tts_failed = False
+
+
+def _get_google_tts():
+    """Lazily build the Google TTS client once. Returns None (and never raises)
+    if the SDK isn't installed or credentials aren't configured."""
+    global _google_tts_client, _google_tts_failed
+    if _google_tts_client is not None:
+        return _google_tts_client
+    if _google_tts_failed:
+        return None
+    try:
+        from google.cloud import texttospeech
+        _google_tts_client = texttospeech.TextToSpeechClient()
+        return _google_tts_client
+    except Exception as e:
+        print(f"[speak] Google TTS unavailable ({e}); staying on OpenAI")
+        _google_tts_failed = True
+        return None
+
+
+def _synthesize(text: str):
+    """Return (audio_bytes, model_used, voice_used). Uses Google WaveNet when the
+    admin has selected it AND it is available; OpenAI otherwise. Any Google error
+    falls back to OpenAI so voice output can never break on the cheaper path."""
+    if current_provider("tts") == "google":
+        cli = _get_google_tts()
+        if cli is not None:
+            try:
+                from google.cloud import texttospeech
+                resp = cli.synthesize_speech(
+                    input=texttospeech.SynthesisInput(text=text),
+                    voice=texttospeech.VoiceSelectionParams(
+                        language_code=GOOGLE_TTS_LANG, name=GOOGLE_TTS_VOICE,
+                    ),
+                    audio_config=texttospeech.AudioConfig(
+                        audio_encoding=texttospeech.AudioEncoding.MP3,
+                    ),
+                )
+                return resp.audio_content, GOOGLE_TTS_VOICE, GOOGLE_TTS_VOICE
+            except Exception as e:
+                print(f"[speak] Google WaveNet failed ({e}); falling back to OpenAI {TTS_MODEL}")
+    speech = client.audio.speech.create(
+        model=TTS_MODEL, voice=TTS_VOICE, input=text, response_format=TTS_FORMAT,
+    )
+    audio_bytes = speech.read() if hasattr(speech, "read") else speech.content
+    return audio_bytes, TTS_MODEL, TTS_VOICE
 
 # The interviewer speaks in 1-3 sentences by prompt contract, and the client
 # sends ONE sentence per call. 1200 chars is generous headroom; anything larger
@@ -100,13 +160,7 @@ async def speak(
 
     try:
         t0 = time.time()
-        speech = client.audio.speech.create(
-            model=TTS_MODEL,
-            voice=TTS_VOICE,
-            input=text,
-            response_format=TTS_FORMAT,
-        )
-        audio_bytes = speech.read() if hasattr(speech, "read") else speech.content
+        audio_bytes, used_model, used_voice = _synthesize(text)
         latency_ms = int((time.time() - t0) * 1000)
 
         # The TTS response carries no duration, so bill on characters. This is an
@@ -115,9 +169,10 @@ async def speak(
         minutes = len(text) / TTS_CHARS_PER_MIN
 
         log_ai_usage(
-            user_id=uid, endpoint="/speak", model=TTS_MODEL,
+            user_id=uid, endpoint="/speak", model=used_model,
             audio_minutes=minutes, latency_ms=latency_ms, success=True,
-            meta={"chars": len(text), "voice": TTS_VOICE, "bytes": len(audio_bytes)},
+            meta={"chars": len(text), "voice": used_voice, "bytes": len(audio_bytes),
+                  "provider": "google" if "wavenet" in used_model.lower() else "openai"},
         )
 
         # Deliberately NO quota header. A custom response header is invisible to
@@ -141,3 +196,8 @@ async def speak(
             audio_minutes=0, success=False, meta={"chars": len(text), "error": str(e)[:200]},
         )
         raise HTTPException(status_code=500, detail=f"Failed to synthesize speech: {str(e)}")
+
+
+# NOTE: setup — to enable the cheaper WaveNet path, `pip install google-cloud-texttospeech`,
+# set GOOGLE_APPLICATION_CREDENTIALS to the service-account JSON path, then toggle
+# "Interviewer voice (TTS)" to Google in the admin AI-providers panel.

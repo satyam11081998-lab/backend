@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 from openai import OpenAI
 from services.supabase_client import get_supabase_client
 from services.ai_usage import log_ai_usage
+from services.ai_providers import chat_with_fallback
 
 
 # These MUST match lib/constants.ts on the frontend.
@@ -98,11 +99,6 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
     if not api_key:
         raise GeneratorError("OPENAI_API_KEY not set")
 
-    # Bounded so a slow/hung OpenAI call fails FAST (→ daily_scheduler falls back to
-    # existing cases) instead of tying up the Render worker until the cron times out.
-    # max_retries lets the SDK ride out transient 429/5xx before giving up.
-    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=2)
-
     user_prompt = "Generate one challenging MBA-level Case Study and one Guesstimate for today.\n"
     if recent_themes:
         joined = ", ".join(t for t in recent_themes if t)
@@ -114,8 +110,10 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
 
     try:
         t0 = time.time()
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        # Defaults to OpenAI gpt-4o ("daily_content"); admin can toggle to Groq. Any
+        # Groq/JSON error falls back to OpenAI, so the daily cron never dies on the toggle.
+        response, used_model, _prov = chat_with_fallback(
+            "daily_content",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -124,11 +122,11 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
             temperature=0.8,
             max_tokens=2000,  # one case + one guesstimate as JSON; ceiling well above the ~950 typical
         )
-        log_ai_usage(endpoint="/cron/schedule-daily", model="gpt-4o", response=response,
+        log_ai_usage(endpoint="/cron/schedule-daily", model=used_model, response=response,
                      latency_ms=int((time.time() - t0) * 1000))
         raw_content = response.choices[0].message.content
     except Exception as e:
-        raise GeneratorError(f"OpenAI request failed: {type(e).__name__}: {e}")
+        raise GeneratorError(f"Daily content request failed: {type(e).__name__}: {e}")
 
     if not raw_content or not raw_content.strip():
         raise GeneratorError("Model returned empty content")

@@ -66,3 +66,8 @@ zstandard==0.25.0
 python-multipart==0.0.9
 pypdfium2>=4.30.0
 Pillow>=10.0.0
+
+# Google Cloud WaveNet TTS — the cheaper interviewer voice ($4/1M chars vs
+# OpenAI tts-1 $15/1M). Used only when the admin toggles the "tts" feature to
+# Google; lazily imported in routes/speak.py so its absence never breaks import.
+google-cloud-texttospeech==2.16.3

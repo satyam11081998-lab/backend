@@ -14,6 +14,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from services.ai_usage import log_ai_usage
+from services.ai_providers import resolve_llm, openai_client
 
 from prompts.interview_prompts import (
     build_interviewer_messages,
@@ -34,31 +35,10 @@ _client = OpenAI(api_key=_OPENAI_API_KEY)
 INTERVIEWER_MODEL = "gpt-4o-mini"
 SCORING_MODEL = "gpt-4o"
 
-# Interviewer LLM on GROQ when GROQ_API_KEY is set — Groq's Llama is cheaper AND
-# much faster (sub-second), which makes both the typed and the spoken interview
-# feel snappier. Groq is OpenAI-API-compatible, so it's a drop-in. If Groq is
-# unset, or a Groq call fails, we fall back to OpenAI gpt-4o-mini so the
-# interviewer can never go silent because of the cheaper provider. SCORING stays
-# on OpenAI gpt-4o (quality-critical) and is deliberately NOT moved to Groq.
-_GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
-_groq_client = (
-    OpenAI(api_key=_GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-    if _GROQ_API_KEY else None
-)
-
-
-# Escape hatch: set INTERVIEWER_USE_GROQ=0 to keep the interviewer on OpenAI while
-# STT still uses Groq (the two share GROQ_API_KEY). Lets you revert only the
-# interviewer's voice/phrasing without giving up the 9x cheaper transcription.
-_INTERVIEWER_USE_GROQ = os.getenv("INTERVIEWER_USE_GROQ", "1") != "0"
-
-
-def _interviewer_backend():
-    """Prefer Groq for the interviewer; else OpenAI. Returns (client, model)."""
-    if _groq_client is not None and _INTERVIEWER_USE_GROQ:
-        return _groq_client, GROQ_LLM_MODEL
-    return _client, INTERVIEWER_MODEL
+# The interviewer's provider (Groq Llama vs OpenAI gpt-4o-mini) is chosen by the
+# admin toggle via services/ai_providers.resolve_llm("interviewer"). Groq is
+# cheaper + faster; on any Groq error we fall back to OpenAI so the interviewer
+# never goes silent. SCORING stays on OpenAI gpt-4o (locked, quality-critical).
 
 # Live-turn sampling. Was 0.4, which — combined with a prompt that literally
 # contained the words "say 'Let's assume X'" — made the interviewer open EVERY
@@ -108,7 +88,7 @@ def stream_interviewer_reply(
         new_user_message=new_user_message,
         clarifications_exhausted=clarifications_exhausted,
     )
-    cli, model = _interviewer_backend()
+    cli, model, provider = resolve_llm("interviewer")
 
     def _open_stream(c, m):
         return c.chat.completions.create(
@@ -126,11 +106,11 @@ def stream_interviewer_reply(
         t0 = time.time()
         stream = _open_stream(cli, model)
     except Exception as e:
-        if cli is not _client:
-            # Groq failed to start the stream → fall back to OpenAI so voice/typed
-            # interviewer never goes silent because of the cheaper provider.
-            print(f"[interviewer] Groq stream failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
-            cli, model = _client, INTERVIEWER_MODEL
+        if provider != "openai":
+            # Non-OpenAI (Groq) failed to start the stream → fall back to OpenAI so
+            # the interviewer never goes silent because of the cheaper provider.
+            print(f"[interviewer] {provider} stream failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
+            cli, model = openai_client(), INTERVIEWER_MODEL
             try:
                 stream = _open_stream(cli, model)
             except Exception as e2:
@@ -177,7 +157,7 @@ def complete_interviewer_reply(
         new_user_message=new_user_message,
         clarifications_exhausted=clarifications_exhausted,
     )
-    cli, model = _interviewer_backend()
+    cli, model, provider = resolve_llm("interviewer")
 
     def _complete(c, m):
         return c.chat.completions.create(
@@ -192,10 +172,10 @@ def complete_interviewer_reply(
     try:
         resp = _complete(cli, model)
     except Exception as e:
-        if cli is not _client:
-            print(f"[interviewer] Groq failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
+        if provider != "openai":
+            print(f"[interviewer] {provider} failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
             try:
-                resp = _complete(_client, INTERVIEWER_MODEL)
+                resp = _complete(openai_client(), INTERVIEWER_MODEL)
             except Exception as e2:
                 raise InterviewEngineError(f"OpenAI call failed: {e2}")
         else:

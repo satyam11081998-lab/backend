@@ -17,6 +17,7 @@ from typing import List, TypedDict, Optional
 from openai import OpenAI
 
 from services.ai_usage import log_ai_usage
+from services.ai_providers import chat_with_fallback
 
 
 class ClassifiedHeadline(TypedDict):
@@ -114,8 +115,11 @@ def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[Classifie
 
     try:
         t0 = time.time()
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        # Bulk, non-user-facing classification -> cheap provider ("news_classify"):
+        # Groq when the admin selects it, OpenAI otherwise, with automatic OpenAI
+        # fallback on any Groq/JSON-mode error so a run never dies on the cheap path.
+        response, used_model, _prov = chat_with_fallback(
+            "news_classify",
             messages=[
                 {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -124,10 +128,10 @@ def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[Classifie
             temperature=0.3,
             max_tokens=3500,  # 20 items echo their (sometimes long) titles; headroom so JSON never truncates
         )
-        log_ai_usage(endpoint="/news/classify", model="gpt-4o-mini", response=response,
+        log_ai_usage(endpoint="/news/classify", model=used_model, response=response,
                      latency_ms=int((time.time() - t0) * 1000), meta={"batch": len(raw_headlines)})
     except Exception as e:
-        raise ClassificationError(f"OpenAI API call failed: {type(e).__name__}: {e}")
+        raise ClassificationError(f"AI classification call failed: {type(e).__name__}: {e}")
 
     raw_content = response.choices[0].message.content
     if not raw_content:
