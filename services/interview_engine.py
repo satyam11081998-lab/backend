@@ -34,6 +34,32 @@ _client = OpenAI(api_key=_OPENAI_API_KEY)
 INTERVIEWER_MODEL = "gpt-4o-mini"
 SCORING_MODEL = "gpt-4o"
 
+# Interviewer LLM on GROQ when GROQ_API_KEY is set — Groq's Llama is cheaper AND
+# much faster (sub-second), which makes both the typed and the spoken interview
+# feel snappier. Groq is OpenAI-API-compatible, so it's a drop-in. If Groq is
+# unset, or a Groq call fails, we fall back to OpenAI gpt-4o-mini so the
+# interviewer can never go silent because of the cheaper provider. SCORING stays
+# on OpenAI gpt-4o (quality-critical) and is deliberately NOT moved to Groq.
+_GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+_groq_client = (
+    OpenAI(api_key=_GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    if _GROQ_API_KEY else None
+)
+
+
+# Escape hatch: set INTERVIEWER_USE_GROQ=0 to keep the interviewer on OpenAI while
+# STT still uses Groq (the two share GROQ_API_KEY). Lets you revert only the
+# interviewer's voice/phrasing without giving up the 9x cheaper transcription.
+_INTERVIEWER_USE_GROQ = os.getenv("INTERVIEWER_USE_GROQ", "1") != "0"
+
+
+def _interviewer_backend():
+    """Prefer Groq for the interviewer; else OpenAI. Returns (client, model)."""
+    if _groq_client is not None and _INTERVIEWER_USE_GROQ:
+        return _groq_client, GROQ_LLM_MODEL
+    return _client, INTERVIEWER_MODEL
+
 # Live-turn sampling. Was 0.4, which — combined with a prompt that literally
 # contained the words "say 'Let's assume X'" — made the interviewer open EVERY
 # reply with that exact phrase. A whole 7-question transcript read as one
@@ -82,10 +108,11 @@ def stream_interviewer_reply(
         new_user_message=new_user_message,
         clarifications_exhausted=clarifications_exhausted,
     )
-    try:
-        t0 = time.time()
-        stream = _client.chat.completions.create(
-            model=INTERVIEWER_MODEL,
+    cli, model = _interviewer_backend()
+
+    def _open_stream(c, m):
+        return c.chat.completions.create(
+            model=m,
             messages=messages,
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
@@ -94,8 +121,22 @@ def stream_interviewer_reply(
             stream=True,
             stream_options={"include_usage": True},  # final chunk carries token usage
         )
+
+    try:
+        t0 = time.time()
+        stream = _open_stream(cli, model)
     except Exception as e:
-        raise InterviewEngineError(f"OpenAI streaming call failed: {e}")
+        if cli is not _client:
+            # Groq failed to start the stream → fall back to OpenAI so voice/typed
+            # interviewer never goes silent because of the cheaper provider.
+            print(f"[interviewer] Groq stream failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
+            cli, model = _client, INTERVIEWER_MODEL
+            try:
+                stream = _open_stream(cli, model)
+            except Exception as e2:
+                raise InterviewEngineError(f"OpenAI streaming call failed: {e2}")
+        else:
+            raise InterviewEngineError(f"OpenAI streaming call failed: {e}")
 
     class _U:  # tiny shim so log_ai_usage can read .usage off a response-like object
         usage = None
@@ -117,7 +158,7 @@ def stream_interviewer_reply(
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
-        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=INTERVIEWER_MODEL,
+        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
                      response=final, latency_ms=int((time.time() - t0) * 1000))
 
 
@@ -136,17 +177,29 @@ def complete_interviewer_reply(
         new_user_message=new_user_message,
         clarifications_exhausted=clarifications_exhausted,
     )
-    try:
-        resp = _client.chat.completions.create(
-            model=INTERVIEWER_MODEL,
+    cli, model = _interviewer_backend()
+
+    def _complete(c, m):
+        return c.chat.completions.create(
+            model=m,
             messages=messages,
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
             presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
             max_tokens=180,
         )
+
+    try:
+        resp = _complete(cli, model)
     except Exception as e:
-        raise InterviewEngineError(f"OpenAI call failed: {e}")
+        if cli is not _client:
+            print(f"[interviewer] Groq failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
+            try:
+                resp = _complete(_client, INTERVIEWER_MODEL)
+            except Exception as e2:
+                raise InterviewEngineError(f"OpenAI call failed: {e2}")
+        else:
+            raise InterviewEngineError(f"OpenAI call failed: {e}")
     return (resp.choices[0].message.content or "").strip()
 
 

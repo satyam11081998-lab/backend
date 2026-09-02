@@ -30,6 +30,9 @@ from services.access_guard import effective_tier
 PRICES = {  # (input $/1M, output $/1M)
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
+    # Groq Llama 3.3 70B — the interviewer LLM when GROQ_API_KEY is set. Cheap and
+    # fast; kept here so its turns aren't mispriced against the gpt-4o default.
+    "llama-3.3-70b-versatile": (0.59, 0.79),
 }
 WHISPER_PER_MIN = 0.006
 # Groq's whisper-large-v3-turbo is ~$0.04/hr ≈ $0.000667/min — ~9x cheaper than
