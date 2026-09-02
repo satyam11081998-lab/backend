@@ -87,6 +87,12 @@ FEATURES: Dict[str, Dict[str, Any]] = {
         "default": "openai",  # user-facing brief — gpt-4o by default; toggle to A/B cost
         "models": {"openai": "gpt-4o", "groq": _GROQ_LLM},
     },
+    "voice_mode": {
+        "label": "Voice interview mode",
+        "providers": ["realtime", "pipeline"],
+        "default": "realtime",  # "the real one" — ChatGPT-style speech-to-speech; toggle to pipeline to cut cost
+        "models": {"realtime": "gpt-realtime-2.1", "pipeline": "whisper + llm + tts"},
+    },
     "scoring": {
         "label": "Answer scoring (locked — quality-critical)",
         "providers": ["openai"],  # intentionally NOT toggleable

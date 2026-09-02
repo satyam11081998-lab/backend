@@ -63,3 +63,5 @@ from routes import deck_ingestion as _deck_ingestion
 app.include_router(_deck_ingestion.router)
 from routes import ai_providers as _ai_providers
 app.include_router(_ai_providers.router)
+from routes import public_config as _public_config
+app.include_router(_public_config.router)
