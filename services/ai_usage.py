@@ -79,7 +79,7 @@ def _int_env(name: str, default: int) -> int:
 VOICE_MIN_PER_DAY = {
     "free": _int_env("AI_VOICE_MIN_FREE", 5),
     "lite": _int_env("AI_VOICE_MIN_LITE", 20),
-    "pro":  _int_env("AI_VOICE_MIN_PRO", 60),
+    "pro":  _int_env("AI_VOICE_MIN_PRO", 180),
 }
 OCR_IMG_PER_DAY = {
     "free": _int_env("AI_OCR_IMG_FREE", 5),
@@ -98,7 +98,7 @@ OCR_IMG_PER_DAY = {
 TTS_MIN_PER_DAY = {
     "free": _int_env("AI_TTS_MIN_FREE", 0),
     "lite": _int_env("AI_TTS_MIN_LITE", 0),
-    "pro":  _int_env("AI_TTS_MIN_PRO", 60),
+    "pro":  _int_env("AI_TTS_MIN_PRO", 180),
 }
 
 DAILY_BUDGET_USD = float(os.getenv("AI_DAILY_BUDGET_USD", "10.0"))
