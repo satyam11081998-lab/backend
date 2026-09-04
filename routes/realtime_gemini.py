@@ -114,8 +114,10 @@ async def create_gemini_session(
                 headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
             )
         if res.status_code >= 400:
-            print(f"[gemini-rt] auth_tokens failed {res.status_code}: {res.text[:400]}")
-            raise HTTPException(status_code=502, detail=f"Could not start the voice session ({res.status_code}).")
+            print(f"[gemini-rt] auth_tokens failed {res.status_code}: {res.text[:600]}")
+            # Surface Google's reason to the client (admin-only feature, still in
+            # bring-up) so the exact cause is visible without digging Render logs.
+            raise HTTPException(status_code=502, detail=f"Gemini token error {res.status_code}: {res.text[:300]}")
         data = res.json()
         # The token value is under `name` (top-level or nested under `token`).
         token_name = data.get("name") or (data.get("token") or {}).get("name")
