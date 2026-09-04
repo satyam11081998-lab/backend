@@ -65,3 +65,5 @@ from routes import ai_providers as _ai_providers
 app.include_router(_ai_providers.router)
 from routes import public_config as _public_config
 app.include_router(_public_config.router)
+from routes import realtime_gemini as _realtime_gemini
+app.include_router(_realtime_gemini.router, prefix="/realtime-gemini")

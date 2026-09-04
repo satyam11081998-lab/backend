@@ -89,9 +89,9 @@ FEATURES: Dict[str, Dict[str, Any]] = {
     },
     "voice_mode": {
         "label": "Voice interview mode",
-        "providers": ["pipeline", "realtime"],
+        "providers": ["pipeline", "realtime", "gemini"],
         "default": "pipeline",  # Groq pipeline (Groq STT + Groq LLM + Google TTS): cheap, no OpenAI. "realtime" = OpenAI speech-to-speech, kept as an option.
-        "models": {"realtime": "gpt-realtime-2.1", "pipeline": "whisper + llm + tts"},
+        "models": {"realtime": "gpt-realtime-2.1", "pipeline": "whisper + llm + tts", "gemini": "gemini-live"},
     },
     "scoring": {
         "label": "Answer scoring (locked — quality-critical)",

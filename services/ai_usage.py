@@ -52,6 +52,8 @@ TTS_PER_MIN = 0.015
 # without its own branch a WaveNet row would book $0 (no usage object, name isn't
 # "tts...") and hide talk-mode spend from the daily-budget kill switch.
 GOOGLE_TTS_PER_MIN = float(os.getenv("GOOGLE_TTS_PER_MIN", "0.0036"))
+# Gemini Live speech-to-speech ~ $0.02-0.05/min all-in; used for /realtime-gemini rows.
+GEMINI_LIVE_PER_MIN = float(os.getenv("GEMINI_LIVE_PER_MIN", "0.04"))
 
 # Realtime (speech-to-speech) audio pricing, verified 2026-08-16.
 # Input $32/1M audio tokens, output $64/1M. Rates: user audio is 1 token per
@@ -146,6 +148,9 @@ def log_ai_usage(
             # OpenAI Whisper is $0.006/min; Groq's whisper-large-v3* is ~9x cheaper.
             # Any non-"whisper-1" whisper model is assumed to be the Groq endpoint.
             cost = audio_minutes * (WHISPER_PER_MIN if model == "whisper-1" else GROQ_WHISPER_PER_MIN)
+        elif "live" in model.lower() and audio_minutes is not None:
+            # Gemini Live (gemini-*-live-*) — priced per minute of audio.
+            cost = audio_minutes * GEMINI_LIVE_PER_MIN
         elif "wavenet" in model.lower() and audio_minutes is not None:
             # Google WaveNet /speak row — character-priced, no usage object, and
             # its model name ("en-US-Wavenet-D") is neither "tts..." nor "whisper".
