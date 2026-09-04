@@ -44,7 +44,7 @@ GEMINI_LIVE_PER_MIN = float(os.getenv("GEMINI_LIVE_PER_MIN", "0.04"))  # ~$/min,
 
 AUTH_TOKEN_URL = "https://generativelanguage.googleapis.com/v1beta/auth_tokens"
 WS_BASE = ("wss://generativelanguage.googleapis.com/ws/"
-           "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained")
+           "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
 
 
 class GeminiSessionRequest(BaseModel):
@@ -98,11 +98,13 @@ async def create_gemini_session(
         "outputAudioTranscription": {},
     }
     now = datetime.datetime.now(tz=datetime.timezone.utc)
+    # A plain ephemeral token (no constraints — the REST auth_tokens resource does
+    # not accept liveConnectConstraints). The browser sends the full setup (model,
+    # voice, instructions) on the unconstrained Bidi endpoint below.
     token_body = {
-        "uses": 1,
+        "uses": 2,
         "expireTime": (now + datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "newSessionExpireTime": (now + datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "liveConnectConstraints": {"model": model, "config": live_config},
     }
 
     try:
