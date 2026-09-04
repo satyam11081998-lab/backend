@@ -109,15 +109,18 @@ async def create_gemini_session(
         t0 = time.time()
         async with httpx.AsyncClient(timeout=20.0) as client:
             res = await client.post(
-                f"{AUTH_TOKEN_URL}?key={GEMINI_API_KEY}",
-                json=token_body, headers={"Content-Type": "application/json"},
+                AUTH_TOKEN_URL,
+                json=token_body,
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
             )
         if res.status_code >= 400:
             print(f"[gemini-rt] auth_tokens failed {res.status_code}: {res.text[:400]}")
             raise HTTPException(status_code=502, detail=f"Could not start the voice session ({res.status_code}).")
         data = res.json()
-        token_name = data.get("name")
+        # The token value is under `name` (top-level or nested under `token`).
+        token_name = data.get("name") or (data.get("token") or {}).get("name")
         if not token_name:
+            print(f"[gemini-rt] no token in response: {str(data)[:300]}")
             raise HTTPException(status_code=502, detail="Voice session token missing from response.")
 
         log_ai_usage(

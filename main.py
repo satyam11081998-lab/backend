@@ -38,6 +38,7 @@ def health_check():
         "gnews_key_loaded": bool(os.getenv("GNEWS_API_KEY")),
         "newsapi_key_loaded": bool(os.getenv("NEWSAPI_KEY")),
         "cron_secret_loaded": bool(os.getenv("CRON_SECRET")),
+        "gemini_key_loaded": bool(os.getenv("GEMINI_API_KEY")),
     }
 
 
