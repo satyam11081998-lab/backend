@@ -154,7 +154,7 @@ async def speak(
             detail="Voice interview mode is a Pro feature. Upgrade to talk through a case out loud.",
         )
     speak_quota = quota["speak"]
-    if speak_quota["remaining_min"] <= 0:
+    if not speak_quota.get("unlimited") and speak_quota["remaining_min"] <= 0:
         raise HTTPException(
             status_code=429,
             detail=f"Daily voice-interview limit reached ({speak_quota['limit_min']} min). "

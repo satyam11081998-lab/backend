@@ -11,6 +11,7 @@ from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
+from services.realtime_credits import has_credit, get_balance
 from prompts.interview_prompts import build_interviewer_messages
 
 load_dotenv()
@@ -92,6 +93,15 @@ async def create_realtime_session(
         raise HTTPException(
             status_code=403,
             detail="Voice interview is a Pro feature. Upgrade to talk through a case out loud.",
+        )
+
+    # Real-time is CREDIT-metered — it costs ~10x the Groq pipeline, so it cannot be
+    # unlimited in the flat sub. Pro includes a monthly allowance; beyond it the user
+    # buys minute packs. (The standard pipeline voice mode stays unlimited for Pro.)
+    if not has_credit(supabase, uid, quota["tier"]):
+        raise HTTPException(
+            status_code=402,
+            detail="You're out of real-time interview minutes. Buy a minute pack, or switch to the standard voice mode — it's unlimited on Pro.",
         )
 
     case = (
@@ -188,6 +198,7 @@ async def create_realtime_session(
             "model": REALTIME_MODEL,
             "voice": REALTIME_VOICE,
             "max_session_seconds": MAX_SESSION_SECONDS,
+            "credits": get_balance(supabase, uid, quota["tier"]),
         }
 
     except HTTPException:
@@ -195,3 +206,16 @@ async def create_realtime_session(
     except Exception as e:
         print(f"[realtime] session error: {e}")
         raise HTTPException(status_code=500, detail=f"Could not start the voice session: {e}")
+
+
+@router.get("/credits")
+async def realtime_credits_balance(authorization: Optional[str] = Header(default=None)):
+    """Current real-time minute balance for the caller (included + purchased).
+    The talk-mode UI reads this to show 'X min left' and to know when to show the
+    buy-minutes paywall instead of connecting."""
+    supabase = get_supabase_client()
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        return {"total_remaining": 0, "included_remaining": 0, "purchased_remaining": 0, "tier": "guest"}
+    tier = get_ai_input_quota(supabase, uid)["tier"]
+    return get_balance(supabase, uid, tier)

@@ -34,6 +34,7 @@ from services.interview_engine import (
 )
 from services.badge_awarder import award_badges_for_submission
 from services.ai_usage import assert_daily_budget, log_realtime_usage
+from services.realtime_credits import deduct as deduct_realtime_credit
 
 router = APIRouter(prefix="/attempts", tags=["attempts"])
 
@@ -581,6 +582,10 @@ async def post_realtime_turn(
             output_tokens=body.audio_output_tokens or 0,
             meta={"attempt_id": attempt_id, "role": role},
         )
+        # Burn real-time credit for this turn. Rates match log_realtime_usage:
+        # input 1 tok/100ms (600/min), output 1 tok/50ms (1200/min).
+        turn_minutes = (body.audio_input_tokens or 0) / 600.0 + (body.audio_output_tokens or 0) / 1200.0
+        deduct_realtime_credit(supabase, user_id, turn_minutes)
 
     return {"message_id": saved.data[0]["id"] if saved.data else None}
 

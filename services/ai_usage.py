@@ -259,6 +259,10 @@ def speak_minutes_used_today(supabase, user_id: str) -> float:
 def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
     """Full quota snapshot for the frontend 'X min / Y images left today' UI."""
     tier = effective_tier(supabase, user_id)
+    # Pipeline talk mode (Groq STT + Groq LLM + WaveNet TTS) is CHEAP (~Rs 0.4/min),
+    # so it is included and unlimited for Pro. Real-time (Gemini/OpenAI) is the
+    # expensive one and is metered separately by the realtime CREDIT system, not here.
+    pipeline_unlimited = (tier == "pro")
     v_limit = VOICE_MIN_PER_DAY.get(tier, VOICE_MIN_PER_DAY["free"])
     o_limit = OCR_IMG_PER_DAY.get(tier, OCR_IMG_PER_DAY["free"])
     s_limit = TTS_MIN_PER_DAY.get(tier, TTS_MIN_PER_DAY["free"])
@@ -271,6 +275,7 @@ def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
             "used_min": round(v_used, 2),
             "limit_min": v_limit,
             "remaining_min": max(0.0, round(v_limit - v_used, 2)),
+            "unlimited": pipeline_unlimited,
         },
         "images": {
             "used": o_used,
@@ -283,6 +288,7 @@ def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
             "used_min": round(s_used, 2),
             "limit_min": s_limit,
             "remaining_min": max(0.0, round(s_limit - s_used, 2)),
+            "unlimited": pipeline_unlimited,
         },
     }
 
@@ -290,7 +296,7 @@ def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
 def assert_voice_quota(supabase, user_id: str) -> float:
     """Raise 429 if today's voice minutes are used up. Returns remaining minutes."""
     q = get_ai_input_quota(supabase, user_id)["voice"]
-    if q["remaining_min"] <= 0:
+    if not q.get("unlimited") and q["remaining_min"] <= 0:
         raise HTTPException(
             status_code=429,
             detail=f"Daily voice-to-text limit reached ({q['limit_min']} min). "
@@ -310,7 +316,7 @@ def assert_tts_quota(supabase, user_id: str) -> float:
     reads all three off it.
     """
     q = get_ai_input_quota(supabase, user_id)["speak"]
-    if q["remaining_min"] <= 0:
+    if not q.get("unlimited") and q["remaining_min"] <= 0:
         raise HTTPException(
             status_code=429,
             detail=f"Daily voice-interview limit reached ({q['limit_min']} min). "
