@@ -58,7 +58,19 @@ def _get_google_tts():
         return None
     try:
         from google.cloud import texttospeech
-        _google_tts_client = texttospeech.TextToSpeechClient()
+        # Two ways to authenticate, easiest first:
+        #  1) GOOGLE_TTS_CREDENTIALS_JSON — paste the service-account JSON straight
+        #     into this env var (best on Render/serverless, no file to manage).
+        #  2) GOOGLE_APPLICATION_CREDENTIALS — a path to that JSON file (local/dev).
+        raw = os.getenv("GOOGLE_TTS_CREDENTIALS_JSON", "").strip()
+        if raw:
+            import json as _json
+            from google.oauth2 import service_account
+            info = _json.loads(raw)
+            creds = service_account.Credentials.from_service_account_info(info)
+            _google_tts_client = texttospeech.TextToSpeechClient(credentials=creds)
+        else:
+            _google_tts_client = texttospeech.TextToSpeechClient()  # uses GOOGLE_APPLICATION_CREDENTIALS
         return _google_tts_client
     except Exception as e:
         print(f"[speak] Google TTS unavailable ({e}); staying on OpenAI")
