@@ -44,7 +44,7 @@ GEMINI_LIVE_PER_MIN = float(os.getenv("GEMINI_LIVE_PER_MIN", "0.04"))  # ~$/min,
 
 AUTH_TOKEN_URL = "https://generativelanguage.googleapis.com/v1beta/auth_tokens"
 WS_BASE = ("wss://generativelanguage.googleapis.com/ws/"
-           "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
+           "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained")
 
 
 class GeminiSessionRequest(BaseModel):
@@ -89,44 +89,35 @@ async def create_gemini_session(
     if not instructions:
         raise HTTPException(status_code=500, detail="Could not build interviewer instructions.")
 
-    model = f"models/{GEMINI_LIVE_MODEL}"
-    live_config = {
-        "responseModalities": ["AUDIO"],
-        "systemInstruction": {"parts": [{"text": instructions}]},
-        "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_LIVE_VOICE}}},
-        "inputAudioTranscription": {},
-        "outputAudioTranscription": {},
-    }
     now = datetime.datetime.now(tz=datetime.timezone.utc)
-    # A plain ephemeral token (no constraints — the REST auth_tokens resource does
-    # not accept liveConnectConstraints). The browser sends the full setup (model,
-    # voice, instructions) on the unconstrained Bidi endpoint below.
-    token_body = {
-        "uses": 2,
-        "expireTime": (now + datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "newSessionExpireTime": (now + datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    # Ephemeral token WITH constraints, minted via the google-genai SDK. Ephemeral
+    # tokens are only accepted on the CONSTRAINED endpoint, and the raw-REST field
+    # names differ from the SDK's — so the SDK is the reliable path. Constraints pin
+    # the model, voice, modality, interviewer instructions and transcription, so the
+    # browser sends only a minimal setup and none of it is client-tamperable.
+    constraints_config = {
+        "response_modalities": ["AUDIO"],
+        "system_instruction": instructions,
+        "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": GEMINI_LIVE_VOICE}}},
+        "input_audio_transcription": {},
+        "output_audio_transcription": {},
     }
-
     try:
         t0 = time.time()
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.post(
-                AUTH_TOKEN_URL,
-                json=token_body,
-                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-            )
-        if res.status_code >= 400:
-            print(f"[gemini-rt] auth_tokens failed {res.status_code}: {res.text[:600]}")
-            # Surface Google's reason to the client (admin-only feature, still in
-            # bring-up) so the exact cause is visible without digging Render logs.
-            raise HTTPException(status_code=502, detail=f"Gemini token error {res.status_code}: {res.text[:300]}")
-        data = res.json()
-        # The token value is under `name` (top-level or nested under `token`).
-        token_name = data.get("name") or (data.get("token") or {}).get("name")
+        from google import genai  # lazy import: keeps its cost off every other route
+        gclient = genai.Client(api_key=GEMINI_API_KEY)
+        tok = gclient.auth_tokens.create(config={
+            "uses": 2,
+            "expire_time": now + datetime.timedelta(minutes=30),
+            "new_session_expire_time": now + datetime.timedelta(minutes=2),
+            "live_connect_constraints": {
+                "model": GEMINI_LIVE_MODEL,
+                "config": constraints_config,
+            },
+        })
+        token_name = getattr(tok, "name", None)
         if not token_name:
-            print(f"[gemini-rt] no token in response: {str(data)[:300]}")
-            raise HTTPException(status_code=502, detail="Voice session token missing from response.")
-
+            raise HTTPException(status_code=502, detail="Voice session token missing.")
         log_ai_usage(
             user_id=uid, endpoint="/realtime-gemini/session", model=GEMINI_LIVE_MODEL,
             audio_minutes=0, latency_ms=int((time.time() - t0) * 1000), success=True,
@@ -135,16 +126,19 @@ async def create_gemini_session(
         return {
             "token": token_name,
             "ws_url": f"{WS_BASE}?access_token={token_name}",
-            "model": model,
+            "model": f"models/{GEMINI_LIVE_MODEL}",
             "voice": GEMINI_LIVE_VOICE,
             "instructions": instructions,
+            # Exact setup the browser should send. Constraints supply the config, so
+            # this stays minimal; kept here so it is tunable without a UI redeploy.
+            "setup": {"model": f"models/{GEMINI_LIVE_MODEL}"},
             "credits": get_balance(supabase, uid, quota["tier"]),
         }
     except HTTPException:
         raise
     except Exception as e:
         print(f"[gemini-rt] session error: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not start the voice session: {e}")
+        raise HTTPException(status_code=502, detail=f"Gemini token error: {str(e)[:300]}")
 
 
 class GeminiUsageRequest(BaseModel):
