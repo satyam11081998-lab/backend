@@ -47,6 +47,56 @@ WS_BASE = ("wss://generativelanguage.googleapis.com/ws/"
            "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained")
 
 
+_MODEL_CACHE = {"model": None, "ts": 0.0}
+_MODEL_TTL = 3600.0
+
+
+def _list_live_models() -> list:
+    """Model IDs (bare) on this key that support the Live API (bidiGenerateContent).
+    Runs on the server, which can reach Google even when nothing else can."""
+    try:
+        with httpx.Client(timeout=15.0) as c:
+            r = c.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}&pageSize=1000")
+        if r.status_code >= 400:
+            print(f"[gemini-rt] models list {r.status_code}: {r.text[:200]}")
+            return []
+        ms = r.json().get("models", [])
+        return [m["name"].split("/")[-1] for m in ms
+                if "bidiGenerateContent" in (m.get("supportedGenerationMethods") or [])]
+    except Exception as e:
+        print(f"[gemini-rt] models list failed: {e}")
+        return []
+
+
+def _resolve_live_model() -> str:
+    """Pick a valid Live model for this key. Honors GEMINI_LIVE_MODEL when it is
+    set AND actually available; otherwise auto-selects (native-audio > flash-live
+    > flash). Cached for an hour. Never raises."""
+    import time as _t
+    now = _t.time()
+    if _MODEL_CACHE["model"] and (now - _MODEL_CACHE["ts"]) < _MODEL_TTL:
+        return _MODEL_CACHE["model"]
+    live = _list_live_models()
+    env = os.getenv("GEMINI_LIVE_MODEL", "").strip()
+    chosen = None
+    if env and (env in live or not live):
+        chosen = env
+    if not chosen and live:
+        for pref in ("native-audio", "flash-live", "-live-", "flash", "live"):
+            hit = next((n for n in live if pref in n), None)
+            if hit:
+                chosen = hit
+                break
+        if not chosen:
+            chosen = live[0]
+    if not chosen:
+        chosen = env or "gemini-2.5-flash-native-audio-preview-12-2025"
+    _MODEL_CACHE["model"] = chosen
+    _MODEL_CACHE["ts"] = now
+    print(f"[gemini-rt] resolved live model: {chosen} ({len(live)} live models available)")
+    return chosen
+
+
 class GeminiSessionRequest(BaseModel):
     case_id: str
     attempt_id: Optional[str] = None
@@ -95,6 +145,7 @@ async def create_gemini_session(
     # names differ from the SDK's — so the SDK is the reliable path. Constraints pin
     # the model, voice, modality, interviewer instructions and transcription, so the
     # browser sends only a minimal setup and none of it is client-tamperable.
+    model_id = _resolve_live_model()
     constraints_config = {
         "response_modalities": ["AUDIO"],
         "system_instruction": instructions,
@@ -111,7 +162,7 @@ async def create_gemini_session(
             "expire_time": now + datetime.timedelta(minutes=30),
             "new_session_expire_time": now + datetime.timedelta(minutes=2),
             "live_connect_constraints": {
-                "model": GEMINI_LIVE_MODEL,
+                "model": model_id,
                 "config": constraints_config,
             },
         })
@@ -126,12 +177,12 @@ async def create_gemini_session(
         return {
             "token": token_name,
             "ws_url": f"{WS_BASE}?access_token={token_name}",
-            "model": f"models/{GEMINI_LIVE_MODEL}",
+            "model": f"models/{model_id}",
             "voice": GEMINI_LIVE_VOICE,
             "instructions": instructions,
             # Exact setup the browser should send. Constraints supply the config, so
             # this stays minimal; kept here so it is tunable without a UI redeploy.
-            "setup": {"model": f"models/{GEMINI_LIVE_MODEL}"},
+            "setup": {"model": f"models/{model_id}"},
             "credits": get_balance(supabase, uid, quota["tier"]),
         }
     except HTTPException:
