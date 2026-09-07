@@ -157,15 +157,27 @@ async def create_gemini_session(
         t0 = time.time()
         from google import genai  # lazy import: keeps its cost off every other route
         gclient = genai.Client(api_key=GEMINI_API_KEY)
-        tok = gclient.auth_tokens.create(config={
-            "uses": 2,
-            "expire_time": now + datetime.timedelta(minutes=30),
-            "new_session_expire_time": now + datetime.timedelta(minutes=2),
-            "live_connect_constraints": {
-                "model": model_id,
-                "config": constraints_config,
-            },
-        })
+
+        def _mint(cfg):
+            return gclient.auth_tokens.create(config={
+                "uses": 2,
+                "expire_time": now + datetime.timedelta(minutes=30),
+                "new_session_expire_time": now + datetime.timedelta(minutes=2),
+                "live_connect_constraints": {"model": model_id, "config": cfg},
+            })
+
+        # Tighter turn-taking: shorten how long Gemini waits after the candidate
+        # stops speaking before it replies (default is long -> the "5-6s" lag).
+        # If the field is ever rejected, fall back to the plain config so voice
+        # never breaks over a latency tweak.
+        tuned = dict(constraints_config)
+        tuned["realtime_input_config"] = {"automatic_activity_detection": {"silence_duration_ms": 500}}
+        try:
+            tok = _mint(tuned)
+        except Exception as e:
+            print(f"[gemini-rt] VAD-tuned config rejected ({e}); minting plain config")
+            tok = _mint(constraints_config)
+
         token_name = getattr(tok, "name", None)
         if not token_name:
             raise HTTPException(status_code=502, detail="Voice session token missing.")
