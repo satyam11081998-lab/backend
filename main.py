@@ -70,3 +70,5 @@ from routes import realtime_gemini as _realtime_gemini
 app.include_router(_realtime_gemini.router, prefix="/realtime-gemini")
 from routes import agentic as _agentic
 app.include_router(_agentic.router)
+from routes import coach as _coach
+app.include_router(_coach.router)

@@ -1,0 +1,1334 @@
+diff --git a/main.py b/main.py
+index fea85b1..a932131 100644
+--- a/main.py
++++ b/main.py
+@@ -70,3 +70,5 @@ from routes import realtime_gemini as _realtime_gemini
+ app.include_router(_realtime_gemini.router, prefix="/realtime-gemini")
+ from routes import agentic as _agentic
+ app.include_router(_agentic.router)
++from routes import coach as _coach
++app.include_router(_coach.router)
+diff --git a/routes/coach.py b/routes/coach.py
+new file mode 100644
+index 0000000..718cd84
+--- /dev/null
++++ b/routes/coach.py
+@@ -0,0 +1,223 @@
++"""
++Prep Copilot — the per-user agentic-AI coach.
++
++  GET  /coach/info   -> eligibility (has the user completed enough scored
++                        attempts?), a profile pre-fill for the intake form, the
++                        specialist roster, and whether live (model) mode is
++                        available. Pro-gated.
++  POST /coach/run    -> run the orchestrator over THIS user's real data. Body:
++                        {goal, target_company, domain, mode}. Pro-gated AND
++                        eligibility-gated. mode="live" uses the model planner;
++                        if the model is unavailable/over-budget it falls back to
++                        the GUIDED (deterministic) planner OVER THE SAME REAL
++                        DATA — never sample data — so a real user always gets a
++                        grounded plan, and the endpoint never returns 5xx.
++  POST /coach/demo   -> admin-only stage demo. Runs the guided planner against a
++                        chosen SAMPLE candidate (no key, no budget, no DB). This
++                        is what you show people; different sample candidates take
++                        visibly different paths.
++
++Gating reuses the exact contracts already in the codebase:
++  * Pro   -> services.access_guard.assert_tier_at_least(supabase, uid, "pro")
++  * Admin -> users.is_admin (same as routes/ai_providers.py & routes/agentic.py)
++"""
++
++import os
++from typing import Optional
++
++from fastapi import APIRouter, Header, HTTPException
++from pydantic import BaseModel
++
++from services.auth import get_verified_user, is_guest_user
++from services.supabase_client import get_supabase_client
++from services.access_guard import assert_tier_at_least
++from services.rate_limit import check_rate_limit
++from services.ai_usage import assert_daily_budget
++
++from services.coach import orchestrate, catalog, make_sim_planner, SAMPLE_CANDIDATES
++from services.coach.simulation import SampleUserData
++# make_live_planner / SupabaseUserData are imported lazily inside the handlers so
++# a missing OpenAI SDK/key can never break module import or the /info endpoint.
++
++router = APIRouter(prefix="/coach", tags=["coach", "agentic"])
++
++# How many completed (scored) attempts unlock the copilot. Product default 4;
++# override with COACH_MIN_ATTEMPTS without a redeploy.
++MIN_ATTEMPTS = int(os.getenv("COACH_MIN_ATTEMPTS", "4") or "4")
++
++
++def _require_pro(authorization: Optional[str]):
++    """Bearer token -> (supabase, uid). Raises 401 (unauth) / 403 (not Pro)."""
++    supabase = get_supabase_client()
++    uid, user_obj = get_verified_user(supabase, authorization)
++    if is_guest_user(user_obj):
++        raise HTTPException(status_code=403, detail="Create a free account, then upgrade to Pro to use the Prep Copilot.")
++    assert_tier_at_least(supabase, uid, "pro")  # raises 403 with an upgrade message
++    return supabase, uid
++
++
++def _require_admin(authorization: Optional[str]) -> str:
++    supabase = get_supabase_client()
++    uid, user_obj = get_verified_user(supabase, authorization)
++    if is_guest_user(user_obj):
++        raise HTTPException(status_code=403, detail="Admins only")
++    try:
++        res = supabase.table("users").select("is_admin").eq("id", uid).single().execute()
++        is_admin = bool((res.data or {}).get("is_admin"))
++    except Exception:
++        raise HTTPException(status_code=403, detail="Admins only")
++    if not is_admin:
++        raise HTTPException(status_code=403, detail="Admins only")
++    return uid
++
++
++def _completed_count(supabase, uid: str) -> int:
++    try:
++        r = supabase.table("submissions").select("id", count="exact").eq("user_id", uid).execute()
++        if getattr(r, "count", None) is not None:
++            return int(r.count)
++        return len(r.data or [])
++    except Exception:
++        return 0
++
++
++class RunRequest(BaseModel):
++    goal: str = ""
++    target_company: str = ""
++    domain: str = ""
++    mode: str = "live"  # "live" (model planner) | "guided" (deterministic)
++
++
++class DemoRequest(BaseModel):
++    candidate: str = "aarav"
++    goal: str = ""
++
++
++@router.get("/info")
++async def coach_info(authorization: Optional[str] = Header(default=None)):
++    supabase, uid = _require_pro(authorization)
++    completed = _completed_count(supabase, uid)
++
++    prof = {}
++    try:
++        p = (supabase.table("users")
++             .select("name, goal_text, placement_focus, weekly_hours_target")
++             .eq("id", uid).maybe_single().execute())
++        prof = dict(p.data or {})
++    except Exception:
++        prof = {}
++
++    try:
++        from services.ai_providers import openai_client
++        live_available = openai_client() is not None
++    except Exception:
++        live_available = False
++
++    return {
++        "eligible": completed >= MIN_ATTEMPTS,
++        "completed": completed,
++        "required": MIN_ATTEMPTS,
++        "specialists": catalog(),
++        "live_available": live_available,
++        "prefill": {
++            "goal": prof.get("goal_text") or "",
++            "placement_focus": prof.get("placement_focus") or "",
++            "weekly_hours": prof.get("weekly_hours_target") or 5,
++        },
++    }
++
++
++@router.post("/run")
++async def coach_run(body: RunRequest, authorization: Optional[str] = Header(default=None)):
++    supabase, uid = _require_pro(authorization)
++    check_rate_limit(f"coach:run:{uid}", max_calls=6, window_seconds=60)
++
++    completed = _completed_count(supabase, uid)
++    if completed < MIN_ATTEMPTS:
++        raise HTTPException(
++            status_code=403,
++            detail=f"Complete {MIN_ATTEMPTS} scored cases or guesstimates to unlock your Prep Copilot "
++                   f"(you've done {completed}).",
++        )
++
++    from services.coach.live import SupabaseUserData
++    data = SupabaseUserData(supabase, uid)
++
++    goal = (body.goal or "").strip() or "Improve my case-interview performance."
++    target_company = (body.target_company or "").strip()
++    domain = (body.domain or "").strip()
++    weekly = 5
++    try:
++        p = data.profile()
++        weekly = int(p.get("weekly_hours_target") or 5)
++    except Exception:
++        weekly = 5
++
++    want_live = (body.mode or "live").lower() != "guided"
++    note = None
++
++    def _guided():
++        planner = make_sim_planner(target_company=target_company, domain=domain, weekly_hours=weekly)
++        return orchestrate(goal, planner, data, mode="guided", max_steps=8)
++
++    if want_live:
++        try:
++            from services.coach.live import make_live_planner
++            assert_daily_budget()  # raises 503 if the day's spend is over budget
++            context = {"goal": goal, "target_company": target_company, "domain": domain, "weekly_hours": weekly}
++            planner, model = make_live_planner(uid, data, context)
++            result = orchestrate(goal, planner, data, mode="live", max_steps=8, model=model)
++            # If the model produced nothing useful, fall back to the guided plan.
++            if not result.agents_used and result.stopped_reason in ("synthesized", "planner_error"):
++                note = "Model returned no plan; used the guided planner on your real data."
++                result = _guided()
++        except HTTPException as e:
++            note = f"Live unavailable ({e.detail}); used the guided planner on your real data."
++            result = _guided()
++        except Exception as e:  # noqa: BLE001
++            note = f"Live failed ({type(e).__name__}); used the guided planner on your real data."
++            result = _guided()
++    else:
++        result = _guided()
++
++    payload = result.to_dict()
++    payload["target_company"] = target_company
++    payload["domain"] = domain
++    if note:
++        payload["note"] = note
++
++    # Best-effort audit trail; never fails the response.
++    try:
++        supabase.table("coach_runs").insert({
++            "user_id": uid, "goal": goal, "target_company": target_company, "domain": domain,
++            "mode": result.mode, "summary": result.summary, "agents_used": result.agents_used,
++            "trace": [s.to_dict() for s in result.steps], "model": result.model,
++        }).execute()
++    except Exception:
++        pass
++
++    return payload
++
++
++@router.post("/demo")
++async def coach_demo(body: DemoRequest, authorization: Optional[str] = Header(default=None)):
++    """Admin-only, zero-cost stage demo over a sample candidate. Always works."""
++    _require_admin(authorization)
++    cand = SAMPLE_CANDIDATES.get((body.candidate or "").lower()) or next(iter(SAMPLE_CANDIDATES.values()))
++    data = SampleUserData(cand)
++    goal = (body.goal or "").strip() or cand.goal
++    planner = make_sim_planner(target_company=cand.target_company, domain=cand.domain, weekly_hours=cand.weekly_hours)
++    result = orchestrate(goal, planner, data, mode="demo", max_steps=8)
++    payload = result.to_dict()
++    payload["target_company"] = cand.target_company
++    payload["domain"] = cand.domain
++    payload["candidate"] = {"key": cand.key, "name": cand.name}
++    return payload
++
++
++@router.get("/demo/candidates")
++async def coach_demo_candidates(authorization: Optional[str] = Header(default=None)):
++    _require_admin(authorization)
++    return {"candidates": [{"key": c.key, "name": c.name, "goal": c.goal,
++                            "target_company": c.target_company, "domain": c.domain}
++                           for c in SAMPLE_CANDIDATES.values()]}
+diff --git a/services/coach/__init__.py b/services/coach/__init__.py
+new file mode 100644
+index 0000000..077e857
+--- /dev/null
++++ b/services/coach/__init__.py
+@@ -0,0 +1,39 @@
++"""MECE Prep Copilot — the per-user agentic-AI layer.
++
++This is the USER-FACING counterpart to services/agentic (which is platform/admin
++facing). Where the admin orchestrator reasons about the whole cohort, this one
++reasons about ONE Pro candidate: it reads their graded history, understands where
++they want to go, and plans a personalised prep path by deploying a team of
++domain specialists.
++
++Vocabulary (the distinction that matters for the demo):
++  * an "AI agent" = ONE autonomous, tool-using entity.
++  * "agentic AI"  = a SYSTEM that shows agency by PLANNING and ORCHESTRATING
++                    several specialists across DIFFERENT DOMAINS, deciding at
++                    runtime which to deploy, reading their results, looping, and
++                    terminating on its own judgement.
++
++Only light, dependency-free pieces are imported here so the package is always
++importable. The live (OpenAI/Supabase-backed) pieces live in `.live` and are
++imported lazily by the route — a missing key or SDK can never break import.
++
++Public (light) API:
++    orchestrate(mission, planner, data, mode=...) -> CoachResult
++    make_sim_planner(), SampleCandidate, SAMPLE_CANDIDATES   # always-works demo
++    catalog()                                                # specialist roster
++
++Live API (import from services.coach.live):
++    make_live_planner(user_id, data, context), SupabaseUserData
++"""
++
++from .orchestrator import orchestrate, catalog
++from .simulation import make_sim_planner, SampleCandidate, SAMPLE_CANDIDATES
++from .schemas import CoachResult, CoachStep, SpecialistResult
++from .specialists import SPECIALISTS, DIMENSIONS
++
++__all__ = [
++    "orchestrate", "catalog",
++    "make_sim_planner", "SampleCandidate", "SAMPLE_CANDIDATES",
++    "CoachResult", "CoachStep", "SpecialistResult",
++    "SPECIALISTS", "DIMENSIONS",
++]
+diff --git a/services/coach/live.py b/services/coach/live.py
+new file mode 100644
+index 0000000..d456cea
+--- /dev/null
++++ b/services/coach/live.py
+@@ -0,0 +1,243 @@
++"""
++Live engine — the real, model-driven Prep Copilot orchestrator.
++
++Two pieces:
++  * SupabaseUserData: the DataAccess implementation over the real tables, SCOPED
++    TO ONE user, each read wrapped so a missing table/column/empty result
++    degrades to a safe default instead of raising (a run must never 500).
++  * make_live_planner: an OpenAI function-calling planner. Each SPECIALIST is a
++    tool the model can call; the model decides which to deploy, with what
++    arguments, reads each result, and calls `synthesize` to finish. This is the
++    genuine agentic-AI control flow — the MODEL orchestrates the team; the
++    specialists keep every fact grounded in real data.
++
++If OpenAI is unconfigured or errors, the caller falls back to simulation mode,
++so "live" degrades gracefully rather than failing.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from typing import Any, Dict, List, Optional
++
++from services.ai_providers import openai_client
++from services.ai_usage import log_ai_usage
++
++from .specialists import DataAccess, SPECIALISTS, DIMENSIONS
++
++PLANNER_MODEL = "gpt-4o"
++
++
++# ---------------------------------------------------------------------------
++# Supabase-backed, user-scoped data access (defensive: never raises)
++# ---------------------------------------------------------------------------
++class SupabaseUserData(DataAccess):
++    def __init__(self, supabase, user_id: str):
++        self.s = supabase
++        self.uid = user_id
++
++    def profile(self) -> Dict[str, Any]:
++        try:
++            r = (self.s.table("users")
++                 .select("name, goal_text, placement_focus, weekly_hours_target")
++                 .eq("id", self.uid).maybe_single().execute())
++            return dict(r.data or {})
++        except Exception:
++            return {}
++
++    def my_scored_submissions(self, limit: int = 40) -> List[Dict[str, Any]]:
++        try:
++            r = (self.s.table("submissions").select("score, feedback_json, case_id, created_at")
++                 .eq("user_id", self.uid).order("created_at", desc=True).limit(limit).execute())
++            return r.data or []
++        except Exception:
++            return []
++
++    def attempted_case_ids(self) -> List[str]:
++        ids: set = set()
++        try:
++            r = self.s.table("case_attempts").select("case_id").eq("user_id", self.uid).execute()
++            for row in (r.data or []):
++                if row.get("case_id"):
++                    ids.add(row["case_id"])
++        except Exception:
++            pass
++        return list(ids)
++
++    def recommend_cases(self, *, case_type: str, difficulty: Optional[str], firm: Optional[str],
++                        exclude_ids: List[str], limit: int = 3) -> List[Dict[str, Any]]:
++        # Fetch a candidate pool of active cases of the right type, then filter in
++        # Python (jsonb firm match + exclude-set) — robust across PostgREST quirks.
++        try:
++            r = (self.s.table("cases")
++                 .select("id, title, type, difficulty, interview_meta, skill_node, skill_cluster")
++                 .eq("is_active", True).eq("type", case_type).limit(60).execute())
++            pool = r.data or []
++        except Exception:
++            return []
++        exclude = set(exclude_ids or [])
++        pool = [c for c in pool if c.get("id") not in exclude]
++
++        def firm_of(c: Dict[str, Any]) -> str:
++            meta = c.get("interview_meta") or {}
++            return str((meta.get("firm") if isinstance(meta, dict) else "") or "").lower()
++
++        if firm:
++            f = firm.lower()
++            firm_hits = [c for c in pool if f and f in firm_of(c)]
++            if firm_hits:
++                pool = firm_hits
++        if difficulty:
++            diff_hits = [c for c in pool if (c.get("difficulty") or "").lower() == difficulty.lower()]
++            if diff_hits:
++                pool = diff_hits
++        out = []
++        for c in pool[:limit]:
++            out.append({"id": c.get("id"), "title": c.get("title"), "type": c.get("type"),
++                        "difficulty": c.get("difficulty")})
++        return out
++
++    def top_headlines(self, domain: Optional[str] = None, limit: int = 6) -> List[Dict[str, Any]]:
++        try:
++            r = (self.s.table("news_headlines")
++                 .select("title, gd_worthiness_score, category, source_name")
++                 .order("gd_worthiness_score", desc=True).limit(limit).execute())
++            return r.data or []
++        except Exception:
++            return []
++
++    def search_decks(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
++        try:
++            r = (self.s.table("deck_skeletons").select("title, competition, result")
++                 .ilike("title", f"%{topic}%").eq("is_active", True).limit(limit).execute())
++            return r.data or []
++        except Exception:
++            return []
++
++
++# ---------------------------------------------------------------------------
++# Live planner: specialists-as-tools function calling
++# ---------------------------------------------------------------------------
++def _planner_tools() -> List[Dict[str, Any]]:
++    tools: List[Dict[str, Any]] = []
++    schemas: Dict[str, Dict[str, Any]] = {
++        "diagnostician": {"type": "object", "properties": {}},
++        "target_strategist": {"type": "object", "properties": {
++            "target_company": {"type": "string"},
++            "domain": {"type": "string"},
++            "weakest_dimensions": {"type": "array", "items": {"type": "string", "enum": DIMENSIONS}},
++        }},
++        "case_curator": {"type": "object", "properties": {
++            "focus_dimension": {"type": "string", "enum": DIMENSIONS},
++            "case_type": {"type": "string", "enum": ["case", "guesstimate"]},
++            "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
++            "firm": {"type": "string"},
++        }},
++        "news_analyst": {"type": "object", "properties": {"domain": {"type": "string"}}},
++        "exemplar_scout": {"type": "object", "properties": {
++            "focus_dimension": {"type": "string", "enum": DIMENSIONS},
++            "topic": {"type": "string"},
++        }},
++        "roadmap_architect": {"type": "object", "properties": {
++            "weakest_dimensions": {"type": "array", "items": {"type": "string", "enum": DIMENSIONS}},
++            "target": {"type": "string"},
++            "weekly_hours": {"type": "integer"},
++        }},
++    }
++    for name, (_fn, label, domain) in SPECIALISTS.items():
++        tools.append({"type": "function", "function": {
++            "name": name, "description": f"{label} ({domain}). Deploy this specialist.",
++            "parameters": schemas.get(name, {"type": "object", "properties": {}})}})
++    tools.append({"type": "function", "function": {
++        "name": "synthesize",
++        "description": "Finish: compose the personalised prep plan from what the specialists returned.",
++        "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}})
++    return tools
++
++
++_SYSTEM = """You are the MECE Prep Copilot — the planner of an agentic-AI system that builds a \
++personalised interview-prep plan for ONE candidate on a case-interview platform. You do NOT do the \
++analysis yourself; you have a team of domain specialists and you decide, from the candidate's goal, \
++profile and what you have learned, WHICH to deploy, in what order, and with what arguments.
++
++Rules:
++- ALWAYS deploy the diagnostician FIRST — never advise before you have measured where they stand.
++- Read each specialist's result before choosing the next move; pass what you learned as arguments \
++(e.g. the weakest dimensions into target_strategist and roadmap_architect, the priority skill into \
++case_curator and exemplar_scout).
++- If the diagnostician reports no graded attempts, do NOT invent a diagnosis — deploy only the \
++target_strategist and then synthesize, telling the candidate to complete a few cases first.
++- Deploy only the specialists the goal needs; never deploy one whose answer you already have.
++- When you have enough, call synthesize with a warm, specific, first-person plan the candidate can act \
++on this week (headline diagnosis, the priority skill, the exact cases to attempt, the news angle, one \
++exemplar to copy, and the sequence)."""
++
++
++def make_live_planner(user_id: Optional[str], data: DataAccess, context: Dict[str, Any]):
++    """Returns (planner, model). The planner keeps its own message history so the
++    model sees each specialist's result and orchestrates over it."""
++    cli = openai_client()
++    if cli is None:
++        raise RuntimeError("OpenAI not configured")
++
++    prof = {}
++    try:
++        prof = data.profile() or {}
++    except Exception:
++        prof = {}
++    ctx_lines = [
++        f"GOAL: {context.get('goal', '')}",
++        f"TARGET COMPANY: {context.get('target_company', '') or '(unspecified)'}",
++        f"DOMAIN/ROLE: {context.get('domain', '') or '(unspecified)'}",
++        f"WEEKLY HOURS: {context.get('weekly_hours') or prof.get('weekly_hours_target') or 5}",
++        f"PROFILE GOAL NOTE: {prof.get('goal_text') or '(none)'}",
++    ]
++
++    messages: List[Dict[str, Any]] = [
++        {"role": "system", "content": _SYSTEM},
++        {"role": "user", "content": "\n".join(ctx_lines)},
++    ]
++    initialized = {"done": False}
++
++    def planner(goal: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
++        if not initialized["done"]:
++            initialized["done"] = True  # context already seeded above
++        elif history:
++            last = history[-1]
++            messages.append({"role": "user",
++                             "content": f"RESULT from {last['agent']}: {json.dumps(last['result'])[:1800]}"})
++
++        t0 = time.time()
++        resp = cli.chat.completions.create(
++            model=PLANNER_MODEL, messages=messages,
++            tools=_planner_tools(), tool_choice="auto",
++            temperature=0.2, max_tokens=700,
++        )
++        try:
++            log_ai_usage(user_id=user_id, endpoint="/coach/plan", model=PLANNER_MODEL,
++                         response=resp, latency_ms=int((time.time() - t0) * 1000))
++        except Exception:
++            pass
++
++        msg = resp.choices[0].message
++        tcs = getattr(msg, "tool_calls", None)
++        if not tcs:
++            return {"action": "synthesize", "summary": (getattr(msg, "content", "") or "").strip()}
++
++        tc = tcs[0]
++        messages.append({"role": "assistant", "content": msg.content or "",
++                         "tool_calls": [{"id": tc.id, "type": "function",
++                                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]})
++        messages.append({"role": "tool", "tool_call_id": tc.id, "content": "acknowledged"})
++
++        name = tc.function.name
++        try:
++            args = json.loads(tc.function.arguments or "{}")
++        except json.JSONDecodeError:
++            args = {}
++        if name == "synthesize":
++            return {"action": "synthesize", "summary": args.get("summary", ""), "rationale": msg.content or None}
++        return {"action": "delegate", "agent": name, "args": args, "rationale": msg.content or None}
++
++    return planner, PLANNER_MODEL
+diff --git a/services/coach/orchestrator.py b/services/coach/orchestrator.py
+new file mode 100644
+index 0000000..cfb825d
+--- /dev/null
++++ b/services/coach/orchestrator.py
+@@ -0,0 +1,131 @@
++"""
++The ORCHESTRATOR loop — the heart of the Prep Copilot's agentic AI.
++
++The loop is the multi-agent form of an agent loop. Its "actions" are whole
++SPECIALIST agents in different domains rather than low-level tools:
++
++    while not done and steps < budget:
++        decision = PLAN(goal, what_i've_learned_so_far)   # planner reasons
++        if decision == 'synthesize':                       # planner decides done
++            return compose(findings)
++        result = DELEGATE(decision.agent, decision.args)   # run a specialist
++        findings += result                                 # observe, then plan again
++
++Why this is *agentic AI* and not a fixed pipeline: the planner chooses, at
++runtime and from what it has learned, WHICH specialists to deploy, in WHAT
++order, with WHAT arguments, and WHEN to stop. A candidate weak on quant aiming
++at a bank and a candidate weak on synthesis aiming at product get genuinely
++different teams and different plans. The control flow belongs to the planner.
++
++The loop is model-agnostic: it takes a `planner` callable. Production injects an
++OpenAI-function-calling planner (live.py); the always-on demo injects a
++deterministic planner (simulation.py). Identical loop code runs both — which is
++how we prove the machinery is real independent of the model.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Callable, Dict, List, Optional
++
++from .schemas import CoachStep, CoachResult, SpecialistResult
++from .specialists import DataAccess, run_specialist, SPECIALISTS
++
++# planner(goal, history) -> decision
++#   decision: {"action": "delegate", "agent": str, "args": {...}, "rationale": str}
++#          or {"action": "synthesize", "summary": str, "rationale": str}
++#   history: list of {"agent": str, "args": {...}, "result": {...}}
++Planner = Callable[[str, List[Dict[str, Any]]], Dict[str, Any]]
++
++
++def orchestrate(
++    goal: str,
++    planner: Planner,
++    data: DataAccess,
++    *,
++    mode: str = "sim",
++    max_steps: int = 8,
++    on_step: Optional[Callable[[CoachStep], None]] = None,
++    model: Optional[str] = None,
++) -> CoachResult:
++    """Run the plan -> delegate -> observe -> synthesize loop to completion."""
++    steps: List[CoachStep] = []
++    history: List[Dict[str, Any]] = []
++    agents_used: List[str] = []
++    idx = 0
++
++    def emit(step: CoachStep) -> None:
++        steps.append(step)
++        if on_step:
++            try:
++                on_step(step)
++            except Exception:  # noqa: BLE001 — a UI hook must never break the loop
++                pass
++
++    for _ in range(max_steps):
++        try:
++            decision = planner(goal, history) or {}
++        except Exception as e:  # noqa: BLE001 — a planner error becomes a graceful synthesis
++            idx += 1
++            summary = _fallback_summary(goal, history)
++            emit(CoachStep(index=idx, phase="synthesize", agent=None,
++                           rationale=f"Planner error ({type(e).__name__}); composed from what I gathered.",
++                           output={"summary": summary}))
++            return CoachResult(goal=goal, mode=mode, summary=summary, steps=steps,
++                               agents_used=agents_used, stopped_reason="planner_error", model=model)
++
++        action = decision.get("action")
++
++        if action == "synthesize" or not action:
++            idx += 1
++            summary = (decision.get("summary") or "").strip() or _fallback_summary(goal, history)
++            emit(CoachStep(index=idx, phase="synthesize", agent=None,
++                           rationale=decision.get("rationale") or "I have enough to build the plan.",
++                           output={"summary": summary}))
++            return CoachResult(goal=goal, mode=mode, summary=summary, steps=steps,
++                               agents_used=agents_used, stopped_reason="synthesized", model=model)
++
++        # action == "delegate"
++        agent = decision.get("agent")
++        args = decision.get("args") or {}
++        rationale = decision.get("rationale") or f"Deploying {agent}."
++
++        idx += 1
++        emit(CoachStep(index=idx, phase="plan", agent=agent, rationale=rationale))
++
++        result: SpecialistResult = run_specialist(data, agent, args)
++        agents_used.append(agent)
++        history.append({"agent": agent, "args": args, "result": result.to_dict()})
++
++        idx += 1
++        emit(CoachStep(index=idx, phase="observe", agent=agent, rationale=None, output=result.to_dict()))
++
++    # Step-budget backstop: synthesise what we have rather than returning nothing.
++    idx += 1
++    summary = _fallback_summary(goal, history)
++    emit(CoachStep(index=idx, phase="synthesize", agent=None,
++                   rationale="Reached the step budget; composing from what I gathered.",
++                   output={"summary": summary}))
++    return CoachResult(goal=goal, mode=mode, summary=summary, steps=steps,
++                       agents_used=agents_used, stopped_reason="max_steps", model=model)
++
++
++def _fallback_summary(goal: str, history: List[Dict[str, Any]]) -> str:
++    """Deterministic synthesis if the planner didn't supply one — stitches each
++    specialist's headline + top recommendation into a plan narrative."""
++    if not history:
++        return f"I couldn't gather enough to build a plan for: {goal}"
++    lines = [f"Your prep plan — {goal}", ""]
++    for h in history:
++        r = h.get("result", {})
++        lines.append(f"\u2022 [{r.get('domain', '?')}] {r.get('headline', '')}")
++        for a in (r.get("recommended_actions") or [])[:1]:
++            lines.append(f"    \u2192 {a}")
++    lines.append("")
++    lines.append(f"Specialists deployed: {', '.join(h.get('agent', '?') for h in history) or 'none'}.")
++    return "\n".join(lines)
++
++
++def catalog() -> List[Dict[str, str]]:
++    """The specialist roster, for the coach UI / info endpoint."""
++    return [{"name": name, "label": label, "domain": domain}
++            for name, (_fn, label, domain) in SPECIALISTS.items()]
+diff --git a/services/coach/schemas.py b/services/coach/schemas.py
+new file mode 100644
+index 0000000..97fe745
+--- /dev/null
++++ b/services/coach/schemas.py
+@@ -0,0 +1,66 @@
++"""
++Typed structures for the Prep Copilot's agentic layer.
++
++Kept deliberately separate from services/agentic/schemas.py so the two
++orchestrators can evolve independently and a change to one can never break the
++other. Every run emits a full, inspectable trace (plan -> delegate -> observe ->
++synthesize) because an orchestrator you cannot audit is a liability, not a
++feature — and because the trace is exactly what the UI streams so a user (or a
++watching PM) can literally watch the system think.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field, asdict
++from typing import Any, Dict, List, Optional
++
++
++@dataclass
++class SpecialistResult:
++    """What a single domain specialist hands back to the orchestrator."""
++    domain: str
++    headline: str
++    findings: List[str] = field(default_factory=list)
++    data: Dict[str, Any] = field(default_factory=dict)
++    recommended_actions: List[str] = field(default_factory=list)
++    ok: bool = True
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++
++@dataclass
++class CoachStep:
++    """One move by the orchestrator.
++
++    phase:
++        plan       -> the orchestrator decides which specialist to deploy next
++        observe    -> it records what that specialist returned
++        synthesize -> it composes the final personalised plan and stops
++    """
++    index: int
++    phase: str
++    agent: Optional[str]
++    rationale: Optional[str]
++    output: Optional[Dict[str, Any]] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++
++@dataclass
++class CoachResult:
++    goal: str
++    mode: str                     # "sim" | "live"
++    summary: str                  # the synthesised, human-readable plan narrative
++    steps: List[CoachStep] = field(default_factory=list)
++    agents_used: List[str] = field(default_factory=list)
++    stopped_reason: str = "synthesized"   # synthesized | max_steps
++    ok: bool = True
++    error: Optional[str] = None
++    model: Optional[str] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        d = asdict(self)
++        d["steps"] = [s.to_dict() for s in self.steps]
++        return d
+diff --git a/services/coach/simulation.py b/services/coach/simulation.py
+new file mode 100644
+index 0000000..d83aed4
+--- /dev/null
++++ b/services/coach/simulation.py
+@@ -0,0 +1,224 @@
++"""
++Simulation engine — the ALWAYS-WORKS demo brain for the Prep Copilot.
++
++It runs the REAL orchestrator loop against a deterministic planner and rich
++sample candidates, so the demo works with no OpenAI key, no budget left, and no
++rows in the database. It is honest about what it is (mode="sim"): the planner
++here is scripted, but the loop, the delegation, the specialist code and the
++multi-agent structure are the same objects the live path uses. The demo proves
++the machinery; live mode swaps the scripted planner for the model.
++
++The scripted planner is still *adaptive*: it reads what the specialists returned
++so far (e.g. the weakest dimension the diagnostician found, the priority the
++target strategist derived) and feeds those into the next specialist's arguments
++— so different candidates produce genuinely different teams, orders and plans.
++That divergence is exactly what you demo on stage.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
++
++from .specialists import DataAccess
++
++
++# ---------------------------------------------------------------------------
++# Sample candidates — deliberately different so the paths visibly diverge.
++# ---------------------------------------------------------------------------
++def _sub(structure, quant, synth, judg, crea, pres, score):
++    return {"score": score, "feedback_json": {"breakdown": {
++        "structure": structure, "quantitative": quant, "synthesis": synth,
++        "business_judgment": judg, "creativity": crea, "presence": pres}}}
++
++
++@dataclass
++class SampleCandidate:
++    key: str
++    name: str
++    goal: str
++    target_company: str
++    domain: str
++    weekly_hours: int
++    submissions: List[Dict[str, Any]] = field(default_factory=list)
++    headlines: List[Dict[str, Any]] = field(default_factory=list)
++    bank: List[Dict[str, Any]] = field(default_factory=list)
++    decks: List[Dict[str, Any]] = field(default_factory=list)
++
++
++_HEADLINES = [
++    {"title": "RBI holds repo rate as inflation cools", "gd_worthiness_score": 91, "category": "macro", "source_name": "Sample Wire"},
++    {"title": "Quick-commerce burns cash chasing 10-minute delivery", "gd_worthiness_score": 88, "category": "business", "source_name": "Sample Wire"},
++    {"title": "India's data-centre boom strains the power grid", "gd_worthiness_score": 84, "category": "tech", "source_name": "Sample Wire"},
++    {"title": "MBA hiring shifts toward AI-fluent generalists", "gd_worthiness_score": 82, "category": "jobs", "source_name": "Sample Wire"},
++]
++
++_BANK = [
++    {"id": "sample-c1", "title": "Market entry: EV two-wheelers in Tier-2 India", "type": "case", "difficulty": "hard"},
++    {"id": "sample-c2", "title": "Profitability turnaround: regional QSR chain", "type": "case", "difficulty": "medium"},
++    {"id": "sample-g1", "title": "How many EV chargers does Bengaluru need by 2030?", "type": "guesstimate", "difficulty": "medium"},
++    {"id": "sample-g2", "title": "Daily coffee cups sold in Mumbai", "type": "guesstimate", "difficulty": "easy"},
++]
++
++_DECKS = [
++    {"title": "Market entry: EV two-wheelers", "competition": "IIM-A Case Cup", "result": "Winner"},
++    {"title": "Profitability turnaround: QSR chain", "competition": "BCG Ace", "result": "Finalist"},
++    {"title": "Pricing strategy: OTT bundling", "competition": "Bain BLC", "result": "National Finalist"},
++]
++
++SAMPLE_CANDIDATES: Dict[str, SampleCandidate] = {
++    "aarav": SampleCandidate(
++        key="aarav", name="Aarav (weak on quant, targeting a bank)",
++        goal="Break into investment banking — fix my numbers under pressure.",
++        target_company="Goldman Sachs", domain="finance / IB", weekly_hours=6,
++        submissions=[_sub(22, 12, 16, 12, 7, 8, 64), _sub(23, 11, 17, 12, 7, 8, 63),
++                     _sub(21, 13, 15, 11, 6, 7, 61), _sub(22, 12, 16, 12, 7, 8, 62),
++                     _sub(23, 14, 17, 13, 7, 8, 66), _sub(22, 13, 16, 12, 7, 8, 65)],
++        headlines=_HEADLINES, bank=_BANK, decks=_DECKS,
++    ),
++    "diya": SampleCandidate(
++        key="diya", name="Diya (weak on synthesis, targeting MBB)",
++        goal="Get into McKinsey — my answers ramble, I need to lead with the point.",
++        target_company="McKinsey", domain="consulting / strategy", weekly_hours=5,
++        submissions=[_sub(23, 18, 9, 11, 7, 8, 66), _sub(22, 17, 8, 10, 7, 7, 62),
++                     _sub(24, 18, 10, 12, 7, 8, 68), _sub(23, 17, 9, 11, 6, 7, 64),
++                     _sub(22, 18, 8, 11, 7, 8, 63), _sub(24, 19, 10, 12, 7, 8, 69)],
++        headlines=_HEADLINES, bank=_BANK, decks=_DECKS,
++    ),
++    "kabir": SampleCandidate(
++        key="kabir", name="Kabir (no graded attempts yet)",
++        goal="Explore product management — not sure where I stand.",
++        target_company="Product management", domain="tech / product", weekly_hours=4,
++        submissions=[], headlines=_HEADLINES, bank=_BANK, decks=_DECKS,
++    ),
++}
++
++
++class SampleUserData(DataAccess):
++    """DataAccess over a single sample candidate — no DB, no key, always works."""
++
++    def __init__(self, cand: SampleCandidate):
++        self.c = cand
++
++    def profile(self) -> Dict[str, Any]:
++        return {"name": self.c.name, "goal_text": self.c.goal,
++                "target_company": self.c.target_company, "domain": self.c.domain,
++                "weekly_hours_target": self.c.weekly_hours}
++
++    def my_scored_submissions(self, limit: int = 40) -> List[Dict[str, Any]]:
++        return self.c.submissions[:limit]
++
++    def attempted_case_ids(self) -> List[str]:
++        return []
++
++    def recommend_cases(self, *, case_type: str, difficulty: Optional[str], firm: Optional[str],
++                        exclude_ids: List[str], limit: int = 3) -> List[Dict[str, Any]]:
++        pool = [c for c in self.c.bank if c["type"] == case_type and c["id"] not in set(exclude_ids)]
++        if difficulty:
++            exact = [c for c in pool if c.get("difficulty") == difficulty]
++            pool = exact or pool
++        return pool[:limit]
++
++    def top_headlines(self, domain: Optional[str] = None, limit: int = 6) -> List[Dict[str, Any]]:
++        return self.c.headlines[:limit]
++
++    def search_decks(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
++        return self.c.decks[:limit]
++
++
++# ---------------------------------------------------------------------------
++# Deterministic, adaptive planner
++# ---------------------------------------------------------------------------
++def _done(history: List[Dict[str, Any]], agent: str) -> bool:
++    return any(h.get("agent") == agent for h in history)
++
++
++def _find(history: List[Dict[str, Any]], agent: str) -> Dict[str, Any]:
++    for h in history:
++        if h.get("agent") == agent:
++            return h.get("result", {})
++    return {}
++
++
++def make_sim_planner(*, target_company: str = "", domain: str = "", weekly_hours: int = 5):
++    """A scripted planner that still adapts to what it observes.
++
++    Sequence for a candidate WITH data:
++        diagnose -> target strategy -> curate cases -> news angle -> exemplars ->
++        roadmap -> synthesize
++    A candidate with NO graded attempts takes a visibly SHORTER branch: the
++    planner reasons that any diagnosis would be invented, so it deploys only the
++    target strategist and stops early — different-length control flow chosen from
++    the data is the essence of agency.
++    """
++
++    def planner(goal: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
++        # 1) Always diagnose first.
++        if not _done(history, "diagnostician"):
++            return {"action": "delegate", "agent": "diagnostician",
++                    "rationale": "Before advising, measure where this candidate actually stands."}
++
++        diag = _find(history, "diagnostician")
++        weak = (diag.get("data", {}) or {}).get("weakest_dimensions") or []
++
++        # No usable diagnosis (no attempts / no breakdown): short-circuit.
++        if not diag.get("ok", False) or not weak:
++            if not _done(history, "target_strategist"):
++                return {"action": "delegate", "agent": "target_strategist",
++                        "args": {"target_company": target_company, "domain": domain, "weakest_dimensions": []},
++                        "rationale": "No graded attempts yet — I can still map what the target tests, "
++                                     "but I won't invent a weakness diagnosis."}
++            return {"action": "synthesize",
++                    "rationale": "Without graded attempts, the honest move is to point them at the target's "
++                                 "emphasis and ask them to complete a few cases, not fabricate a plan.",
++                    "summary": _compose(goal, history, target_company)}
++
++        # 2) Interpret the target against the diagnosis.
++        if not _done(history, "target_strategist"):
++            return {"action": "delegate", "agent": "target_strategist",
++                    "args": {"target_company": target_company, "domain": domain, "weakest_dimensions": weak},
++                    "rationale": f"Diagnosis says weakest is {weak[0]}. Now map that against {target_company or 'the target'}."}
++
++        priority = (_find(history, "target_strategist").get("data", {}) or {}).get("priority_dimensions") or weak
++        focus = priority[0]
++
++        # 3) Curate real practice for the priority skill.
++        if not _done(history, "case_curator"):
++            ctype = "guesstimate" if focus == "quantitative" else "case"
++            return {"action": "delegate", "agent": "case_curator",
++                    "args": {"focus_dimension": focus, "case_type": ctype, "difficulty": "hard", "firm": target_company},
++                    "rationale": f"Pull unattempted {ctype}s that stress '{focus}', plus a bespoke stretch case."}
++
++        # 4) A current-events case angle in their domain.
++        if not _done(history, "news_analyst"):
++            return {"action": "delegate", "agent": "news_analyst", "args": {"domain": domain},
++                    "rationale": "Add a live business-news angle so practice connects to the real world."}
++
++        # 5) Real-world exemplars of the priority skill.
++        if not _done(history, "exemplar_scout"):
++            return {"action": "delegate", "agent": "exemplar_scout",
++                    "args": {"focus_dimension": focus, "topic": domain},
++                    "rationale": f"Show what strong '{focus}' looks like in the wild + winning decks to model."}
++
++        # 6) Sequence it all into a path.
++        if not _done(history, "roadmap_architect"):
++            return {"action": "delegate", "agent": "roadmap_architect",
++                    "args": {"weakest_dimensions": weak, "target": target_company, "weekly_hours": weekly_hours},
++                    "rationale": "Sequence the diagnosis, curated practice, news and exemplars into a 1-week path."}
++
++        return {"action": "synthesize", "rationale": "Diagnosis, target, practice, news, exemplars and path are ready.",
++                "summary": _compose(goal, history, target_company)}
++
++    return planner
++
++
++def _compose(goal: str, history: List[Dict[str, Any]], target: str) -> str:
++    lines = [f"Your personalised prep plan for {target or 'your target'}", "", f"Goal: {goal}", ""]
++    for h in history:
++        r = h.get("result", {})
++        lines.append(f"\u2022 [{r.get('domain', '?')}] {r.get('headline', '')}")
++        for a in (r.get("recommended_actions") or [])[:1]:
++            lines.append(f"    \u2192 {a}")
++    lines.append("")
++    lines.append(f"Specialists deployed: {', '.join(h.get('agent', '?') for h in history) or 'none'}.")
++    return "\n".join(lines)
+diff --git a/services/coach/specialists.py b/services/coach/specialists.py
+new file mode 100644
+index 0000000..7c15bd8
+--- /dev/null
++++ b/services/coach/specialists.py
+@@ -0,0 +1,356 @@
++"""
++The domain SPECIALISTS the Prep Copilot orchestrator can deploy for ONE
++candidate. This is what makes it *agentic AI* and not one wrapped call: the
++orchestrator has a team spanning six distinct domains and decides, at runtime,
++who to send in, in what order, and with what arguments.
++
++Design principle — GROUNDED SPECIALISTS, PLANNING MODEL. Every factual claim a
++specialist makes is computed from real data (the user's submissions, the case
++bank, the news table, the deck vault) or looked up in a small curated map. The
++model's job is the ORCHESTRATION (which specialist, when, with what args) and
++the final narration — not to invent facts. That is a deliberate,
++defensible-to-an-expert split: the autonomy is real, the outputs don't
++hallucinate.
++
++Six domains:
++  1. diagnostician     — PERFORMANCE ANALYTICS on THIS candidate. Where are they
++                         weakest right now, and is it trending?
++  2. target_strategist — CAREER INTELLIGENCE. Given the target company/role, what
++                         does it actually test, and which of the candidate's
++                         weaknesses matter most for it?
++  3. case_curator      — CURATION + RETRIEVAL. Pick real, not-yet-attempted cases
++                         and guesstimates from the bank matched to the priority
++                         skill/firm, and draft one bespoke "stretch" case.
++  4. news_analyst      — EDITORIAL / BUSINESS CONTEXT. Turn a current, GD-worthy
++                         headline in their target domain into a case/GD angle.
++  5. exemplar_scout    — REAL-WORLD GROUNDING. Surface tech/business-world
++                         examples and winning decks that model the target skill.
++  6. roadmap_architect — INSTRUCTIONAL DESIGN. Sequence everything into a
++                         milestone prep path (the structured guidance the user
++                         asked for).
++
++Every specialist goes through a DataAccess boundary (Supabase in prod, sample
++fixtures in the demo) and NEVER raises — on missing tables/columns/empty data it
++returns a graceful ok=False result so the orchestrator (and the demo) can't 500.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, List, Optional, Protocol
++
++from .schemas import SpecialistResult
++
++# The 6-dimension case rubric. Guesstimates carry a subset; unknown dimensions
++# are handled generically (normalised against the max observed) so a different
++# rubric can never crash the analytics.
++DIMENSIONS = ["structure", "quantitative", "synthesis", "business_judgment", "creativity", "presence"]
++DIM_MAX = {"structure": 25, "quantitative": 20, "synthesis": 20, "business_judgment": 15, "creativity": 10, "presence": 10}
++
++DIM_LABEL = {
++    "structure": "structuring / MECE issue trees",
++    "quantitative": "quant & estimation",
++    "synthesis": "synthesis (answer-first)",
++    "business_judgment": "business judgement",
++    "creativity": "creativity / hypotheses",
++    "presence": "communication & presence",
++}
++DIM_TECHNIQUE = {
++    "structure": "MECE issue trees drawn before talking",
++    "quantitative": "sanity-checking every number a second way",
++    "synthesis": "the Pyramid Principle — answer first, then support",
++    "business_judgment": "tying each recommendation to industry + macro context",
++    "creativity": "hypothesis-driven problem solving",
++    "presence": "calibrated, top-down delivery under time pressure",
++}
++
++# Grounded career-intelligence map. What each target *emphasises*, expressed as
++# the rubric dimensions it leans on hardest. Kept small and honest — the point is
++# to ANCHOR the model, not to pretend at precision we don't have.
++FIRM_EMPHASIS: Dict[str, Dict[str, Any]] = {
++    "mckinsey": {"label": "McKinsey", "dims": ["structure", "synthesis", "business_judgment"],
++                 "note": "Highly structured, top-down synthesis; expect a crisp so-what early."},
++    "bcg": {"label": "BCG", "dims": ["structure", "creativity", "quantitative"],
++            "note": "Structured but hypothesis-led; creative framing is rewarded."},
++    "bain": {"label": "Bain", "dims": ["business_judgment", "quantitative", "presence"],
++             "note": "Answer-first, results-oriented; strong on the quant and the 'so what'."},
++    "kearney": {"label": "Kearney", "dims": ["structure", "quantitative"],
++                "note": "Operations/quant heavy; clean structure and numbers."},
++    "big4": {"label": "Big 4 (Deloitte/PwC/EY/KPMG) consulting", "dims": ["structure", "business_judgment"],
++             "note": "Practical, client-ready structuring and judgement."},
++    "product": {"label": "Product management (tech)", "dims": ["creativity", "quantitative", "synthesis"],
++                "note": "Guesstimation, product sense and prioritisation matter more than pure strategy."},
++    "finance": {"label": "Finance / IB", "dims": ["quantitative", "business_judgment"],
++                "note": "Numbers under pressure and commercial judgement dominate."},
++    "general": {"label": "General management / other", "dims": ["structure", "synthesis", "business_judgment"],
++                "note": "Balanced structuring, synthesis and judgement."},
++}
++
++# Real-world examples keyed by dimension — used by the exemplar scout to make the
++# advice concrete ("here's this skill in the wild"). These are illustrative
++# anchors, framed as examples, not claims about any company's internal decisions.
++DIM_EXAMPLES: Dict[str, List[str]] = {
++    "structure": [
++        "Amazon's working-backwards PR/FAQ forces a MECE problem definition before any build.",
++        "Spotify's squad model is a textbook clean decomposition of a big org into non-overlapping units.",
++    ],
++    "quantitative": [
++        "Netflix sizing content spend vs. subscriber LTV is a classic market-sizing chain.",
++        "Zomato/Swiggy unit economics (AOV × take-rate − delivery cost) is a live guesstimate.",
++    ],
++    "synthesis": [
++        "A McKinsey exec summary states the recommendation in sentence one — that's synthesis.",
++        "Jeff Bezos's one-page memos are answer-first: conclusion up top, evidence below.",
++    ],
++    "business_judgment": [
++        "Reliance Jio's free-then-monetise entry is a judgement call on land-grab vs. margin.",
++        "Tata's EV bet weighs macro fuel policy against near-term unit cost — pure judgement.",
++    ],
++    "creativity": [
++        "Airbnb reframing 'hotels' as 'belong anywhere' opened a non-obvious market hypothesis.",
++        "Dollar Shave Club attacked razors on distribution, not product — a creative angle.",
++    ],
++    "presence": [
++        "A strong candidate leads with the answer, then walks structure — calm, top-down.",
++        "Great analysts signpost ('three reasons; first…') so the listener never gets lost.",
++    ],
++}
++
++
++# ---------------------------------------------------------------------------
++# Data-access boundary (user-scoped)
++# ---------------------------------------------------------------------------
++class DataAccess(Protocol):
++    def profile(self) -> Dict[str, Any]: ...
++    def my_scored_submissions(self, limit: int = 40) -> List[Dict[str, Any]]: ...
++    def attempted_case_ids(self) -> List[str]: ...
++    def recommend_cases(self, *, case_type: str, difficulty: Optional[str],
++                        firm: Optional[str], exclude_ids: List[str], limit: int = 3) -> List[Dict[str, Any]]: ...
++    def top_headlines(self, domain: Optional[str] = None, limit: int = 6) -> List[Dict[str, Any]]: ...
++    def search_decks(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]: ...
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++def _mastery(subs: List[Dict[str, Any]]) -> Dict[str, int]:
++    """Per-dimension mastery 0..100 from graded submissions. Robust to any rubric:
++    known dims normalise against DIM_MAX; unknown dims against the max observed."""
++    totals: Dict[str, float] = {}
++    counts: Dict[str, int] = {}
++    observed_max: Dict[str, float] = {}
++    for s in subs:
++        bd = ((s.get("feedback_json") or {}).get("breakdown")) or {}
++        for k, v in bd.items():
++            if isinstance(v, (int, float)):
++                totals[k] = totals.get(k, 0.0) + float(v)
++                counts[k] = counts.get(k, 0) + 1
++                observed_max[k] = max(observed_max.get(k, 0.0), float(v))
++    out: Dict[str, int] = {}
++    for k in counts:
++        avg = totals[k] / counts[k]
++        cap = float(DIM_MAX.get(k) or observed_max.get(k) or 0)
++        if cap <= 0:
++            continue
++        out[k] = max(0, min(100, round(100 * avg / cap)))
++    return out
++
++
++def _norm_firm(target_company: str, domain: str) -> str:
++    t = f"{target_company} {domain}".lower()
++    if "mckinsey" in t or "mbb" in t and "bcg" not in t and "bain" not in t:
++        return "mckinsey"
++    if "bcg" in t or "boston consulting" in t:
++        return "bcg"
++    if "bain" in t:
++        return "bain"
++    if "kearney" in t or "at kearney" in t:
++        return "kearney"
++    if any(k in t for k in ("deloitte", "pwc", "kpmg", "ey ", "big 4", "big four")):
++        return "big4"
++    if any(k in t for k in ("product", "pm ", "apm", "tech", "google", "microsoft", "amazon", "meta", "flipkart")):
++        return "product"
++    if any(k in t for k in ("finance", "investment bank", "ib", "goldman", "jpmorgan", "j.p. morgan", "banking")):
++        return "finance"
++    if any(k in t for k in ("consult", "mbb", "strategy")):
++        return "mckinsey"
++    return "general"
++
++
++# ---------------------------------------------------------------------------
++# Specialists
++# ---------------------------------------------------------------------------
++def diagnostician(data: DataAccess, **_: Any) -> SpecialistResult:
++    subs = data.my_scored_submissions(limit=40)
++    if not subs:
++        return SpecialistResult("diagnostics", "No graded attempts yet to diagnose.", ok=False,
++                                recommended_actions=["Complete a few scored cases, then run the coach."])
++    scores = [int(s.get("score", 0) or 0) for s in subs]
++    mastery = _mastery(subs)
++    if not mastery:
++        return SpecialistResult("diagnostics", "Attempts exist but carry no dimension breakdown.", ok=False)
++    ordered = sorted(mastery, key=mastery.get)
++    weakest = ordered[:2]
++    avg = round(sum(scores) / len(scores)) if scores else 0
++    trend = "flat"
++    if len(scores) >= 6:
++        recent = sum(scores[:3]) / 3
++        prev = sum(scores[3:6]) / 3
++        trend = "improving" if recent > prev + 3 else "declining" if recent < prev - 3 else "flat"
++    weak_labels = ", ".join(DIM_LABEL.get(d, d) for d in weakest)
++    return SpecialistResult(
++        domain="diagnostics",
++        headline=f"Across {len(subs)} graded attempts, weakest is {weak_labels}; avg {avg}/100, trend {trend}.",
++        findings=[f"{DIM_LABEL.get(d, d)}: {mastery[d]}/100" for d in ordered],
++        data={"weakest_dimensions": weakest, "mastery": mastery, "avg_score": avg,
++              "trend": trend, "n": len(subs)},
++        recommended_actions=[f"Prioritise {DIM_LABEL.get(weakest[0], weakest[0])} — "
++                             f"drill {DIM_TECHNIQUE.get(weakest[0], 'targeted reps')}."],
++    )
++
++
++def target_strategist(data: DataAccess, target_company: str = "", domain: str = "",
++                      weakest_dimensions: Optional[List[str]] = None, **_: Any) -> SpecialistResult:
++    firm_key = _norm_firm(target_company, domain)
++    firm = FIRM_EMPHASIS[firm_key]
++    emphasised = firm["dims"]
++    weak = weakest_dimensions or []
++    # The priority = what the TARGET stresses AND the candidate is weak on.
++    priority = [d for d in emphasised if d in weak] or emphasised[:1]
++    also = [d for d in weak if d not in emphasised]
++    label = firm["label"]
++    tgt = target_company.strip() or label
++    return SpecialistResult(
++        domain="target",
++        headline=f"For {tgt}, the make-or-break skills are {', '.join(DIM_LABEL.get(d, d) for d in emphasised)}.",
++        findings=[firm["note"],
++                  f"Your priority (target stresses it AND you're weak): {', '.join(DIM_LABEL.get(d, d) for d in priority)}."]
++                 + ([f"Also shore up: {', '.join(DIM_LABEL.get(d, d) for d in also)}."] if also else []),
++        data={"firm_key": firm_key, "firm_label": label, "target": tgt,
++              "emphasised_dimensions": emphasised, "priority_dimensions": priority},
++        recommended_actions=[f"Aim practice at {DIM_LABEL.get(priority[0], priority[0])} first — "
++                             f"it's where {label}'s bar and your gap overlap."],
++    )
++
++
++def case_curator(data: DataAccess, focus_dimension: str = "structure", case_type: str = "case",
++                 difficulty: str = "medium", firm: str = "", **_: Any) -> SpecialistResult:
++    if focus_dimension not in DIMENSIONS:
++        focus_dimension = "structure"
++    if case_type not in ("case", "guesstimate"):
++        case_type = "case"
++    exclude = data.attempted_case_ids()
++    recs = data.recommend_cases(case_type=case_type, difficulty=difficulty,
++                                firm=firm or None, exclude_ids=exclude, limit=3)
++    technique = DIM_TECHNIQUE.get(focus_dimension, "targeted reps")
++    # A bespoke "stretch" case — TEXT ONLY. It is returned to the user and saved
++    # to THEIR plan (coach_runs); it is deliberately NOT inserted into the shared
++    # `cases` bank so it can never leak into other users' practice or the
++    # leaderboard.
++    stretch = {
++        "title": f"Stretch {case_type}: pressure-test your {DIM_LABEL.get(focus_dimension, focus_dimension)}",
++        "prompt": (f"An Indian firm faces a decision that hinges on {DIM_LABEL.get(focus_dimension, focus_dimension)}. "
++                   f"Frame the problem, work the numbers in Rs/crore, and deliver a top-down recommendation. "
++                   f"Constraint: you must {technique}."),
++        "focus_dimension": focus_dimension, "difficulty": difficulty, "case_type": case_type,
++    }
++    findings = [f"{c.get('title', 'Untitled')} — {c.get('type', '')} · {c.get('difficulty', '')}"
++                for c in recs] or ["No unattempted match in the bank right now — use the stretch case below."]
++    return SpecialistResult(
++        domain="curation",
++        headline=(f"Curated {len(recs)} unattempted {case_type}(s) for {DIM_LABEL.get(focus_dimension, focus_dimension)}"
++                  + (f" + 1 bespoke stretch case." if recs else " (bank had none — drafted a bespoke stretch case).")),
++        findings=findings,
++        data={"recommended_cases": recs, "stretch_case": stretch, "focus_dimension": focus_dimension},
++        recommended_actions=([f"Start with '{recs[0].get('title')}', then attempt the stretch case."]
++                             if recs else ["Attempt the bespoke stretch case below."]),
++    )
++
++
++def news_analyst(data: DataAccess, domain: str = "", **_: Any) -> SpecialistResult:
++    heads = data.top_headlines(domain=domain or None, limit=6)
++    if not heads:
++        return SpecialistResult("news", "No fresh, GD-worthy headline available right now.", ok=False,
++                                recommended_actions=["Refresh the news pipeline, then re-run."])
++    best = max(heads, key=lambda h: h.get("gd_worthiness_score", 0) or 0)
++    title = best.get("title", "Untitled")
++    return SpecialistResult(
++        domain="news",
++        headline=f"Turn today's headline into practice: \u201c{title}\u201d.",
++        findings=[f"{h.get('title', '?')} (GD-worthiness {h.get('gd_worthiness_score', '?')})" for h in heads[:4]],
++        data={"topic": title, "score": best.get("gd_worthiness_score"),
++              "category": best.get("category"), "source": best.get("source_name"),
++              "case_angle": f"Should the key player in \u201c{title}\u201d change strategy? "
++                            f"Structure both sides, size the impact, and recommend."},
++        recommended_actions=[f"Do a 10-minute structured take on \u201c{title}\u201d — for/against + a sized recommendation."],
++    )
++
++
++def exemplar_scout(data: DataAccess, focus_dimension: str = "structure", topic: str = "", **_: Any) -> SpecialistResult:
++    if focus_dimension not in DIMENSIONS:
++        focus_dimension = "structure"
++    examples = DIM_EXAMPLES.get(focus_dimension, [])
++    decks = data.search_decks(topic or focus_dimension, limit=3)
++    deck_lines = [f"{d.get('title', '?')} — {d.get('competition', '')} {d.get('result', '')}".strip() for d in decks]
++    return SpecialistResult(
++        domain="exemplars",
++        headline=f"Real-world models of strong {DIM_LABEL.get(focus_dimension, focus_dimension)}.",
++        findings=examples + (deck_lines or []),
++        data={"examples": examples, "decks": decks, "focus_dimension": focus_dimension},
++        recommended_actions=["Study one exemplar before your next attempt and copy its move deliberately."],
++    )
++
++
++def roadmap_architect(data: DataAccess, weakest_dimensions: Optional[List[str]] = None,
++                      target: str = "", weekly_hours: int = 5, **_: Any) -> SpecialistResult:
++    weak = (weakest_dimensions or ["structure"])[:2]
++    prim = weak[0]
++    sec = weak[1] if len(weak) > 1 else weak[0]
++    plan = [
++        {"title": "Days 1–3 · Diagnose & drill the primary gap",
++         "focus": DIM_LABEL.get(prim, prim),
++         "items": [f"Warm-up: 1 easy case focused on {DIM_LABEL.get(prim, prim)}.",
++                   f"Technique rep: {DIM_TECHNIQUE.get(prim, 'targeted reps')} on every attempt.",
++                   "Review the curated exemplar, then re-attempt and compare."]},
++        {"title": "Days 4–6 · Apply under target-firm conditions",
++         "focus": target or "your target",
++         "items": ["Attempt the curated case matched to your target's emphasis.",
++                   f"Do the news-driven case angle (10 min, timed).",
++                   f"Second gap: one guesstimate stressing {DIM_LABEL.get(sec, sec)}."]},
++        {"title": "Day 7 · Integrate & self-assess",
++         "focus": "synthesis under time",
++         "items": ["Attempt the bespoke stretch case end-to-end, timed.",
++                   "Re-run the coach to see the trend move.",
++                   "Book one mock with a peer if you can."]},
++    ]
++    return SpecialistResult(
++        domain="roadmap",
++        headline=f"A 1-week path to lift {DIM_LABEL.get(prim, prim)} toward {target or 'your target'}.",
++        findings=[m["title"] for m in plan],
++        data={"plan": plan, "weekly_hours": weekly_hours, "primary": prim, "secondary": sec},
++        recommended_actions=["Follow the path top to bottom; re-run the coach weekly to re-plan on fresh data."],
++    )
++
++
++# name -> (callable, human label, domain)
++SPECIALISTS = {
++    "diagnostician": (diagnostician, "Diagnostician", "Performance analytics"),
++    "target_strategist": (target_strategist, "Target Strategist", "Career intelligence"),
++    "case_curator": (case_curator, "Case Curator", "Curation & retrieval"),
++    "news_analyst": (news_analyst, "News Analyst", "Business context"),
++    "exemplar_scout": (exemplar_scout, "Exemplar Scout", "Real-world grounding"),
++    "roadmap_architect": (roadmap_architect, "Roadmap Architect", "Instructional design"),
++}
++
++
++def run_specialist(data: DataAccess, name: str, args: Optional[Dict[str, Any]] = None) -> SpecialistResult:
++    """Dispatch to a specialist by name. Unknown/failed specialists return a
++    graceful result rather than raising — the orchestrator must never crash on a
++    single specialist's failure."""
++    entry = SPECIALISTS.get(name)
++    if entry is None:
++        return SpecialistResult(name or "unknown", f"No such specialist: {name}", ok=False)
++    fn = entry[0]
++    try:
++        return fn(data, **(args or {}))
++    except Exception as e:  # noqa: BLE001
++        return SpecialistResult(name, f"{name} failed: {type(e).__name__}: {e}", ok=False)
