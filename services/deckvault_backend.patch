@@ -1,0 +1,563 @@
+diff --git a/requirements.txt b/requirements.txt
+index 6438744..27adf31 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -25,6 +25,10 @@ mdurl==0.1.2
+ mmh3==5.2.1
+ multidict==6.7.1
+ openai==2.37.0
++# Deck Vault AI enrichment runs on Google Gemini (free tier). Without this package
++# installed, deck_ai_gemini.py raises on import and every deck silently falls back to
++# generic template text — the root cause of the "generic 2024 deck" summaries.
++google-generativeai==0.8.3
+ packaging==26.2
+ postgrest==2.30.0
+ propcache==0.5.2
+diff --git a/routes/decks.py b/routes/decks.py
+index dc3f7fa..590eb61 100644
+--- a/routes/decks.py
++++ b/routes/decks.py
+@@ -16,7 +16,7 @@ from pydantic import BaseModel
+ from services import gdrive
+ from services.ai_usage import assert_daily_budget
+ from services.auth import get_verified_user, is_guest_user
+-from services.deck_ai import DeckAIError, generate_deck_summary
++from services.deck_ai_gemini import DeckAIError, generate_deck_summary
+ from services.deck_render import render_deck_pages
+ from services.rate_limit import check_rate_limit
+ from services.supabase_client import get_supabase_client
+diff --git a/scripts/ingest_decks.py b/scripts/ingest_decks.py
+deleted file mode 100644
+index 83b23e4..0000000
+--- a/scripts/ingest_decks.py
++++ /dev/null
+@@ -1,178 +0,0 @@
+-"""
+-Case Deck Automated Ingestion CLI.
+-
+-Scans deck folders, extracts text locally, classifies against MECE taxonomy,
+-generates verified AI summaries & SEO metadata, renames and organizes into
+-Google Drive hierarchy, and stores structured metadata into PostgreSQL.
+-
+-Usage:
+-  python scripts/ingest_decks.py --dir "C:/path/to/decks"
+-  python scripts/ingest_decks.py --dir "C:/path/to/decks" --dry-run
+-  python scripts/ingest_decks.py --dir "C:/path/to/decks" --batch-size 10
+-  python scripts/ingest_decks.py --dir "C:/path/to/decks" --force
+-"""
+-
+-import argparse
+-import json
+-import os
+-import sys
+-import time
+-
+-# Ensure backend root is on sys.path
+-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+-
+-from dotenv import load_dotenv
+-load_dotenv()
+-
+-from services.deck_ingestion_pipeline import discover_decks, process_single_deck
+-from services.supabase_client import get_supabase_client
+-
+-
+-def print_banner():
+-    print("=" * 80)
+-    print("      MECE AUTOMATED CASE DECK INGESTION & INDEXING PIPELINE")
+-    print("=" * 80)
+-
+-
+-def format_confidence_badge(score: float) -> str:
+-    if score >= 0.85:
+-        return f"[HIGH {int(score*100)}%]"
+-    elif score >= 0.70:
+-        return f"[MED  {int(score*100)}%]"
+-    else:
+-        return f"[LOW  {int(score*100)}%]"
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description="MECE Automated Deck Ingestion Pipeline")
+-    parser.add_argument(
+-        "--dir",
+-        type=str,
+-        default=os.getenv("DECK_SOURCE_DIRECTORY", r"C:\Users\satya\Downloads\cases\IMI Unstop Igniters Case Decks\Corporate Case Comps\some of them"),
+-        help="Root directory containing deck files (PDF, PPTX)",
+-    )
+-    parser.add_argument("--dry-run", action="store_true", help="Simulate pipeline without modifying DB or uploading files")
+-    parser.add_argument("--force", action="store_true", help="Force re-processing of already indexed files")
+-    parser.add_argument("--batch-size", type=int, default=None, help="Process at most N decks")
+-    parser.add_argument("--retry-failed", action="store_true", help="Retry failed or unindexed decks")
+-    parser.add_argument("--json", action="store_true", help="Output full results as JSON")
+-
+-    args = parser.parse_args()
+-
+-    if not args.json:
+-        print_banner()
+-        print(f"Target Directory : {args.dir}")
+-        print(f"Execution Mode   : {'DRY RUN (Simulation)' if args.dry_run else 'LIVE INGESTION'}")
+-        print(f"Force Reprocess  : {args.force}")
+-        if args.batch_size:
+-            print(f"Batch Limit      : {args.batch_size} decks")
+-        print("-" * 80)
+-
+-    try:
+-        deck_files = discover_decks(args.dir)
+-    except Exception as e:
+-        print(f"ERROR: Could not discover decks: {e}", file=sys.stderr)
+-        sys.exit(1)
+-
+-    total_discovered = len(deck_files)
+-    if not args.json:
+-        print(f"Discovered {total_discovered} candidate deck files.")
+-        print("-" * 80)
+-
+-    if total_discovered == 0:
+-        if not args.json:
+-            print("No PDF/PPTX files found in target directory.")
+-        return
+-
+-    if args.batch_size and args.batch_size > 0:
+-        deck_files = deck_files[:args.batch_size]
+-
+-    supabase = get_supabase_client() if not args.dry_run else None
+-
+-    completed_count = 0
+-    needs_review_count = 0
+-    skipped_count = 0
+-    failed_count = 0
+-    results = []
+-
+-    t_start = time.time()
+-
+-    for idx, file_path in enumerate(deck_files):
+-        num = idx + 1
+-        total = len(deck_files)
+-        orig_name = os.path.basename(file_path)
+-
+-        if not args.json:
+-            print(f"\n[{num}/{total}] Processing: {orig_name[:60]}")
+-
+-        res = process_single_deck(
+-            file_path=file_path,
+-            dry_run=args.dry_run,
+-            force=args.force,
+-            supabase=supabase,
+-        )
+-
+-        st = res.get("status")
+-        results.append(res)
+-
+-        if st == "completed":
+-            completed_count += 1
+-            if not args.json:
+-                badge = format_confidence_badge(res.get("confidence", 0.9))
+-                print(f"      Status       : OK {badge}")
+-                print(f"      Classification: {res.get('competition')} | {res.get('company')} | {res.get('case_type')} | {res.get('result')}")
+-                print(f"      Normalized   : {res.get('normalized_filename')}")
+-                print(f"      Drive Path   : {res.get('target_drive_path')}")
+-        elif st == "needs_review":
+-            needs_review_count += 1
+-            if not args.json:
+-                badge = format_confidence_badge(res.get("confidence", 0.6))
+-                print(f"      Status       : NEEDS REVIEW {badge}")
+-                print(f"      Classification: {res.get('competition')} | {res.get('company')} | {res.get('case_type')}")
+-                print(f"      Normalized   : {res.get('normalized_filename')}")
+-        elif st == "skipped":
+-            skipped_count += 1
+-            if not args.json:
+-                print(f"      Status       : SKIPPED (Already in database: {res.get('title')})")
+-        else:
+-            failed_count += 1
+-            if not args.json:
+-                print(f"      Status       : FAILED ({res.get('error')})")
+-
+-    elapsed = round(time.time() - t_start, 2)
+-
+-    if args.json:
+-        output = {
+-            "total_discovered": total_discovered,
+-            "total_processed": len(deck_files),
+-            "completed": completed_count,
+-            "needs_review": needs_review_count,
+-            "skipped": skipped_count,
+-            "failed": failed_count,
+-            "elapsed_seconds": elapsed,
+-            "results": results,
+-        }
+-        print(json.dumps(output, indent=2))
+-        return
+-
+-    print("\n" + "=" * 80)
+-    print("                      INGESTION BATCH SUMMARY")
+-    print("=" * 80)
+-    print(f"Total Discovered   : {total_discovered}")
+-    print(f"Processed In Batch : {len(deck_files)}")
+-    print(f"Successfully Ready : {completed_count}")
+-    print(f"Flagged For Review : {needs_review_count}")
+-    print(f"Skipped Duplicates : {skipped_count}")
+-    print(f"Failed Extractions : {failed_count}")
+-    print(f"Total Time Taken   : {elapsed}s")
+-    print("=" * 80)
+-
+-    if needs_review_count > 0:
+-        print("\nItems Flagged For Human Review:")
+-        for r in results:
+-            if r.get("status") == "needs_review":
+-                print(f" - {r.get('original_filename')} (Confidence: {int(r.get('confidence',0)*100)}%) -> Proposed: {r.get('title')}")
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/scripts/master_deck_pipeline.py b/scripts/master_deck_pipeline.py
+index 837119f..50b02d9 100644
+--- a/scripts/master_deck_pipeline.py
++++ b/scripts/master_deck_pipeline.py
+@@ -68,7 +68,10 @@ from services.deck_taxonomy import (
+ # Constants
+ # ---------------------------------------------------------------------------
+ SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".ppt")
+-DEFAULT_FREE_PAGES = 2  # User requested: show exactly 2 free pages by default
++# Free preview pages are computed by public.effective_free_pages() in SQL as 25%
++# of page_count (clamp 1-5). The pipeline no longer writes a fixed free_pages value;
++# leaving it NULL lets that computed default apply. An admin can still override per
++# deck from the Deck Vault admin screen.
+ CONFIDENCE_REVIEW_THRESHOLD = 0.70
+ 
+ 
+@@ -427,7 +430,7 @@ def audit_existing_decks(
+     - Rename files on Drive with proper names
+     - Run adversarial SEO checks
+     - Flag low-confidence decks for review (is_active=False for public, visible in admin)
+-    - Set free_pages to DEFAULT_FREE_PAGES
++    - Leave free_pages NULL (DB computes the 25% default at read time)
+     """
+     supabase = get_supabase_client() if not dry_run else None
+ 
+@@ -622,8 +625,14 @@ def audit_existing_decks(
+                     print(f"      [SEO] {issue}")
+ 
+             # --- Step 10: Determine visibility ---
+-            # Low confidence or no content -> flag for review (hidden from public)
++            # A deck is published + indexed ONLY when the classifier is confident AND
++            # the summary is a real, number-verified Gemini read of the deck. A generic
++            # fallback ("local_fallback"/"unknown", incl. --no-llm mode) is held for
++            # review so it never reaches a public, Google-indexed page. "kept" means an
++            # existing good summary we deliberately did not regenerate.
+             overall_confidence = classification.get("confidence", 0.8)
++            synthesis_source = synthesis.get("_synthesis_source", "kept")
++            ai_ok = synthesis_source in ("gemini", "kept")
+             is_active = True
+             is_indexable = True
+ 
+@@ -633,6 +642,17 @@ def audit_existing_decks(
+                 stats["flagged_for_review"] += 1
+                 print(f"      [REVIEW] Flagged — confidence {overall_confidence:.0%}")
+ 
++            if not ai_ok:
++                # Keep it visible in the library but out of the public search index
++                # until a human clears the summary.
++                is_indexable = False
++                stats["flagged_for_review"] += 1
++                print(
++                    f"      [REVIEW] Summary is generic (synthesis_source="
++                    f"{synthesis_source}) — held out of the index. Check GEMINI_API_KEY "
++                    f"and that google-generativeai is installed."
++                )
++
+             # --- Step 11: Build update payload ---
+             update_payload = {
+                 "title": clean_title,
+@@ -653,8 +673,11 @@ def audit_existing_decks(
+                 "description": synthesis.get("description", f"{classification['company']} case solution for {comp}."),
+                 "is_active": is_active,
+                 "is_indexable": is_indexable,
+-                "free_pages": DEFAULT_FREE_PAGES,
+-                "processing_status": "needs_review" if not is_active else "completed",
++                # NOTE: free_pages is intentionally NOT written here. Leaving it NULL
++                # lets public.effective_free_pages() compute the 25% default (clamp
++                # 1-5) at read time. Writing a number makes it a permanent admin
++                # override — that is exactly how migration 0051 pinned every deck to 2.
++                "processing_status": "needs_review" if (not is_active or not is_indexable) else "completed",
+             }
+ 
+             # Preserve industry/function if available
+@@ -673,7 +696,7 @@ def audit_existing_decks(
+                     fallback = {k: v for k, v in update_payload.items()
+                                 if k in {"title", "competition", "result", "case_type",
+                                          "year", "summary", "tags", "is_active", "is_indexable",
+-                                         "free_pages", "description"}}
++                                         "description"}}
+                     try:
+                         supabase.table("deck_skeletons").update(fallback).eq("id", deck_id).execute()
+                         print(f"      [DB] Updated (baseline): {clean_title}")
+@@ -895,14 +918,9 @@ def ingest_new_decks(
+             st = result.get("status")
+             if st == "completed":
+                 stats["ingested"] += 1
+-                # Set free_pages to 2 for new decks
+-                if not dry_run and result.get("deck_id"):
+-                    try:
+-                        supabase.table("deck_skeletons").update(
+-                            {"free_pages": DEFAULT_FREE_PAGES}
+-                        ).eq("id", result["deck_id"]).execute()
+-                    except Exception:
+-                        pass
++                # free_pages is left NULL so public.effective_free_pages() computes the
++                # 25% default (clamp 1-5) at read time. Do NOT write a fixed number
++                # here — that becomes a permanent admin override (the 0051 mistake).
+                 print(f"      [OK] {result.get('normalized_filename', filename)}")
+             elif st == "skipped":
+                 stats["skipped"] += 1
+@@ -956,7 +974,7 @@ def main():
+         print(f"  Mode           : {'DRY RUN' if args.dry_run else 'LIVE'}")
+         print(f"  Gemini AI      : {'DISABLED (free local)' if args.no_llm else 'ENABLED'}")
+         print(f"  Force Refresh  : {args.force}")
+-        print(f"  Free Pages     : {DEFAULT_FREE_PAGES} (default for all decks)")
++        print("  Free Pages     : 25% of pages (clamp 1-5), computed by the DB at read time")
+         if args.dir:
+             print(f"  New Decks Dir  : {args.dir}")
+         print("-" * 80)
+@@ -1019,7 +1037,7 @@ def main():
+         print(f"    Failed                  : {i.get('failed', 0)}")
+ 
+     print(f"\n  Total Time: {elapsed}s")
+-    print(f"  Free Preview Pages: {DEFAULT_FREE_PAGES} (set for all decks)")
++    print("  Free Preview Pages: 25% of pages (clamp 1-5), computed by the DB")
+     print("=" * 80)
+ 
+ 
+diff --git a/scripts/process_all_decks.py b/scripts/process_all_decks.py
+deleted file mode 100644
+index fc30929..0000000
+--- a/scripts/process_all_decks.py
++++ /dev/null
+@@ -1,56 +0,0 @@
+-﻿"""Script to render and summarize all existing decks in the database."""
+-import os
+-import sys
+-
+-from services.supabase_client import get_supabase_client
+-from routes.decks import _fetch_deck_bytes, _effective_free_pages
+-from services.deck_render import render_deck_pages
+-from services.deck_ai import generate_deck_summary
+-
+-def main():
+-    supabase = get_supabase_client()
+-    res = supabase.table("deck_skeletons").select("*").execute()
+-    decks = res.data or []
+-    print(f"Found {len(decks)} decks to process.")
+-
+-    for d in decks:
+-        title = d.get("title")
+-        deck_id = d.get("id")
+-        slug = d.get("slug")
+-        storage_path = d.get("storage_path")
+-        print(f"\n==========================================")
+-        print(f"Processing: {title}")
+-        print(f"Deck ID: {deck_id} | Slug: {slug}")
+-        print(f"Storage Path: {storage_path}")
+-        print(f"==========================================")
+-
+-        try:
+-            print(f"1. Downloading PDF bytes...")
+-            pdf_bytes = _fetch_deck_bytes(storage_path, supabase)
+-            print(f"   Downloaded {len(pdf_bytes)} bytes.")
+-
+-            free_pages = _effective_free_pages(supabase, deck_id, d.get("page_count"))
+-            print(f"2. Rendering pages with watermark (effective free pages: {free_pages})...")
+-            render_res = render_deck_pages(deck_id, pdf_bytes, slug or "", free_pages)
+-            print(f"   Successfully rendered {render_res['rendered_pages']} pages to WebP + OG JPEG!")
+-
+-            if not d.get("summary"):
+-                print(f"3. Generating verified AI executive summary...")
+-                try:
+-                    summary = generate_deck_summary(
+-                        deck_id, pdf_bytes, title, d.get("competition", ""),
+-                        d.get("organizer", ""), d.get("year")
+-                    )
+-                    print(f"   Summary generated successfully:\n{summary[:150]}...\n")
+-                except Exception as e_ai:
+-                    print(f"   AI summary failed: {e_ai}")
+-            else:
+-                print("3. Summary already exists in database.")
+-
+-        except Exception as e:
+-            print(f"   ERROR processing {title}: {e}")
+-
+-    print("\nProcessing complete for all decks!")
+-
+-if __name__ == "__main__":
+-    main()
+\ No newline at end of file
+diff --git a/services/deck_ai_gemini.py b/services/deck_ai_gemini.py
+index a9a794d..b655ca8 100644
+--- a/services/deck_ai_gemini.py
++++ b/services/deck_ai_gemini.py
+@@ -238,10 +238,14 @@ def generate_deck_synthesis(
+                 last_errors = ["Executive summary is too brief, aim for 150-250 words"]
+                 continue
+ 
+-            # Zero-hallucination check
+-            allowed_numbers = source_numbers | ({str(year)} if year else set()) | {
+-                "1", "2", "3", "4", "5", "10", "20", "24", "25", "26"
+-            }
++            # Zero-hallucination check.
++            # Small integers 0-12 are structural counts ("3 recommendations",
++            # "7-point gist") rather than fabricated metrics, so they are allowed.
++            # Everything else must come from the deck's own extracted numbers (or the
++            # deck's year); otherwise the summary is rejected and regenerated.
++            structural_counts = {str(n) for n in range(0, 13)}
++            year_tokens = {str(year)} if year else set()
++            allowed_numbers = source_numbers | year_tokens | structural_counts
+             candidate_numbers = extract_numbers_from_text(exec_summary)
+             invented = candidate_numbers - allowed_numbers
+ 
+@@ -269,6 +273,10 @@ def generate_deck_synthesis(
+             parsed["ai_summary"] = _clean_text_for_summary(
+                 parsed.get("ai_summary", "")
+             )
++            # Provenance marker: a genuine, number-verified Gemini result. The
++            # ingestion pipeline reads this to decide whether a deck is safe to
++            # publish/index or must be held for human review.
++            parsed["_synthesis_source"] = "gemini"
+ 
+             final_payload = parsed
+             break
+@@ -286,7 +294,10 @@ def generate_deck_synthesis(
+             extracted_deck, rule_classification, file_hash
+         )
+ 
+-    if file_hash:
++    # Only cache genuine, number-verified Gemini results. Caching a fallback would
++    # poison the cache: a later, fully-working run (key/quota restored) would keep
++    # returning the stale generic text instead of a real summary.
++    if file_hash and final_payload.get("_synthesis_source") == "gemini":
+         _save_cached_ai_result(file_hash, final_payload)
+ 
+     return final_payload
+@@ -389,9 +400,16 @@ def _generate_local_synthesis(
+             f"Verified case competition deck for {comp} ({yr}) analysing "
+             f"{co}'s {ct} strategy. {res_label} submission in the MECE Deck Vault."
+         ),
++        # Provenance marker: this is DETERMINISTIC TEMPLATE text, not a real AI
++        # reading of the deck. It is generic by construction (this is the source of
++        # the "Case Competition 2024 - National Finalist Deck" summaries). The
++        # ingestion pipeline must treat any deck carrying this marker as
++        # needs_review and MUST NOT mark it indexable — generic text must never
++        # reach a public, Google-indexed page.
++        "_synthesis_source": "local_fallback",
+     }
+-    if file_hash:
+-        _save_cached_ai_result(file_hash, local_payload)
++    # Intentionally NOT cached: a fallback must never be persisted, or it would be
++    # served on later runs in place of a real Gemini summary.
+     return local_payload
+ 
+ 
+diff --git a/services/deck_ingestion_pipeline.py b/services/deck_ingestion_pipeline.py
+index bc6cd32..3522758 100644
+--- a/services/deck_ingestion_pipeline.py
++++ b/services/deck_ingestion_pipeline.py
+@@ -12,7 +12,7 @@ import time
+ from typing import Any, Callable, Dict, List, Optional
+ 
+ from services import gdrive
+-from services.deck_ai import generate_deck_synthesis
++from services.deck_ai_gemini import generate_deck_synthesis
+ from services.deck_classifier import classify_deck_rules
+ from services.deck_extractor import compute_file_hash, extract_deck
+ from services.deck_render import render_deck_pages
+@@ -103,9 +103,16 @@ def process_single_deck(
+     user_id: Optional[str] = None,
+     supabase=None,
+     progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
++    no_llm: bool = False,
++    rename_files: bool = True,
+ ) -> Dict[str, Any]:
+     """
+     Process a single deck through all pipeline stages with fault isolation.
++
++    no_llm:       skip the Gemini call and use deterministic local synthesis (the
++                  result is generic and will be held for review, never indexed).
++    rename_files: when False, skip the Google Drive normalise/upload step and keep a
++                  local storage path (useful for local dry testing without Drive).
+     """
+     filename = os.path.basename(file_path)
+     if progress_callback:
+@@ -148,6 +155,7 @@ def process_single_deck(
+             rule_classification=classification,
+             user_id=user_id,
+             force_refresh=force,
++            no_llm=no_llm,
+         )
+ 
+         # 5. Deterministic File Naming & Target Drive Hierarchy
+@@ -163,7 +171,23 @@ def process_single_deck(
+         company_folder = ai_synthesis.get("company") or classification["company"]
+         target_drive_path = f"Case Decks / {year_str} / {company_folder} / {normalized_filename}"
+ 
+-        status = "needs_review" if classification["needs_review"] else "completed"
++        # Fail loud: a deck is only "completed" (and therefore publishable/indexable)
++        # when BOTH the rule classifier is confident AND the summary came from a real,
++        # number-verified Gemini read of the deck. If Gemini was unavailable (missing
++        # key/package, quota, parse error) the synthesis is generic template text — that
++        # must be held for human review, never silently published to a public page.
++        synthesis_source = ai_synthesis.get("_synthesis_source", "unknown")
++        ai_ok = synthesis_source == "gemini"
++        needs_review = bool(classification["needs_review"]) or not ai_ok
++        status = "needs_review" if needs_review else "completed"
++        if not ai_ok:
++            review_reason = (
++                "AI summary fell back to generic template text "
++                f"(synthesis_source={synthesis_source}); Gemini did not produce a "
++                "verified summary. Check GEMINI_API_KEY and that google-generativeai "
++                "is installed."
++            )
++            print(f"[pipeline] HELD FOR REVIEW: {filename} -> {review_reason}")
+ 
+         result_item = {
+             "status": status,
+@@ -212,7 +236,7 @@ def process_single_deck(
+ 
+         drive_info = {"gdrive_file_id": None, "gdrive_folder_id": None, "gdrive_url": None, "gdrive_path": target_drive_path}
+         storage_path = ""
+-        if gdrive.is_configured():
++        if rename_files and gdrive.is_configured():
+             try:
+                 drive_sync_res = upload_or_sync_deck(
+                     normalized_filename=normalized_filename,
+@@ -271,7 +295,13 @@ def process_single_deck(
+             "classification_confidence": result_item["field_confidences"],
+             "metadata_confidence": result_item["confidence"],
+             "is_active": True,
+-            "is_indexable": True,
++            # Only fully-verified decks are exposed to search engines. Anything held
++            # for review stays out of the index (and off the public page) until a
++            # human clears it, so generic/low-confidence text can never rank.
++            "is_indexable": status == "completed",
++            "error_message": None if ai_ok else (
++                f"synthesis_source={synthesis_source}; held for review"
++            ),
+             "processed_at": now_iso,
+         }
+ 
+@@ -298,11 +328,16 @@ def process_single_deck(
+             try:
+                 if progress_callback:
+                     progress_callback("rendering_slides", {"file": normalized_filename})
++                # This count only controls which preview pages get a watermark.
++                # The ACCESS boundary is enforced server-side by the SQL function
++                # public.effective_free_pages() in the image route — never here, and
++                # never trusted from the client. Kept as 25% (clamped 1-5) so the
++                # watermark set matches the default the DB will serve.
+                 render_deck_pages(
+                     deck_id=deck_id,
+                     pdf_bytes=file_bytes,
+                     slug=result_item.get("slug", ""),
+-                    effective_free_pages=min(4, max(1, int(extracted["slide_count"] * 0.25))),
++                    effective_free_pages=min(5, max(1, round(extracted["slide_count"] * 0.25))),
+                 )
+             except Exception as render_err:
+                 print(f"[pipeline] Slide rendering warning for {deck_id}: {render_err}")

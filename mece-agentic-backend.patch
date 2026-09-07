@@ -1,0 +1,903 @@
+diff --git a/main.py b/main.py
+index 9891ae2..fea85b1 100644
+--- a/main.py
++++ b/main.py
+@@ -68,3 +68,5 @@ from routes import public_config as _public_config
+ app.include_router(_public_config.router)
+ from routes import realtime_gemini as _realtime_gemini
+ app.include_router(_realtime_gemini.router, prefix="/realtime-gemini")
++from routes import agentic as _agentic
++app.include_router(_agentic.router)
+diff --git a/routes/agentic.py b/routes/agentic.py
+new file mode 100644
+index 0000000..fad595f
+--- /dev/null
++++ b/routes/agentic.py
+@@ -0,0 +1,123 @@
++"""
++Admin route for MECE's agentic AI — the orchestrator demo + live runner.
++
++  GET  /admin/agentic/info   -> the specialist roster + mission presets + whether
++                                live mode is available. Drives the admin UI.
++  POST /admin/agentic/run    -> run the orchestrator. Body: {mission, mode}.
++                                mode="sim"  : deterministic, zero-cost, ALWAYS works
++                                              (this is what you show people).
++                                mode="live" : real, model-driven orchestration over
++                                              live data — and if anything is missing
++                                              (no key, budget hit, empty tables) it
++                                              transparently FALLS BACK to sim so the
++                                              demo never errors in front of an audience.
++
++Admin-gated with the same contract as routes/ai_providers.py. Never returns 5xx
++for a run — failures are reported inside a 200 body so the UI degrades gracefully.
++"""
++
++from typing import Optional
++
++from fastapi import APIRouter, Header, HTTPException
++from pydantic import BaseModel
++
++from services.auth import get_verified_user, is_guest_user
++from services.supabase_client import get_supabase_client
++from services.rate_limit import check_rate_limit
++from services.ai_usage import assert_daily_budget
++
++from services.agentic import orchestrate, catalog, make_sim_planner, SampleData
++# make_live_planner / SupabaseData are imported lazily inside the run handler so a
++# missing OpenAI SDK/key can never break module import or the /info endpoint.
++
++router = APIRouter(prefix="/admin/agentic", tags=["admin", "agentic"])
++
++
++# Mission presets surfaced in the demo UI. Each is a real, different orchestration.
++MISSION_PRESETS = [
++    {"id": "daily_brief", "label": "Run today's platform brief",
++     "mission": "Run today's platform brief: pick the best GD topic, diagnose the cohort's weakest skill, and design today's targeted practice case."},
++    {"id": "cut_cost", "label": "Cut our AI costs (without hurting quality)",
++     "mission": "Cut our AI costs without hurting scoring quality: find where spend goes and recommend safe provider switches."},
++    {"id": "week_focus", "label": "Design this week's practice focus",
++     "mission": "Design this week's practice focus: find the cohort's weakest dimension, build a hard case for it, and surface exemplar winning decks."},
++]
++
++
++def _require_admin(authorization: Optional[str]) -> str:
++    """Bearer token -> admin user id. Same contract as routes/ai_providers.py."""
++    supabase = get_supabase_client()
++    uid, user_obj = get_verified_user(supabase, authorization)
++    if is_guest_user(user_obj):
++        raise HTTPException(status_code=403, detail="Admins only")
++    try:
++        res = supabase.table("users").select("is_admin").eq("id", uid).single().execute()
++        is_admin = bool((res.data or {}).get("is_admin"))
++    except Exception:
++        raise HTTPException(status_code=403, detail="Admins only")
++    if not is_admin:
++        raise HTTPException(status_code=403, detail="Admins only")
++    return uid
++
++
++class RunRequest(BaseModel):
++    mission: str = ""
++    mode: str = "sim"  # "sim" | "live"
++
++
++@router.get("/info")
++async def agentic_info(authorization: Optional[str] = Header(default=None)):
++    _require_admin(authorization)
++    # Live is "available" only if the OpenAI client exists; the UI uses this to
++    # enable/disable the Live toggle. Import lazily so a missing key never breaks import.
++    try:
++        from services.ai_providers import openai_client
++        live_available = openai_client() is not None
++    except Exception:
++        live_available = False
++    return {"specialists": catalog(), "missions": MISSION_PRESETS, "live_available": live_available}
++
++
++@router.post("/run")
++async def agentic_run(body: RunRequest, authorization: Optional[str] = Header(default=None)):
++    uid = _require_admin(authorization)
++    check_rate_limit(f"agentic:run:{uid}", max_calls=10, window_seconds=60)
++
++    mission = (body.mission or "").strip() or MISSION_PRESETS[0]["mission"]
++    mode = "live" if (body.mode or "").lower() == "live" else "sim"
++    supabase = get_supabase_client()
++
++    note = None
++    if mode == "live":
++        # Try the real thing; degrade to sim on ANY problem so the demo can't fail.
++        try:
++            from services.agentic.live import make_live_planner, SupabaseData
++            assert_daily_budget()  # raises 503 if the day's spend is over budget
++            data = SupabaseData(supabase)
++            planner, model = make_live_planner(uid, data)
++            result = orchestrate(mission, planner, data, mode="live", max_steps=6, model=model)
++        except HTTPException as e:
++            note = f"Live unavailable ({e.detail}); showed a simulation instead."
++            result = orchestrate(mission, make_sim_planner(), SampleData(), mode="sim", max_steps=6)
++        except Exception as e:  # noqa: BLE001
++            note = f"Live failed ({type(e).__name__}); showed a simulation instead."
++            result = orchestrate(mission, make_sim_planner(), SampleData(), mode="sim", max_steps=6)
++    else:
++        result = orchestrate(mission, make_sim_planner(), SampleData(), mode="sim", max_steps=6)
++
++    payload = result.to_dict()
++    if note:
++        payload["note"] = note
++
++    # Best-effort audit trail; never fails the response.
++    try:
++        supabase.table("agentic_runs").insert({
++            "user_id": uid, "mission": mission, "mode": result.mode,
++            "summary": result.summary, "agents_used": result.agents_used,
++            "trace": [s.to_dict() for s in result.steps],
++            "stopped_reason": result.stopped_reason, "model": result.model,
++        }).execute()
++    except Exception:
++        pass
++
++    return payload
+diff --git a/services/agentic/__init__.py b/services/agentic/__init__.py
+new file mode 100644
+index 0000000..5dbdc88
+--- /dev/null
++++ b/services/agentic/__init__.py
+@@ -0,0 +1,27 @@
++"""MECE agentic-AI layer: a planner that orchestrates domain specialists.
++
++Only light, dependency-free pieces are imported here so the package is always
++importable. The live (OpenAI/Supabase-backed) pieces live in `.live` and are
++imported lazily by the route — that keeps a missing key or SDK from ever breaking
++import, and keeps this unit-testable without any external dependency.
++
++Public API (light):
++    orchestrate(mission, planner, data, mode=...) -> OrchestrationResult
++    make_sim_planner(), SampleData          # always-works demo
++    catalog()                                # specialist roster
++
++Live API (import from services.agentic.live):
++    make_live_planner(user_id, data), SupabaseData
++"""
++
++from .orchestrator import orchestrate, catalog
++from .simulation import make_sim_planner, SampleData
++from .schemas import OrchestrationResult, OrchestrationStep, SpecialistResult
++from .specialists import SPECIALISTS, DIMENSIONS
++
++__all__ = [
++    "orchestrate", "catalog",
++    "make_sim_planner", "SampleData",
++    "OrchestrationResult", "OrchestrationStep", "SpecialistResult",
++    "SPECIALISTS", "DIMENSIONS",
++]
+diff --git a/services/agentic/live.py b/services/agentic/live.py
+new file mode 100644
+index 0000000..c6d4671
+--- /dev/null
++++ b/services/agentic/live.py
+@@ -0,0 +1,179 @@
++"""
++Live engine — the real, model-driven orchestrator.
++
++Two pieces:
++  * SupabaseData: the DataAccess implementation over the real tables, each read
++    wrapped so a missing table/column/empty result degrades to [] instead of
++    raising (the demo must never 500).
++  * make_live_planner: an OpenAI-function-calling planner. Each SPECIALIST is
++    exposed to the model as a tool; the model chooses which to deploy, with what
++    arguments, and calls a `synthesize` tool to finish. This is the genuine
++    agentic-AI control flow — the MODEL orchestrates the team.
++
++If OpenAI is unconfigured or errors, the caller falls back to simulation mode, so
++"live" degrades gracefully rather than failing.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from typing import Any, Dict, List, Optional
++
++from services.ai_providers import openai_client
++from services.ai_usage import log_ai_usage
++
++from .specialists import DataAccess, SPECIALISTS, DIMENSIONS
++
++PLANNER_MODEL = "gpt-4o"
++
++
++# ---------------------------------------------------------------------------
++# Supabase-backed data access (defensive: never raises)
++# ---------------------------------------------------------------------------
++class SupabaseData(DataAccess):
++    def __init__(self, supabase):
++        self.s = supabase
++
++    def recent_scored_submissions(self, limit: int = 40) -> List[Dict[str, Any]]:
++        try:
++            r = (self.s.table("submissions").select("score, feedback_json, created_at")
++                 .order("created_at", desc=True).limit(limit).execute())
++            return r.data or []
++        except Exception:
++            return []
++
++    def top_headlines(self, limit: int = 8) -> List[Dict[str, Any]]:
++        try:
++            r = (self.s.table("news_headlines")
++                 .select("title, gd_worthiness_score, category, source_name")
++                 .order("gd_worthiness_score", desc=True).limit(limit).execute())
++            return r.data or []
++        except Exception:
++            return []
++
++    def ai_spend_by_feature(self) -> Dict[str, float]:
++        # Best-effort: sum estimated cost by feature/endpoint from the usage ledger.
++        try:
++            r = self.s.table("ai_usage_log").select("endpoint, cost_usd").limit(2000).execute()
++            out: Dict[str, float] = {}
++            for row in (r.data or []):
++                key = (row.get("endpoint") or "other").strip("/").split("/")[0] or "other"
++                out[key] = out.get(key, 0.0) + float(row.get("cost_usd") or 0.0)
++            return {k: round(v, 2) for k, v in out.items() if v > 0}
++        except Exception:
++            return {}
++
++    def search_decks(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
++        try:
++            r = (self.s.table("deck_skeletons").select("title, competition, result")
++                 .ilike("title", f"%{topic}%").eq("is_active", True).limit(limit).execute())
++            return r.data or []
++        except Exception:
++            return []
++
++    def create_practice_case(self, title: str, content: str, case_type: str, difficulty: str, focus: str) -> Dict[str, Any]:
++        payload = {"title": title, "type": case_type, "difficulty": difficulty,
++                   "content": content, "is_active": True, "source": f"agentic:{focus}"}
++        try:
++            r = self.s.table("cases").insert(payload).execute()
++            return {"id": (r.data or [{}])[0].get("id"), "title": title}
++        except Exception:
++            try:
++                payload.pop("source", None)
++                r = self.s.table("cases").insert(payload).execute()
++                return {"id": (r.data or [{}])[0].get("id"), "title": title}
++            except Exception:
++                return {"id": None, "title": title}
++
++
++# ---------------------------------------------------------------------------
++# Live planner: specialists-as-tools function calling
++# ---------------------------------------------------------------------------
++def _planner_tools() -> List[Dict[str, Any]]:
++    tools = []
++    for name, (_fn, label, domain) in SPECIALISTS.items():
++        params: Dict[str, Any] = {"type": "object", "properties": {}}
++        if name == "curriculum_designer":
++            params["properties"] = {
++                "focus_dimension": {"type": "string", "enum": DIMENSIONS},
++                "case_type": {"type": "string", "enum": ["case", "guesstimate"]},
++                "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
++            }
++        elif name == "deck_librarian":
++            params["properties"] = {"topic": {"type": "string"}}
++        tools.append({"type": "function", "function": {
++            "name": name, "description": f"{label} ({domain}). Deploy this specialist.",
++            "parameters": params}})
++    tools.append({"type": "function", "function": {
++        "name": "synthesize",
++        "description": "Finish: compose the executive answer from what the specialists returned.",
++        "parameters": {"type": "object", "properties": {"summary": {"type": "string"}},
++                       "required": ["summary"]}}})
++    return tools
++
++
++_SYSTEM = """You are the MECE Orchestrator — the planner of an agentic AI system for a case-interview \
++platform. You do NOT do the work yourself; you have a team of domain specialists and you decide, from \
++the mission and what you have learned, WHICH to deploy, in what order, and with what arguments. \
++Deploy only the specialists the mission needs. Read each result before deciding the next move. When you \
++have enough, call synthesize with a crisp executive answer (headline findings + concrete actions). \
++Be efficient — never deploy a specialist whose answer you already have."""
++
++
++def make_live_planner(user_id: Optional[str], data: DataAccess):
++    """Returns (planner, model). The planner keeps its own message history so the
++    model sees each specialist's result and orchestrates over it."""
++    cli = openai_client()
++    if cli is None:
++        raise RuntimeError("OpenAI not configured")
++
++    messages: List[Dict[str, Any]] = [{"role": "system", "content": _SYSTEM}]
++    initialized = {"done": False}
++
++    def planner(mission: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
++        # Seed the mission once; thereafter feed back the latest specialist result.
++        if not initialized["done"]:
++            messages.append({"role": "user", "content": f"MISSION: {mission}"})
++            initialized["done"] = True
++        elif history:
++            last = history[-1]
++            messages.append({"role": "user",
++                             "content": f"RESULT from {last['agent']}: {json.dumps(last['result'])[:1500]}"})
++
++        t0 = time.time()
++        resp = cli.chat.completions.create(
++            model=PLANNER_MODEL, messages=messages,
++            tools=_planner_tools(), tool_choice="auto",
++            temperature=0.2, max_tokens=600,
++        )
++        try:
++            log_ai_usage(user_id=user_id, endpoint="/admin/agentic/plan",
++                         model=PLANNER_MODEL, response=resp, latency_ms=int((time.time() - t0) * 1000))
++        except Exception:
++            pass
++
++        msg = resp.choices[0].message
++        tcs = getattr(msg, "tool_calls", None)
++        if not tcs:
++            return {"action": "synthesize", "summary": (getattr(msg, "content", "") or "").strip()}
++
++        # Record the assistant tool-call turn so the protocol stays valid, and add
++        # a tool result placeholder (the real result is fed back next planner call).
++        tc = tcs[0]
++        messages.append({"role": "assistant", "content": msg.content or "",
++                         "tool_calls": [{"id": tc.id, "type": "function",
++                                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]})
++        messages.append({"role": "tool", "tool_call_id": tc.id, "content": "acknowledged"})
++
++        name = tc.function.name
++        try:
++            args = json.loads(tc.function.arguments or "{}")
++        except json.JSONDecodeError:
++            args = {}
++        if name == "synthesize":
++            return {"action": "synthesize", "summary": args.get("summary", ""),
++                    "rationale": msg.content or None}
++        return {"action": "delegate", "agent": name, "args": args, "rationale": msg.content or None}
++
++    return planner, PLANNER_MODEL
+diff --git a/services/agentic/orchestrator.py b/services/agentic/orchestrator.py
+new file mode 100644
+index 0000000..2ca009a
+--- /dev/null
++++ b/services/agentic/orchestrator.py
+@@ -0,0 +1,127 @@
++"""
++The ORCHESTRATOR loop — the heart of MECE's agentic AI.
++
++This is the multi-agent version of an agent loop. Instead of calling low-level
++tools, the orchestrator's "actions" are whole SPECIALIST AGENTS in different
++domains. The loop is:
++
++    while not done and steps < budget:
++        decision = PLAN(mission, what_i've_learned_so_far)   # planner reasons
++        if decision == 'synthesize':                         # planner decides done
++            return compose(findings)
++        result = DELEGATE(decision.agent, decision.args)     # run a specialist
++        findings += result                                   # observe, then plan again
++
++Why this is *agentic AI* and not a fixed pipeline: the planner chooses, at
++runtime and from what it has learned, WHICH specialists to deploy, in WHAT order,
++with WHAT arguments, and WHEN to stop. Two missions — "run the daily brief" vs
++"cut our AI costs" — send in completely different teams. The control flow is the
++planner's, not ours.
++
++The loop is model-agnostic: it takes a `planner` callable. Production injects an
++OpenAI-function-calling planner (live.py); the always-on admin demo injects a
++deterministic planner (simulation.py) so it works with no key, no budget, no data.
++Identical loop code runs both — which is how you prove the machinery is real
++independent of the model.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Callable, Dict, List, Optional
++
++from .schemas import OrchestrationStep, OrchestrationResult, SpecialistResult
++from .specialists import DataAccess, run_specialist, SPECIALISTS
++
++
++# A planner decision. `action` is either "delegate" (then agent+args) or
++# "synthesize" (then summary). The planner returns this given the mission and the
++# results gathered so far.
++PlannerDecision = Dict[str, Any]
++
++# planner(mission, history) -> PlannerDecision
++#   history: list of {"agent": str, "result": dict}
++Planner = Callable[[str, List[Dict[str, Any]]], PlannerDecision]
++
++
++def orchestrate(
++    mission: str,
++    planner: Planner,
++    data: DataAccess,
++    *,
++    mode: str = "sim",
++    max_steps: int = 6,
++    on_step: Optional[Callable[[OrchestrationStep], None]] = None,
++    model: Optional[str] = None,
++) -> OrchestrationResult:
++    """Run the plan -> delegate -> observe -> synthesize loop to completion."""
++    steps: List[OrchestrationStep] = []
++    history: List[Dict[str, Any]] = []
++    agents_used: List[str] = []
++    idx = 0
++
++    def emit(step: OrchestrationStep) -> None:
++        steps.append(step)
++        if on_step:
++            on_step(step)
++
++    for _ in range(max_steps):
++        decision = planner(mission, history)
++        action = (decision or {}).get("action")
++
++        if action == "synthesize" or not action:
++            idx += 1
++            summary = (decision or {}).get("summary") or _fallback_summary(mission, history)
++            emit(OrchestrationStep(index=idx, phase="synthesize", agent=None,
++                                   rationale=(decision or {}).get("rationale") or "I have enough to answer.",
++                                   output={"summary": summary}))
++            return OrchestrationResult(
++                mission=mission, mode=mode, summary=summary, steps=steps,
++                agents_used=agents_used, stopped_reason="synthesized", model=model,
++            )
++
++        # action == "delegate"
++        agent = decision.get("agent")
++        args = decision.get("args") or {}
++        rationale = decision.get("rationale") or f"Deploying {agent}."
++
++        idx += 1
++        emit(OrchestrationStep(index=idx, phase="plan", agent=agent, rationale=rationale))
++
++        result: SpecialistResult = run_specialist(data, agent, args)
++        agents_used.append(agent)
++        history.append({"agent": agent, "args": args, "result": result.to_dict()})
++
++        idx += 1
++        emit(OrchestrationStep(index=idx, phase="observe", agent=agent, rationale=None,
++                               output=result.to_dict()))
++
++    # Budget backstop. Synthesise whatever we have rather than returning nothing.
++    idx += 1
++    summary = _fallback_summary(mission, history)
++    emit(OrchestrationStep(index=idx, phase="synthesize", agent=None,
++                           rationale="Reached the step budget; composing from what I gathered.",
++                           output={"summary": summary}))
++    return OrchestrationResult(
++        mission=mission, mode=mode, summary=summary, steps=steps,
++        agents_used=agents_used, stopped_reason="max_steps", model=model,
++    )
++
++
++def _fallback_summary(mission: str, history: List[Dict[str, Any]]) -> str:
++    """Deterministic synthesis if the planner didn't supply one — stitches each
++    specialist's headline + top recommendation into an executive brief."""
++    if not history:
++        return f"No specialist produced a usable result for: {mission}"
++    lines = [f"Executive brief — {mission}", ""]
++    for h in history:
++        r = h.get("result", {})
++        lines.append(f"• [{r.get('domain','?')}] {r.get('headline','')}")
++        for a in (r.get("recommended_actions") or [])[:1]:
++            lines.append(f"    → {a}")
++    return "\n".join(lines)
++
++
++def catalog() -> List[Dict[str, str]]:
++    """The specialist roster, for the admin UI / info endpoint."""
++    return [{"name": name, "label": label, "domain": domain}
++            for name, (_fn, label, domain) in SPECIALISTS.items()]
+diff --git a/services/agentic/schemas.py b/services/agentic/schemas.py
+new file mode 100644
+index 0000000..93b80a3
+--- /dev/null
++++ b/services/agentic/schemas.py
+@@ -0,0 +1,71 @@
++"""
++Typed structures for MECE's *agentic AI* layer.
++
++Vocabulary note (this is the distinction you asked for):
++  * an "AI agent"  = ONE autonomous, tool-using entity.
++  * "agentic AI"   = a SYSTEM that exhibits agency by PLANNING and ORCHESTRATING
++                     several specialist agents across DIFFERENT DOMAINS, deciding
++                     at runtime which to deploy, reading their results, and
++                     synthesising an outcome.
++
++This module is the second kind. The orchestrator is a planner that delegates to
++domain specialists (growth analytics, content strategy, curriculum design, FinOps
++cost control, deck retrieval) and composes their findings. Every run emits a full,
++inspectable trace — the plan, each delegation, each observation, the synthesis —
++because an orchestrator you cannot audit is a liability, not a feature.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field, asdict
++from typing import Any, Dict, List, Optional
++
++
++@dataclass
++class SpecialistResult:
++    """What a single domain specialist hands back to the orchestrator."""
++    domain: str
++    headline: str
++    findings: List[str] = field(default_factory=list)
++    data: Dict[str, Any] = field(default_factory=dict)
++    recommended_actions: List[str] = field(default_factory=list)
++    ok: bool = True
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++
++@dataclass
++class OrchestrationStep:
++    """One move by the orchestrator. `phase` makes the trace legible in the UI:
++        plan      -> the orchestrator reasons about what to do next
++        delegate  -> it invokes a specialist agent (the ACTION)
++        observe   -> it records what the specialist returned
++        synthesize-> it composes the final answer and stops
++    """
++    index: int
++    phase: str
++    agent: Optional[str]
++    rationale: Optional[str]
++    output: Optional[Dict[str, Any]] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++
++@dataclass
++class OrchestrationResult:
++    mission: str
++    mode: str                     # "sim" | "live"
++    summary: str                  # the synthesised executive answer
++    steps: List[OrchestrationStep] = field(default_factory=list)
++    agents_used: List[str] = field(default_factory=list)
++    stopped_reason: str = "synthesized"   # synthesized | max_steps
++    ok: bool = True
++    error: Optional[str] = None
++    model: Optional[str] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        d = asdict(self)
++        d["steps"] = [s.to_dict() for s in self.steps]
++        return d
+diff --git a/services/agentic/simulation.py b/services/agentic/simulation.py
+new file mode 100644
+index 0000000..7e3e7b5
+--- /dev/null
++++ b/services/agentic/simulation.py
+@@ -0,0 +1,134 @@
++"""
++Simulation engine — the ALWAYS-WORKS demo brain.
++
++This makes the admin demo bulletproof: it runs the REAL orchestrator loop against
++a deterministic planner and rich sample data, so it works with no OpenAI key, no
++budget left, and no rows in the database. It's what you show people.
++
++It is honest about what it is (mode="sim"): the planner here is scripted, but the
++loop, the delegation, the specialist code, and the multi-agent structure are all
++the same objects the live path uses. The demo proves the machinery; live mode
++swaps the scripted planner for the model.
++
++The scripted planner is still *adaptive*: it reads the results gathered so far
++(e.g. the weakest dimension the growth analyst found) and feeds them into the next
++specialist's arguments — so different missions produce genuinely different teams.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, List
++
++from .specialists import DataAccess
++
++
++# ---------------------------------------------------------------------------
++# Sample data so specialists produce vivid output with no DB.
++# ---------------------------------------------------------------------------
++class SampleData(DataAccess):
++    def recent_scored_submissions(self, limit: int = 40) -> List[Dict[str, Any]]:
++        # Cohort skewed weak on synthesis — the analyst will surface that.
++        base = [
++            {"score": 61, "feedback_json": {"breakdown": {"structure": 21, "quantitative": 17, "synthesis": 9, "business_judgment": 10, "creativity": 6, "presence": 7}}},
++            {"score": 58, "feedback_json": {"breakdown": {"structure": 20, "quantitative": 16, "synthesis": 8, "business_judgment": 10, "creativity": 6, "presence": 7}}},
++            {"score": 64, "feedback_json": {"breakdown": {"structure": 22, "quantitative": 18, "synthesis": 10, "business_judgment": 11, "creativity": 6, "presence": 8}}},
++            {"score": 55, "feedback_json": {"breakdown": {"structure": 19, "quantitative": 15, "synthesis": 8, "business_judgment": 9, "creativity": 6, "presence": 7}}},
++            {"score": 67, "feedback_json": {"breakdown": {"structure": 23, "quantitative": 18, "synthesis": 11, "business_judgment": 11, "creativity": 7, "presence": 8}}},
++        ]
++        return (base * 8)[:limit]
++
++    def top_headlines(self, limit: int = 8) -> List[Dict[str, Any]]:
++        return [
++            {"title": "RBI holds repo rate as inflation cools", "gd_worthiness_score": 91, "category": "macro", "source_name": "Sample Wire"},
++            {"title": "Quick-commerce burns cash chasing 10-minute delivery", "gd_worthiness_score": 88, "category": "business", "source_name": "Sample Wire"},
++            {"title": "India's data-centre boom strains the power grid", "gd_worthiness_score": 84, "category": "tech", "source_name": "Sample Wire"},
++            {"title": "MBA hiring shifts toward AI-fluent generalists", "gd_worthiness_score": 82, "category": "jobs", "source_name": "Sample Wire"},
++        ][:limit]
++
++    def ai_spend_by_feature(self) -> Dict[str, float]:
++        return {"scoring": 4.10, "interviewer": 3.30, "stt": 1.20, "tts": 0.95, "validity": 0.60, "news_classify": 0.35}
++
++    def search_decks(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
++        return [
++            {"title": "Market entry: EV two-wheelers", "competition": "IIM-A Case Cup", "result": "Winner"},
++            {"title": "Profitability turnaround: QSR chain", "competition": "BCG Ace", "result": "Finalist"},
++            {"title": "Pricing strategy: OTT bundling", "competition": "Bain BLC", "result": "National Finalist"},
++        ][:limit]
++
++    def create_practice_case(self, title: str, content: str, case_type: str, difficulty: str, focus: str) -> Dict[str, Any]:
++        return {"id": f"sample_{focus}_{difficulty}", "title": title}
++
++
++# ---------------------------------------------------------------------------
++# Deterministic, adaptive planner.
++# ---------------------------------------------------------------------------
++def _done(history: List[Dict[str, Any]], agent: str) -> bool:
++    return any(h.get("agent") == agent for h in history)
++
++
++def _find(history: List[Dict[str, Any]], agent: str) -> Dict[str, Any]:
++    for h in history:
++        if h.get("agent") == agent:
++            return h.get("result", {})
++    return {}
++
++
++def make_sim_planner():
++    def planner(mission: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
++        m = (mission or "").lower()
++
++        # ---- Mission: cut AI cost ----
++        if any(k in m for k in ("cost", "spend", "cheaper", "finops", "budget", "bill")):
++            if not _done(history, "cost_optimizer"):
++                return {"action": "delegate", "agent": "cost_optimizer",
++                        "rationale": "This is a FinOps mission — start by reading where the money goes."}
++            cost = _find(history, "cost_optimizer")
++            return {"action": "synthesize",
++                    "rationale": "I have the spend breakdown and the safe levers.",
++                    "summary": _compose(mission, history)}
++
++        # ---- Mission: design this week's practice focus ----
++        if any(k in m for k in ("week", "practice", "focus", "curriculum", "drill")):
++            if not _done(history, "growth_analyst"):
++                return {"action": "delegate", "agent": "growth_analyst",
++                        "rationale": "First measure where candidates are weakest before designing practice."}
++            weak = _find(history, "growth_analyst").get("data", {}).get("weakest_dimension", "structure")
++            if not _done(history, "curriculum_designer"):
++                return {"action": "delegate", "agent": "curriculum_designer",
++                        "args": {"focus_dimension": weak, "case_type": "case", "difficulty": "hard"},
++                        "rationale": f"Growth flagged '{weak}'. Designing a case that stresses exactly that."}
++            if not _done(history, "deck_librarian"):
++                return {"action": "delegate", "agent": "deck_librarian",
++                        "args": {"topic": weak},
++                        "rationale": f"Pull winning decks that model strong '{weak}' so candidates have exemplars."}
++            return {"action": "synthesize", "rationale": "Focus, case and exemplars are ready.",
++                    "summary": _compose(mission, history)}
++
++        # ---- Default / "daily brief" / freeform: a broad platform sweep ----
++        if not _done(history, "content_strategist"):
++            return {"action": "delegate", "agent": "content_strategist",
++                    "rationale": "Lead with today's best discussion topic."}
++        if not _done(history, "growth_analyst"):
++            return {"action": "delegate", "agent": "growth_analyst",
++                    "rationale": "Then diagnose where the cohort is weakest."}
++        weak = _find(history, "growth_analyst").get("data", {}).get("weakest_dimension", "structure")
++        if not _done(history, "curriculum_designer"):
++            return {"action": "delegate", "agent": "curriculum_designer",
++                    "args": {"focus_dimension": weak, "case_type": "case", "difficulty": "medium"},
++                    "rationale": f"Design today's targeted practice around '{weak}'."}
++        return {"action": "synthesize", "rationale": "Topic, diagnosis and today's case are set.",
++                "summary": _compose(mission, history)}
++
++    return planner
++
++
++def _compose(mission: str, history: List[Dict[str, Any]]) -> str:
++    lines = [f"Executive brief — {mission}", ""]
++    for h in history:
++        r = h.get("result", {})
++        lines.append(f"• [{r.get('domain','?')}] {r.get('headline','')}")
++        for a in (r.get("recommended_actions") or [])[:2]:
++            lines.append(f"    → {a}")
++    lines.append("")
++    lines.append(f"Specialists deployed: {', '.join(h.get('agent','?') for h in history) or 'none'}.")
++    return "\n".join(lines)
+diff --git a/services/agentic/specialists.py b/services/agentic/specialists.py
+new file mode 100644
+index 0000000..8066203
+--- /dev/null
++++ b/services/agentic/specialists.py
+@@ -0,0 +1,190 @@
++"""
++The domain SPECIALISTS — the multiple, different-domain capabilities the
++orchestrator can deploy. This is what makes the system *agentic AI* rather than a
++single agent: the orchestrator has a team of specialists and decides who to send in.
++
++Five domains, deliberately spread wide so the breadth is obvious:
++
++  1. growth_analyst   — LEARNING ANALYTICS. Where are candidates (or one candidate)
++                        weakest right now, and is it trending?
++  2. content_strategist — EDITORIAL. Which current news topic is the best Group-
++                        Discussion prompt, and what's the two-sided angle?
++  3. curriculum_designer — INSTRUCTIONAL DESIGN. Produce a practice case targeted at
++                        a specific weakness. (An ACT capability — it makes a thing.)
++  4. cost_optimizer   — FinOps / PLATFORM OPS. Read AI spend and recommend safe,
++                        quality-preserving provider switches. (Operates on the
++                        SYSTEM ITSELF — a genuinely different domain.)
++  5. deck_librarian   — RETRIEVAL. Surface the most relevant winning decks for a
++                        topic or weakness.
++
++Every specialist:
++  * goes through a DataAccess boundary (Supabase in prod, sample fixtures in the
++    demo) so it can run with or without a live database;
++  * NEVER raises — on missing tables/columns/empty data it returns a graceful
++    `ok=False` SpecialistResult so the orchestrator (and the admin demo) can't 500.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, List, Optional, Protocol
++
++from .schemas import SpecialistResult
++
++DIMENSIONS = ["structure", "quantitative", "synthesis", "business_judgment", "creativity", "presence"]
++DIM_MAX = {"structure": 25, "quantitative": 20, "synthesis": 20, "business_judgment": 15, "creativity": 10, "presence": 10}
++_DIM_TO_TECHNIQUE = {
++    "structure": "MECE issue trees",
++    "quantitative": "sanity-checking every estimate a second way",
++    "synthesis": "the Pyramid Principle (answer first)",
++    "business_judgment": "tying recommendations to macro + industry context",
++    "creativity": "hypothesis-driven problem solving",
++    "presence": "calibrated, top-down delivery",
++}
++
++
++# ---------------------------------------------------------------------------
++# Data access boundary
++# ---------------------------------------------------------------------------
++class DataAccess(Protocol):
++    def recent_scored_submissions(self, limit: int = 40) -> List[Dict[str, Any]]: ...
++    def top_headlines(self, limit: int = 8) -> List[Dict[str, Any]]: ...
++    def ai_spend_by_feature(self) -> Dict[str, float]: ...
++    def search_decks(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]: ...
++    def create_practice_case(self, title: str, content: str, case_type: str, difficulty: str, focus: str) -> Dict[str, Any]: ...
++
++
++# ---------------------------------------------------------------------------
++# Specialist implementations. Each takes (data, **args) -> SpecialistResult.
++# ---------------------------------------------------------------------------
++def growth_analyst(data: DataAccess, **_: Any) -> SpecialistResult:
++    subs = data.recent_scored_submissions(limit=40)
++    if not subs:
++        return SpecialistResult("growth", "No graded attempts to analyse yet.", ok=False,
++                                findings=["The platform has no recent scored submissions."],
++                                recommended_actions=["Seed a few attempts, then re-run."])
++    totals = {d: 0.0 for d in DIMENSIONS}
++    counts = {d: 0 for d in DIMENSIONS}
++    scores: List[int] = []
++    for s in subs:
++        scores.append(int(s.get("score", 0) or 0))
++        bd = ((s.get("feedback_json") or {}).get("breakdown")) or {}
++        for d in DIMENSIONS:
++            v = bd.get(d)
++            if isinstance(v, (int, float)):
++                totals[d] += float(v); counts[d] += 1
++    mastery = {d: round(100 * (totals[d] / counts[d]) / DIM_MAX[d]) for d in DIMENSIONS if counts[d]}
++    if not mastery:
++        return SpecialistResult("growth", "Submissions exist but carry no dimension breakdown.", ok=False)
++    weakest = min(mastery, key=mastery.get)
++    avg = round(sum(scores) / len(scores)) if scores else 0
++    trend = "flat"
++    if len(scores) >= 12:
++        recent = sum(scores[:6]) / 6; prev = sum(scores[6:12]) / 6
++        trend = "improving" if recent > prev + 3 else "declining" if recent < prev - 3 else "flat"
++    return SpecialistResult(
++        domain="growth",
++        headline=f"Platform-wide weakest skill is {weakest} ({mastery[weakest]}/100); avg score {avg}, trend {trend}.",
++        findings=[f"{d}: {mastery[d]}/100" for d in sorted(mastery, key=mastery.get)],
++        data={"weakest_dimension": weakest, "mastery": mastery, "avg_score": avg, "trend": trend, "n": len(subs)},
++        recommended_actions=[f"Push practice that stresses {weakest} using {_DIM_TO_TECHNIQUE.get(weakest, 'targeted drills')}."],
++    )
++
++
++def content_strategist(data: DataAccess, **_: Any) -> SpecialistResult:
++    heads = data.top_headlines(limit=8)
++    if not heads:
++        return SpecialistResult("content", "No fresh headlines available.", ok=False,
++                                recommended_actions=["Run the news refresh, then re-run."])
++    best = max(heads, key=lambda h: h.get("gd_worthiness_score", 0) or 0)
++    title = best.get("title", "Untitled")
++    return SpecialistResult(
++        domain="content",
++        headline=f"Best GD topic today: “{title}”.",
++        findings=[f"{h.get('title','?')} (score {h.get('gd_worthiness_score','?')})" for h in heads[:5]],
++        data={"topic": title, "score": best.get("gd_worthiness_score"),
++              "category": best.get("category"), "source": best.get("source_name")},
++        recommended_actions=[
++            f"Frame both sides of “{title}” (for vs against) and seed 3 stakeholder angles.",
++            "Feature it as today's GD brief on the dashboard.",
++        ],
++    )
++
++
++def curriculum_designer(data: DataAccess, focus_dimension: str = "structure",
++                        case_type: str = "case", difficulty: str = "medium", **_: Any) -> SpecialistResult:
++    if focus_dimension not in DIMENSIONS:
++        focus_dimension = "structure"
++    technique = _DIM_TO_TECHNIQUE.get(focus_dimension, "targeted drills")
++    title = f"{difficulty.title()} {case_type}: stress-test {focus_dimension}"
++    content = (
++        f"An Indian firm faces a decision that hinges on {focus_dimension}. "
++        f"Structure the problem, work the numbers in Rs/crore, and deliver a top-down recommendation. "
++        f"(Designed to force {technique}.)"
++    )
++    created = data.create_practice_case(title, content, case_type, difficulty, focus_dimension)
++    return SpecialistResult(
++        domain="curriculum",
++        headline=f"Designed a {difficulty} {case_type} targeting {focus_dimension}.",
++        findings=[f"Technique forced: {technique}", f"Title: {title}"],
++        data={"case_id": created.get("id"), "title": title, "focus_dimension": focus_dimension,
++              "case_type": case_type, "difficulty": difficulty},
++        recommended_actions=[f"Assign this case to candidates weak on {focus_dimension}."],
++    )
++
++
++def cost_optimizer(data: DataAccess, **_: Any) -> SpecialistResult:
++    spend = data.ai_spend_by_feature() or {}
++    if not spend:
++        return SpecialistResult("cost", "No AI spend recorded in the window.", ok=False)
++    total = sum(spend.values())
++    # Safe, quality-preserving levers: move cheap-tolerant features to Groq/Google;
++    # NEVER scoring. Rough savings model mirrors the ~9x / ~3.75x notes in the code.
++    movable = {"stt": 0.9, "interviewer": 0.85, "validity": 0.9, "news_classify": 0.9, "tts": 0.73}
++    est_savings = sum(spend.get(f, 0.0) * frac for f, frac in movable.items())
++    top = sorted(spend.items(), key=lambda kv: kv[1], reverse=True)[:5]
++    actions = [f"Switch '{f}' to its cheaper provider (~save ${spend.get(f,0)*movable[f]:.2f})."
++               for f in movable if spend.get(f, 0) > 0]
++    return SpecialistResult(
++        domain="cost",
++        headline=f"~${est_savings:.2f} of ${total:.2f} is safely removable without touching scoring.",
++        findings=[f"{f}: ${amt:.2f}" for f, amt in top],
++        data={"total_usd": round(total, 2), "est_savings_usd": round(est_savings, 2), "by_feature": spend},
++        recommended_actions=actions or ["Spend is already near-optimal; keep scoring on OpenAI."],
++    )
++
++
++def deck_librarian(data: DataAccess, topic: str = "", **_: Any) -> SpecialistResult:
++    decks = data.search_decks(topic or "strategy", limit=3)
++    if not decks:
++        return SpecialistResult("decks", f"No decks matched “{topic}”.", ok=False)
++    return SpecialistResult(
++        domain="decks",
++        headline=f"Found {len(decks)} winning decks relevant to “{topic}”.",
++        findings=[f"{d.get('title','?')} — {d.get('competition','')} {d.get('result','')}".strip() for d in decks],
++        data={"decks": decks},
++        recommended_actions=["Link these from the practice page for candidates on this focus."],
++    )
++
++
++# name -> (callable, human label, domain)
++SPECIALISTS = {
++    "growth_analyst": (growth_analyst, "Growth Analyst", "Learning analytics"),
++    "content_strategist": (content_strategist, "Content Strategist", "Editorial"),
++    "curriculum_designer": (curriculum_designer, "Curriculum Designer", "Instructional design"),
++    "cost_optimizer": (cost_optimizer, "Cost Optimizer", "Platform FinOps"),
++    "deck_librarian": (deck_librarian, "Deck Librarian", "Retrieval"),
++}
++
++
++def run_specialist(data: DataAccess, name: str, args: Optional[Dict[str, Any]] = None) -> SpecialistResult:
++    """Dispatch to a specialist by name. Unknown/failed specialists return a
++    graceful result rather than raising — the orchestrator must never crash on a
++    single specialist's failure."""
++    entry = SPECIALISTS.get(name)
++    if entry is None:
++        return SpecialistResult(name or "unknown", f"No such specialist: {name}", ok=False)
++    fn = entry[0]
++    try:
++        return fn(data, **(args or {}))
++    except Exception as e:  # noqa: BLE001
++        return SpecialistResult(name, f"{name} failed: {type(e).__name__}: {e}", ok=False)
