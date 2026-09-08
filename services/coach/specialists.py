@@ -155,6 +155,78 @@ def _mastery(subs: List[Dict[str, Any]]) -> Dict[str, int]:
     return out
 
 
+_THEME_FIELDS = ("improvements", "areas_for_improvement", "area_for_improvement",
+                 "weaknesses", "what_to_improve", "improve", "next_steps", "growth_areas")
+
+
+def _feedback_themes(subs: List[Dict[str, Any]], limit: int = 2) -> List[str]:
+    """Best-effort: surface up to `limit` recurring qualitative feedback notes from
+    graded submissions so the diagnosis can point at real patterns, not only
+    numbers. Fully defensive — unknown shapes or absent fields yield an empty list."""
+    seen: set = set()
+    out: List[str] = []
+    for s in subs:
+        fj = s.get("feedback_json") or {}
+        if not isinstance(fj, dict):
+            continue
+        for key in _THEME_FIELDS:
+            v = fj.get(key)
+            items = v if isinstance(v, list) else ([v] if isinstance(v, str) else [])
+            for it in items:
+                if not isinstance(it, str):
+                    continue
+                t = " ".join(it.split()).strip()
+                if 8 <= len(t) <= 180 and t.lower() not in seen:
+                    seen.add(t.lower())
+                    out.append(t)
+                    if len(out) >= limit:
+                        return out
+    return out
+
+
+# Bespoke "stretch" case prompts per dimension — concrete, India-grounded scenarios
+# (TEXT ONLY; never inserted into the shared `cases` bank). Two per dimension so a
+# candidate who re-runs the coach gets variety rather than the same prompt twice.
+STRETCH_SCENARIOS: Dict[str, List[Dict[str, str]]] = {
+    "structure": [
+        {"title": "Quick-commerce leap",
+         "prompt": "PitchPerfect, a Bengaluru D2C cold-brew brand doing about Rs 40 crore a year, is weighing whether to enter 10-minute quick-commerce. Scope the decision and lead with a clear recommendation."},
+        {"title": "Regional FMCG goes national",
+         "prompt": "A Rs 300 crore Gujarat snacks brand wants to expand nationally across India. Frame the go / no-go and the how, then give your answer first."},
+    ],
+    "quantitative": [
+        {"title": "Dark-store economics",
+         "prompt": "Estimate the annual revenue a single quick-commerce dark store captures in a Tier-1 Indian city. Work it top-down in rupees and sanity-check the order volume a second way."},
+        {"title": "Multiplex screen",
+         "prompt": "Size the yearly ticket revenue of one multiplex screen in an Indian metro. State your number first, then defend the build."},
+    ],
+    "synthesis": [
+        {"title": "Dairy's three doors",
+         "prompt": "A Rs 500 crore regional dairy is choosing between premium curd, B2B institutional supply, and a D2C app. You have 60 seconds - give the answer first, then three supporting reasons."},
+        {"title": "Buy or build last-mile",
+         "prompt": "A logistics firm asks whether to buy or build its last-mile delivery capacity. Deliver the recommendation in one sentence, then the pyramid of support beneath it."},
+    ],
+    "business_judgment": [
+        {"title": "How fast to go electric",
+         "prompt": "A legacy two-wheeler maker must decide how quickly to shift capex to EVs while ICE sales still fund the business. Weigh fuel and subsidy policy against near-term unit cost, and recommend a pace."},
+        {"title": "Hold price or match",
+         "prompt": "A premium D2C skincare brand is tempted to match a rival's deep festive discounts. Decide whether to hold price or match, and justify the call commercially."},
+    ],
+    "creativity": [
+        {"title": "Save the single screen",
+         "prompt": "A Tier-2 single-screen cinema is losing to OTT. Generate three non-obvious ways to reposition the asset, then pick one and defend it."},
+        {"title": "Fill the weekday hotel",
+         "prompt": "A business-hotel chain sits half-empty on weekdays. Brainstorm three unconventional demand sources, then commit to the most promising one."},
+    ],
+    "presence": [
+        {"title": "Sixty seconds to the partner",
+         "prompt": "You have one minute with a managing partner: should a mid-size IT-services firm acquire a small GenAI consultancy? Lead with your call, signpost three reasons, and close."},
+        {"title": "The elevator verdict",
+         "prompt": "A CEO asks in the lift whether to enter the Bangladesh market. Give a calm, top-down answer with two conditions, in under a minute."},
+    ],
+}
+
+
 def _norm_firm(target_company: str, domain: str) -> str:
     t = f"{target_company} {domain}".lower()
     if "mckinsey" in t or "mbb" in t and "bcg" not in t and "bain" not in t:
@@ -197,12 +269,15 @@ def diagnostician(data: DataAccess, **_: Any) -> SpecialistResult:
         prev = sum(scores[3:6]) / 3
         trend = "improving" if recent > prev + 3 else "declining" if recent < prev - 3 else "flat"
     weak_labels = ", ".join(DIM_LABEL.get(d, d) for d in weakest)
+    themes = _feedback_themes(subs)
+    findings = [f"{DIM_LABEL.get(d, d)}: {mastery[d]}/100" for d in ordered]
+    findings += [f"Recurring feedback: {t}" for t in themes]
     return SpecialistResult(
         domain="diagnostics",
         headline=f"Across {len(subs)} graded attempts, weakest is {weak_labels}; avg {avg}/100, trend {trend}.",
-        findings=[f"{DIM_LABEL.get(d, d)}: {mastery[d]}/100" for d in ordered],
+        findings=findings,
         data={"weakest_dimensions": weakest, "mastery": mastery, "avg_score": avg,
-              "trend": trend, "n": len(subs)},
+              "trend": trend, "n": len(subs), "themes": themes},
         recommended_actions=[f"Prioritise {DIM_LABEL.get(weakest[0], weakest[0])} — "
                              f"drill {DIM_TECHNIQUE.get(weakest[0], 'targeted reps')}."],
     )
@@ -246,11 +321,11 @@ def case_curator(data: DataAccess, focus_dimension: str = "structure", case_type
     # to THEIR plan (coach_runs); it is deliberately NOT inserted into the shared
     # `cases` bank so it can never leak into other users' practice or the
     # leaderboard.
+    _scen = STRETCH_SCENARIOS.get(focus_dimension) or STRETCH_SCENARIOS["structure"]
+    _pick = _scen[len(exclude) % len(_scen)]
     stretch = {
-        "title": f"Stretch {case_type}: pressure-test your {DIM_LABEL.get(focus_dimension, focus_dimension)}",
-        "prompt": (f"An Indian firm faces a decision that hinges on {DIM_LABEL.get(focus_dimension, focus_dimension)}. "
-                   f"Frame the problem, work the numbers in Rs/crore, and deliver a top-down recommendation. "
-                   f"Constraint: you must {technique}."),
+        "title": _pick["title"],
+        "prompt": f"{_pick['prompt']} Constraint: you must {technique}.",
         "focus_dimension": focus_dimension, "difficulty": difficulty, "case_type": case_type,
     }
     findings = [f"{c.get('title', 'Untitled')} — {c.get('type', '')} · {c.get('difficulty', '')}"
@@ -279,8 +354,8 @@ def news_analyst(data: DataAccess, domain: str = "", **_: Any) -> SpecialistResu
         findings=[f"{h.get('title', '?')} (GD-worthiness {h.get('gd_worthiness_score', '?')})" for h in heads[:4]],
         data={"topic": title, "score": best.get("gd_worthiness_score"),
               "category": best.get("category"), "source": best.get("source_name"),
-              "case_angle": f"Should the key player in \u201c{title}\u201d change strategy? "
-                            f"Structure both sides, size the impact, and recommend."},
+              "case_angle": f"Run \u201c{title}\u201d as a timed GD: build the case for and against, "
+                            f"size the impact in Rs where you can, then give a top-down recommendation."},
         recommended_actions=[f"Do a 10-minute structured take on \u201c{title}\u201d — for/against + a sized recommendation."],
     )
 
