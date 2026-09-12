@@ -159,9 +159,34 @@ def flatten_answer(transcript, rec):
     lines = [f"[{t['role'].upper()}] {t['content']}" for t in transcript] + ["", f"[FINAL] {rec}"]
     return "\n".join(lines)
 
+# Guesstimates are scored by a DETERMINISTIC arithmetic backstop that zeroes any
+# answer with no computable calc-chain — so a generic "I'd segment and sanity-check"
+# answer (fine for the holistic CASE scorer) correctly scores 0 here. These persona
+# answers therefore carry REAL numbers and a consistent chain, so the backstop can
+# actually score them and the approaches block is exercised on non-zero answers.
+GUESS_ANSWERS = {
+    "newbie": (
+        "India has about 1.4 billion people. Maybe 20% of them are relevant here, so "
+        "1,400,000,000 x 0.20 = 280,000,000. Say each uses about 5 per year, so "
+        "280,000,000 x 5 = 1,400,000,000. So around 1.4 billion. That feels high but I'll go with it."
+    ),
+    "good": (
+        "Scope: annual, India. I'll go top-down. Population 1,400,000,000. Urban share ~35% = "
+        "490,000,000. Of those, the target group is ~15% = 73,500,000. At about 2 per person per "
+        "year that's 73,500,000 x 2 = 147,000,000 units a year. Sanity check: ~0.1 per capita, "
+        "which is in a reasonable band for this kind of category."
+    ),
+    "pro": (
+        "Two clarifiers, then bottom-up. Population 1,400,000,000. Urban ~30% = 420,000,000; of "
+        "those the relevant age/use band is ~20% = 84,000,000. Adoption ~10% = 8,400,000 active "
+        "users. Frequency ~12 per year, so 8,400,000 x 12 = 100,800,000 units per year. "
+        "Sanity check: ~0.072 per capita per year, plausible for this category. The swing variable "
+        "is the 10% adoption rate; +/- 3 points moves the answer by roughly 30%, so I'd validate that first."
+    ),
+}
+
 def run_guess(prompt, persona):
-    transcript, rec = PERSONAS[persona]("the estimate")
-    fb = score_guesstimate_answer(case_content=prompt, user_answer=flatten_answer(transcript, rec), user_id=None)
+    fb = score_guesstimate_answer(case_content=prompt, user_answer=GUESS_ANSWERS[persona], user_id=None)
     return fb
 
 def main():
