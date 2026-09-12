@@ -77,6 +77,9 @@ OUTPUT: return ONLY a valid JSON object, no markdown, exactly:
     },
     "top_candidate": {
       "title": "How a top-firm candidate sizes this",
+      "flow": [
+        {"step": "<stage: Scope | Choose driver | Segment | Assume | Multiply | Sanity-check>", "move": "<the concrete step with THIS estimate's real numbers (population, per-unit rate, segment split)>", "framework": "<the technique applied here, or '' if none>"}
+      ],
       "walkthrough": "<6-10 short lines: the model estimate of THIS number — the scoping calls, the top-down or bottom-up tree, the per-segment assumptions with the math, and the sanity-check against a known anchor. Concrete to this estimate.>",
       "frameworks": ["<name each technique actually used + 3-5 words on where: e.g. 'Top-down population funnel', 'Bottom-up unit economics', 'Supply-side throughput', 'Per-capita sanity anchor'>"]
     },
@@ -88,10 +91,13 @@ OUTPUT: return ONLY a valid JSON object, no markdown, exactly:
   }
 }
 
-APPROACHES RULES:
+APPROACHES RULES (be SPECIFIC and technique-rich — generic sizing advice is a failure here):
 - approaches.your_line.exchanges MUST use the candidate's ACTUAL estimation beats (2-4 of the most important: a segmentation choice, a key assumption, the sanity step). Never invent a weakness they didn't show; a strong beat gets a small sharpening, not a fabricated flaw. If there are too few real beats, reconstruct 1-2 and mark them "(reconstructed from your attempt)".
-- approaches.top_candidate.frameworks names only techniques the walkthrough actually applies. Naming without use is a red flag, not a strength.
-- approaches.third_angle must be the genuinely DIFFERENT build (top-down vs bottom-up, demand vs supply), not a paraphrase of top_candidate."""
+- approaches.top_candidate.flow is the step-by-step spine: 5-7 ordered steps (Scope → Choose driver → Segment → Assume → Multiply → Sanity-check). Each step's `move` cites THIS estimate's real numbers (the population, the per-unit rate, the segment split) — never a generic template line.
+- Name AT LEAST 3 distinct techniques across flow + walkthrough and say exactly where each bites, tied to this estimate's numbers (e.g. "Top-down population funnel — 1.4bn → urban → target age", "Consumption-rate assumption — X units/person/week", "Per-capita sanity anchor — cross-check against a known market"). Naming a technique without applying it is a red flag, not a strength.
+- approaches.top_candidate.frameworks lists those same applied techniques (name + 3-5 words on where).
+- approaches.third_angle must be the genuinely DIFFERENT build (top-down vs bottom-up, demand vs supply), not a paraphrase — and state the one cross-check triangulating the two builds reveals.
+- Everything concrete to THIS estimate: quote real figures and segment names. If a line would fit any guesstimate, rewrite it with this one's specifics."""
 
 
 def build_guesstimate_user_prompt(case_content: str, user_answer: str) -> str:
