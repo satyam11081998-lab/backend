@@ -220,24 +220,40 @@ def _flatten_for_legacy_scorer(
     return "\n".join(lines)
 
 
-def _candidate_text(
-    transcript: Iterable[Dict[str, str]],
-    final_recommendation: str,
-) -> str:
-    """Only the CANDIDATE's own words + their final recommendation, for the
-    validity screen — the interviewer's coherent prods must not make a gibberish
-    session read as a genuine attempt."""
+def _transcript_body_text(transcript: Iterable[Dict[str, str]]) -> str:
+    """The CANDIDATE's own conversation turns only — NO final recommendation.
+
+    This is the body of work the validity gate judges. Keeping the recommendation
+    OUT means a junk/empty recommendation can never drag a genuine conversation
+    down to a gibberish/off-topic verdict and zero the whole session. The
+    interviewer's coherent prods are excluded too, so a gibberish session cannot
+    borrow the interviewer's words to look genuine. The recommendation message
+    (kind == 'recommendation') is excluded here because it is judged separately.
+    """
     parts: List[str] = []
     for t in transcript:
         if (t.get("role") or "user") != "user":
             continue
+        if (t.get("kind") or "") == "recommendation":
+            continue
         c = (t.get("content") or "").strip()
         if c:
             parts.append(c)
-    fr = (final_recommendation or "").strip()
-    if fr:
-        parts.append(fr)
     return "\n".join(parts)
+
+
+def _rec_is_weak(recommendation: str) -> bool:
+    """True when the closing recommendation is empty or blatant nonsense.
+
+    Used only to (a) decide whether the recommendation may RESCUE a session whose
+    conversation body failed the gate, and (b) hint the scorer to look for the
+    recommendation elsewhere. NEVER used to cap or zero a score.
+    """
+    from services.answer_validity import deterministic_verdict
+    r = (recommendation or "").strip()
+    if not r:
+        return True
+    return deterministic_verdict(r) is not None  # deterministic gibberish only, no API cost
 
 
 def _score_case_conversation(
@@ -246,6 +262,7 @@ def _score_case_conversation(
     transcript: Iterable[Dict[str, str]],
     final_recommendation: str,
     user_id: Optional[str] = None,
+    case_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Evidence-based scoring for CASE sessions (not guesstimates).
 
@@ -260,11 +277,29 @@ def _score_case_conversation(
     from services.answer_validity import screen_answer
     from services.ai_scorer import _enforce_case, _rejection_case, _is_hard_reject
 
-    validity = screen_answer(
-        case_content, case_type, _candidate_text(transcript, final_recommendation), user_id
-    )
-    if _is_hard_reject(validity):
-        return _rejection_case(case_type, validity)
+    body = _transcript_body_text(transcript)          # candidate turns only, NO recommendation
+    rec = (final_recommendation or "").strip()
+
+    # Gate on the BODY of the candidate's work — never on the recommendation alone.
+    # A genuine conversation with a junk/empty recommendation must still be scored.
+    body_validity = screen_answer(case_content, case_type, body, user_id)
+
+    if _is_hard_reject(body_validity):
+        # The conversation itself shows no genuine attempt. Before zeroing, give the
+        # RECOMMENDATION a chance to carry the session (someone who said little in
+        # chat but wrote a real closing recommendation). The recommendation can only
+        # RESCUE here — it can never be the reason a genuine conversation is zeroed.
+        if rec and not _rec_is_weak(rec):
+            rec_validity = screen_answer(case_content, case_type, rec, user_id)
+            if _is_hard_reject(rec_validity):
+                return _rejection_case(case_type, body_validity)   # nothing genuine anywhere -> 0
+            validity = rec_validity
+        else:
+            return _rejection_case(case_type, body_validity)       # no real body, no real rec -> 0
+    else:
+        validity = body_validity                                   # genuine conversation -> scored
+
+    recommendation_missing = _rec_is_weak(rec)
 
     user_prompt = build_conversation_scoring_user_prompt(
         case_content=case_content,
@@ -272,29 +307,53 @@ def _score_case_conversation(
         transcript=transcript,
         final_recommendation=final_recommendation,
         thin=validity["verdict"] in ("thin", "off_topic"),
+        recommendation_missing=recommendation_missing,
     )
-    try:
-        t0 = time.time()
-        resp = _client.chat.completions.create(
-            model=SCORING_MODEL,
-            messages=[
-                {"role": "system", "content": CONVERSATION_SCORING_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=4000,  # richer output (per-dimension feedback + model answer)
-            response_format={"type": "json_object"},
-        )
-        log_ai_usage(user_id=user_id, endpoint="/attempts/submit", model=SCORING_MODEL,
-                     response=resp, latency_ms=int((time.time() - t0) * 1000))
-    except Exception as e:
-        raise InterviewEngineError(f"Scoring call failed: {e}")
 
-    raw = resp.choices[0].message.content or ""
+    # Silent calibration: enrich the scorer with strong prior work on THIS case, if
+    # any has been banked. Never shown to the candidate. Fails open (no exemplars ->
+    # unchanged prompt) and can never break scoring.
     try:
-        feedback = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise InterviewEngineError(f"Scorer returned invalid JSON: {e}. Raw: {raw[:200]}")
+        from services.exemplar_bank import build_exemplar_reference_block
+        ref = build_exemplar_reference_block(case_id=case_id, case_content=case_content)
+        if ref:
+            user_prompt = user_prompt + "\n\n" + ref
+    except Exception:
+        pass
+    # Richer output now (per-dimension feedback + model answer + 3 approaches), so the
+    # token ceiling is raised from 4000 to 8000 — at 4000 the fuller JSON could
+    # truncate mid-object and fail json.loads, 500-ing the whole submission. gpt-4o
+    # supports well beyond 8000 output tokens. We also retry ONCE on a parse failure
+    # (a rare truncation/format hiccup) before giving up, so a transient blip never
+    # nukes a genuine attempt.
+    feedback = None
+    last_err = None
+    for _attempt in range(2):
+        try:
+            t0 = time.time()
+            resp = _client.chat.completions.create(
+                model=SCORING_MODEL,
+                messages=[
+                    {"role": "system", "content": CONVERSATION_SCORING_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=8000,
+                response_format={"type": "json_object"},
+            )
+            log_ai_usage(user_id=user_id, endpoint="/attempts/submit", model=SCORING_MODEL,
+                         response=resp, latency_ms=int((time.time() - t0) * 1000))
+        except Exception as e:
+            raise InterviewEngineError(f"Scoring call failed: {e}")
+
+        raw = resp.choices[0].message.content or ""
+        try:
+            feedback = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            last_err = e  # retry once, then surface
+    if feedback is None:
+        raise InterviewEngineError(f"Scorer returned invalid JSON after retry: {last_err}. Raw: {raw[:200]}")
 
     required = {"score", "breakdown", "strengths", "improvements", "summary"}
     missing = required - set(feedback.keys())
@@ -314,6 +373,7 @@ def score_conversation(
     transcript: Iterable[Dict[str, str]],
     final_recommendation: str,
     user_id: Optional[str] = None,
+    case_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Top-level scorer. Branches on case_type:
 
@@ -344,6 +404,7 @@ def score_conversation(
         transcript=transcript,
         final_recommendation=final_recommendation,
         user_id=user_id,
+        case_id=case_id,
     )
 
 

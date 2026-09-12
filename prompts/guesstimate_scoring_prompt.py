@@ -67,8 +67,31 @@ OUTPUT: return ONLY a valid JSON object, no markdown, exactly:
   "improvements": ["specific, actionable fix tied to what they wrote", "..."],
   "red_flags": ["arbitrary assumptions / gaming / contradiction if any — omit or [] if none"],
   "model_answer": "4-6 short lines: how a strong candidate would decompose THIS estimate — the driver, the MECE segments, the key per-segment assumptions, the multiplication, and the sanity check. Concrete to this prompt.",
-  "summary": "2-3 sentence honest read of the approach and the single biggest lever."
-}"""
+  "summary": "2-3 sentence honest read of the approach and the single biggest lever.",
+  "approaches": {
+    "your_line": {
+      "title": "Your line — tightened",
+      "exchanges": [
+        {"you_asked": "<the candidate's actual estimation move/assumption, quoted or closely paraphrased>", "interviewer_said": "—", "stronger_version": "<how they could have made THAT SAME step sharper — a better segmentation, a justified assumption, a sanity check>", "why": "<one line: what it buys them>"}
+      ]
+    },
+    "top_candidate": {
+      "title": "How a top-firm candidate sizes this",
+      "walkthrough": "<6-10 short lines: the model estimate of THIS number — the scoping calls, the top-down or bottom-up tree, the per-segment assumptions with the math, and the sanity-check against a known anchor. Concrete to this estimate.>",
+      "frameworks": ["<name each technique actually used + 3-5 words on where: e.g. 'Top-down population funnel', 'Bottom-up unit economics', 'Supply-side throughput', 'Per-capita sanity anchor'>"]
+    },
+    "third_angle": {
+      "title": "The other road — the build you didn't use",
+      "body": "<5-8 short lines: the OPPOSITE build (if they went top-down, show bottom-up; if demand-side, show supply-side) and the ONE cross-check it gives — a strong sizer triangulates two independent builds and sees where they disagree.>",
+      "insight": "<one line: what triangulating the two builds reveals>"
+    }
+  }
+}
+
+APPROACHES RULES:
+- approaches.your_line.exchanges MUST use the candidate's ACTUAL estimation beats (2-4 of the most important: a segmentation choice, a key assumption, the sanity step). Never invent a weakness they didn't show; a strong beat gets a small sharpening, not a fabricated flaw. If there are too few real beats, reconstruct 1-2 and mark them "(reconstructed from your attempt)".
+- approaches.top_candidate.frameworks names only techniques the walkthrough actually applies. Naming without use is a red flag, not a strength.
+- approaches.third_angle must be the genuinely DIFFERENT build (top-down vs bottom-up, demand vs supply), not a paraphrase of top_candidate."""
 
 
 def build_guesstimate_user_prompt(case_content: str, user_answer: str) -> str:

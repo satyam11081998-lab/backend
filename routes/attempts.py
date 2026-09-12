@@ -732,6 +732,7 @@ async def submit_attempt(
             transcript=transcript,
             final_recommendation=body.final_recommendation,
             user_id=user_id,
+            case_id=attempt["case_id"],
         )
     except InterviewEngineError as e:
         raise HTTPException(status_code=500, detail=f"Scoring failed: {e}")
@@ -761,6 +762,22 @@ async def submit_attempt(
         .execute()
     )
     submission_id = sub_res.data[0]["id"]
+
+    # Silent self-improvement: if this scored session clears the bar, bank an
+    # anonymised exemplar for THIS case so future scoring calibrates against real
+    # strong answers. Fully non-blocking — never affects the response or the score.
+    try:
+        from services.exemplar_bank import maybe_capture_exemplar
+        maybe_capture_exemplar(
+            case_id=attempt["case_id"],
+            submission_id=submission_id,
+            case_content=case["content"],
+            case_type=case["type"],
+            feedback=feedback,
+            user_id=user_id,
+        )
+    except Exception as _e:
+        print(f"WARN: exemplar capture skipped: {_e}")
 
     # Mark the attempt submitted.
     supabase.table("attempts").update(

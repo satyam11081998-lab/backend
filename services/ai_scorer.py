@@ -123,7 +123,7 @@ def score_case_answer(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=4000,  # richer output (per-dimension feedback + model answer)
+            max_tokens=8000,  # richer output (per-dimension feedback + model answer + approaches); was 4000
             response_format={"type": "json_object"},
         )
         log_ai_usage(user_id=user_id, endpoint="/submit", model=SCORING_MODEL,
@@ -191,6 +191,7 @@ def _enforce_case(feedback: Dict[str, Any], validity: Dict[str, Any]) -> Dict[st
         "red_flags": _str_list(feedback.get("red_flags"), limit=6),
         "model_answer": str(feedback.get("model_answer", "") or "")[:3000],
         "summary": str(feedback.get("summary", "") or "")[:1200],
+        "approaches": feedback.get("approaches") if isinstance(feedback.get("approaches"), dict) else None,
         "rubric": "case",
         "validity": validity,
     }
@@ -233,7 +234,7 @@ def score_guesstimate_answer(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=2500,
+            max_tokens=4000,  # was 2500; room for the 3-approach block
             response_format={"type": "json_object"},
         )
         log_ai_usage(user_id=user_id, endpoint="/submit", model=GUESSTIMATE_SCORING_MODEL,
@@ -273,6 +274,9 @@ def score_guesstimate_answer(
         "red_flags": _str_list(parsed.get("red_flags"), limit=6),
         "model_answer": str(parsed.get("model_answer", "") or "")[:3000],
         "summary": str(parsed.get("summary", "") or "")[:1200],
+        # Passthrough: emits the 3-approach block once guesstimate_scoring_prompt.py adds it
+        # to its OUTPUT (see GUESSTIMATE_APPROACHES_BLOCK.txt). None until then — uniform key.
+        "approaches": parsed.get("approaches") if isinstance(parsed.get("approaches"), dict) else None,
         "rubric": "guesstimate",
         "validity": validity,
         "backstop": {
@@ -341,6 +345,7 @@ def _rejection_case(case_type: str, validity: Dict[str, Any]) -> Dict[str, Any]:
             "A genuine attempt needs a clarifying question, a MECE structure, some quantification, "
             "and a top-down recommendation. Give it a real try and you'll get a full breakdown."
         ),
+        "approaches": None,
         "rubric": "case",
         "validity": validity,
     }
@@ -362,6 +367,7 @@ def _rejection_guesstimate(validity: Dict[str, Any]) -> Dict[str, Any]:
             "Lay out the units, a MECE decomposition, defensible assumptions with the math shown, "
             "and a sanity check, and you'll get a full breakdown."
         ),
+        "approaches": None,
         "rubric": "guesstimate",
         "validity": validity,
         "backstop": {
