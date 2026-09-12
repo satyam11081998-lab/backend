@@ -72,3 +72,5 @@ from routes import agentic as _agentic
 app.include_router(_agentic.router)
 from routes import coach as _coach
 app.include_router(_coach.router)
+from routes import seo as _seo
+app.include_router(_seo.router)

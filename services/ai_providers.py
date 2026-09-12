@@ -99,6 +99,18 @@ FEATURES: Dict[str, Dict[str, Any]] = {
         "default": "openai",
         "models": {"openai": "gpt-4o"},
     },
+    "seo_writer": {
+        "label": "Growth: SEO article generation",
+        "providers": ["openai", "groq"],
+        "default": "openai",  # public-facing quality — gpt-4o default; toggle to Groq to A/B cost
+        "models": {"openai": "gpt-4o", "groq": _GROQ_LLM},
+    },
+    "seo_critique": {
+        "label": "Growth: SEO quality critique (self-QA)",
+        "providers": ["groq", "openai"],
+        "default": "groq",  # cheap classifier-style pass; Groq is plenty
+        "models": {"openai": "gpt-4o-mini", "groq": _GROQ_LLM},
+    },
     "tts": {
         "label": "Interviewer voice (TTS)",
         "providers": ["openai", "google"],
