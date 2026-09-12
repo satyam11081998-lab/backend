@@ -93,6 +93,14 @@ class DemoRequest(BaseModel):
     goal: str = ""
 
 
+class ToolCaseRequest(BaseModel):
+    focus_dimension: str = "structure"
+    target_company: str = ""
+    role: str = ""
+    difficulty: str = "hard"
+    kind: str = "case"  # "case" | "guesstimate"
+
+
 @router.get("/info")
 async def coach_info(authorization: Optional[str] = Header(default=None)):
     supabase, uid = _require_pro(authorization)
@@ -197,6 +205,33 @@ async def coach_run(body: RunRequest, authorization: Optional[str] = Header(defa
         pass
 
     return payload
+
+
+@router.post("/tool/case")
+async def coach_tool_case(body: ToolCaseRequest, authorization: Optional[str] = Header(default=None)):
+    """CURATED TOOL: generate a case/guesstimate aimed at the candidate's weakest
+    skill + target, saved private to them (is_active=false, owner_id). Attempting
+    it is a live, scored mock interview via the existing /cases/[id] pipeline."""
+    supabase, uid = _require_pro(authorization)
+    check_rate_limit(f"coach:tool:{uid}", max_calls=10, window_seconds=60)
+    assert_daily_budget()  # 503 if the day's AI spend is over budget
+    from services.coach.tools import generate_curated_case
+    try:
+        result = generate_curated_case(
+            supabase, uid,
+            focus_dimension=(body.focus_dimension or "structure"),
+            target_company=(body.target_company or ""),
+            role=(body.role or ""),
+            difficulty=(body.difficulty or "hard"),
+            kind=(body.kind or "case"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Tool failed: {type(e).__name__}")
+    return result
 
 
 @router.post("/demo")
