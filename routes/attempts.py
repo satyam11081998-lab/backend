@@ -181,12 +181,16 @@ def _load_attempt(supabase, attempt_id: str, user_id: str) -> dict:
     return row.data
 
 
-def _load_case(supabase, case_id: str) -> dict:
+def _load_case(supabase, case_id: str, user_id=None) -> dict:
     row = supabase.table("cases").select("*").eq("id", case_id).maybe_single().execute()
     if not row.data:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
     if row.data.get("is_active") is False:
-        raise HTTPException(status_code=404, detail="This case is no longer available.")
+        # Copilot-generated PRIVATE cases (is_active=false, owner_id set) are
+        # attemptable by their OWNER — that is the whole point of the curated
+        # tool. Everyone else still gets a 404 for a retired/private case.
+        if not (user_id and row.data.get("owner_id") == user_id):
+            raise HTTPException(status_code=404, detail="This case is no longer available.")
     return row.data
 
 
@@ -218,7 +222,7 @@ async def start_attempt(
     user_id = get_verified_user_id(supabase, authorization)
     check_rate_limit(f"attempts:start:{user_id}", max_calls=20, window_seconds=60)
 
-    case = _load_case(supabase, body.case_id)
+    case = _load_case(supabase, body.case_id, user_id)
     # Tier/quota gate — same logic as the legacy /submit.
     assert_can_attempt(supabase, user_id, case)
 
@@ -303,7 +307,7 @@ async def get_attempt(
     supabase = get_supabase_client()
     user_id = get_verified_user_id(supabase, authorization)
     attempt = _load_attempt(supabase, attempt_id, user_id)
-    case = _load_case(supabase, attempt["case_id"])
+    case = _load_case(supabase, attempt["case_id"], user_id)
 
     msg_rows = (
         supabase.table("attempt_messages")
@@ -398,7 +402,7 @@ async def post_message(
             ),
         )
 
-    case = _load_case(supabase, attempt["case_id"])
+    case = _load_case(supabase, attempt["case_id"], user_id)
     transcript = _fetch_transcript(supabase, attempt_id)
 
     # Does this turn consume clarification quota?
@@ -705,7 +709,7 @@ async def submit_attempt(
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
-    case = _load_case(supabase, attempt["case_id"])
+    case = _load_case(supabase, attempt["case_id"], user_id)
     transcript = _fetch_transcript(supabase, attempt_id)
     if len(transcript) == 0:
         raise HTTPException(status_code=400, detail="No conversation to submit")

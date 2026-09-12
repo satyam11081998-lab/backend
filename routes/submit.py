@@ -80,7 +80,8 @@ async def submit_answer(
         )
 
     case = case_result.data
-    if case.get("is_active") is False:
+    if case.get("is_active") is False and case.get("owner_id") != submission.user_id:
+        # Copilot-generated private cases (owner_id set) stay attemptable by their owner.
         raise HTTPException(status_code=404, detail="This case is no longer available.")
     case_content = case["content"]
     case_type = case["type"]
