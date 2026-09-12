@@ -9,7 +9,6 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from routes.decks import _require_admin
-from services.deck_ingestion_pipeline import discover_decks, process_single_deck, run_batch_ingestion
 from services.supabase_client import get_supabase_client
 
 router = APIRouter(prefix="/decks/ingest", tags=["deck-ingestion"])
@@ -44,6 +43,7 @@ def trigger_ingestion_scan(
     if not os.path.exists(payload.directory_path):
         raise HTTPException(status_code=400, detail=f"Directory path does not exist: {payload.directory_path}")
 
+    from services.deck_ingestion_pipeline import run_batch_ingestion
     stats = run_batch_ingestion(
         root_directory=payload.directory_path,
         dry_run=payload.dry_run,

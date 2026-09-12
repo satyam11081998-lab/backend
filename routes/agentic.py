@@ -26,7 +26,6 @@ from services.supabase_client import get_supabase_client
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget
 
-from services.agentic import orchestrate, catalog, make_sim_planner, SampleData
 # make_live_planner / SupabaseData are imported lazily inside the run handler so a
 # missing OpenAI SDK/key can never break module import or the /info endpoint.
 
@@ -75,6 +74,7 @@ async def agentic_info(authorization: Optional[str] = Header(default=None)):
         live_available = openai_client() is not None
     except Exception:
         live_available = False
+    from services.agentic import catalog
     return {"specialists": catalog(), "missions": MISSION_PRESETS, "live_available": live_available}
 
 
@@ -86,6 +86,7 @@ async def agentic_run(body: RunRequest, authorization: Optional[str] = Header(de
     mission = (body.mission or "").strip() or MISSION_PRESETS[0]["mission"]
     mode = "live" if (body.mode or "").lower() == "live" else "sim"
     supabase = get_supabase_client()
+    from services.agentic import orchestrate, make_sim_planner, SampleData
 
     note = None
     if mode == "live":

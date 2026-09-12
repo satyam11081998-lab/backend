@@ -11,7 +11,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import pypdfium2 as pdfium
+
 
 try:
     import pptx
@@ -73,6 +73,7 @@ def normalize_extracted_text(text: str) -> str:
 
 def extract_pdf_deck(file_path: str) -> Dict[str, Any]:
     """Extract slides, text, and structure from a PDF file using pypdfium2."""
+    import pypdfium2 as pdfium
     with open(file_path, "rb") as f:
         pdf_bytes = f.read()
 

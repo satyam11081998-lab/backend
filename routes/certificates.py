@@ -13,7 +13,6 @@ from pydantic import BaseModel
 
 from services.ai_usage import assert_daily_budget
 from services.auth import get_verified_user, is_guest_user
-from services.certificate_ai import CertificateAIError, draft_certificate_copy
 from services.rate_limit import check_rate_limit
 from services.supabase_client import get_supabase_client
 
@@ -68,6 +67,7 @@ async def draft(
     check_rate_limit(f"certificate_draft:{uid}", 30, 3600)
     assert_daily_budget()
 
+    from services.certificate_ai import CertificateAIError, draft_certificate_copy
     try:
         result = draft_certificate_copy(
             body.work_notes or "",

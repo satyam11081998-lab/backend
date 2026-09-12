@@ -16,8 +16,7 @@ import io
 import time
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFont
-import pypdfium2 as pdfium
+
 
 from services.supabase_client import get_supabase_client
 
@@ -38,8 +37,9 @@ def _ensure_bucket_exists(supabase):
         pass
 
 
-def _apply_watermark(image: Image.Image, watermark_text: str) -> Image.Image:
+def _apply_watermark(image, watermark_text: str):
     """Draw a clean, professional footer watermark on free preview pages."""
+    from PIL import Image, ImageDraw, ImageFont
     base = image.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
@@ -97,6 +97,7 @@ def render_deck_pages(
     effective_free_pages: int,
 ) -> dict:
     """Rasterise all pages of a PDF using pypdfium2 and save to Supabase private storage."""
+    import pypdfium2 as pdfium
     if not pdf_bytes or len(pdf_bytes) < 10:
         raise ValueError("PDF content is empty or corrupted")
 

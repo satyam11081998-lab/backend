@@ -17,7 +17,6 @@ import time
 from typing import Any, Dict, List, Optional, Set
 
 from openai import OpenAI
-import pypdfium2 as pdfium
 
 from services.ai_usage import log_ai_usage
 from services.deck_extractor import extract_numbers_from_text
@@ -297,6 +296,7 @@ def generate_deck_summary(
     user_id: Optional[str] = None,
 ) -> str:
     """Legacy backward-compatible wrapper for existing single-deck summarize route."""
+    import pypdfium2 as pdfium
     pdf = pdfium.PdfDocument(pdf_bytes)
     pages_text = []
     try:
