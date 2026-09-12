@@ -443,7 +443,8 @@ def _rejection_guesstimate(validity: Dict[str, Any]) -> Dict[str, Any]:
             "Lay out the units, a MECE decomposition, defensible assumptions with the math shown, "
             "and a sanity check, and you'll get a full breakdown."
         ),
-        "approaches": None,
+        # Even a rejected/off-topic attempt gets the TEACHING — the most teachable moment.
+        "approaches": _fallback_guess_approaches({"model_answer": _REJECT_MODEL_GUESSTIMATE}),
         "rubric": "guesstimate",
         "validity": validity,
         "backstop": {
