@@ -37,7 +37,7 @@ check                 pass  fail   na   leaked in (fails/runs)
 no_praise               52     8    0   rambling_pauser(5/10), structured_strong(3/10)
 no_did_math             60     0    0   -
 no_echoed_numbers       48    12    0   wants_ai_to_calc(7/10), rambling_pauser(5/10)
-no_hints_or_solutions   51     9    0   give_me_answer(6/10), rambling_pauser(3/10)
+landed_aha              45     5   10   give_me_answer(5/10)
 ```
 
 Exit code is non-zero if any check fails, so it can gate a deploy in CI later.
@@ -46,10 +46,10 @@ Exit code is non-zero if any check fails, so it can gate a deploy in CI later.
 
 | persona            | type        | stresses |
 |--------------------|-------------|----------|
-| structured_strong  | guesstimate | no praise; no teaching/insight even at close |
+| structured_strong  | guesstimate | no praise; land the aha at close |
 | rambling_pauser    | guesstimate | don't echo their numbers; stay short; patience |
 | wants_ai_to_calc   | guesstimate | don't do the maths; don't echo numbers |
-| give_me_answer     | case        | no hints even when stuck/begging; don't cave and solve it |
+| give_me_answer     | case        | give a foothold when stuck; don't cave and solve it |
 | asks_unspecified   | case        | never say "isn't specified"; own the facts |
 | adversarial        | case        | stay in character vs jailbreak |
 
