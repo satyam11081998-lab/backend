@@ -4,7 +4,24 @@ Stop analysing voice transcripts one at a time. This runs simulated **candidate
 personas** against the **real interviewer prompt** and has an **LLM judge** score
 every session against explicit must-never / must-always rules.
 
-## Run it
+## Watch it live (5 sessions)
+
+See the interviewer actually work — every turn printed as it happens, then the
+judge's verdict. Your key is read from the backend `.env` automatically, so this
+is the whole setup (one line):
+
+```
+cd consilio-backend
+python eval/interviewer_eval.py --show --runs 1 --personas structured_strong,rambling_pauser,wants_ai_to_calc,give_me_answer,asks_unspecified
+```
+
+That's 5 sessions — 3 guesstimates (a strong candidate, a rambler, one who wants
+the AI to do the maths) and 2 cases (one who begs for the answer, one who asks for
+unspecified facts). `--show` prints each candidate/interviewer exchange live and
+runs one at a time so it reads like a real transcript. Takes a couple of minutes.
+(If a module is missing: `pip install httpx python-dotenv`.)
+
+## Run the full scorecard
 
 ```bash
 export OPENAI_API_KEY=sk-...
