@@ -12,7 +12,7 @@ from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance
-from prompts.interview_prompts import build_interviewer_messages
+from prompts.interview_prompts import build_interviewer_messages, VOICE_INTERVIEWER_ADDENDUM
 
 load_dotenv()
 
@@ -199,6 +199,12 @@ async def create_realtime_session(
     # and no idea what case it is running.
     system_turns = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
     instructions = "\n\n".join(system_turns).strip()
+    # Voice-only softening: gpt-realtime over-applies the written probe/pressure-test
+    # rules, and voice is turn-dense, so the spoken interviewer grills every
+    # assumption and feels harsh. Append the voice register to soften the TONE for
+    # voice only — the typed chat path is untouched (it already feels right).
+    if instructions:
+        instructions = f"{instructions}\n\n{VOICE_INTERVIEWER_ADDENDUM}"
     if len(system_turns) < 2:
         # Loud, because a silently case-less interviewer is very hard to spot
         # from the outside — it just sounds vague.
