@@ -67,7 +67,7 @@ OUTPUT: return ONLY a valid JSON object, no markdown, exactly:
   "improvements": ["specific, actionable fix tied to what they wrote", "..."],
   "red_flags": ["arbitrary assumptions / gaming / contradiction if any — omit or [] if none"],
   "model_answer": "4-6 short lines: how a strong candidate would decompose THIS estimate — the driver, the MECE segments, the key per-segment assumptions, the multiplication, and the sanity check. Concrete to this prompt.",
-  "summary": "2-3 sentence honest read of the approach and the single biggest lever.",
+  "summary": "3-4 sentences, honest but motivating - this is the debrief they come back for. Open with the one thing they genuinely did well (if anything), name the SINGLE biggest lever that would move their score most, and end with the one concrete thing to practise next, framed so they want another go. Never sugarcoat a weak attempt, but never leave them crushed either.",
   "approaches": {
     "your_line": {
       "title": "Your line — tightened",

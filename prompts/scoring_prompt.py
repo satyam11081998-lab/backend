@@ -88,7 +88,7 @@ OUTPUT — return ONLY valid JSON (no markdown, no prose) in EXACTLY this shape:
   "improvements": ["<specific, actionable fix tied to what they wrote>", "..."],
   "red_flags": ["<gaming/ethics/logic problem if any — omit or [] if none>"],
   "model_answer": "<5-8 short lines: how a strong candidate would actually approach THIS case — the clarifying questions, the MECE structure, the key calculation or driver, the sanity check, and the top-down recommendation. Concrete to this case, not generic.>",
-  "summary": "<3-5 sentence honest debrief: where they stand, the single biggest lever, and what would move the score most>"
+  "summary": "<3-5 sentence honest debrief, motivating without sugarcoating - this is what brings them back. Open with the one thing they genuinely did well, say where they stand and the SINGLE biggest lever, and end with the one concrete thing to practise next, framed so they want another attempt. Never crush a weak answer, never inflate a lazy one.>"
 }
 
 CRITICAL:

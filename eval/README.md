@@ -34,8 +34,8 @@ transcript for every persona that failed a check. Example:
 
 ```
 check                 pass  fail   na   leaked in (fails/runs)
-no_praise               52     8    0   rambling_pauser(5/10), structured_strong(3/10)
-no_did_math             60     0    0   -
+no_rubber_stamp         55     5    0   structured_strong(5/10)
+no_repetition           49    11    0   give_me_answer(6/10), rambling_pauser(5/10)
 no_echoed_numbers       48    12    0   wants_ai_to_calc(7/10), rambling_pauser(5/10)
 no_hints_or_solutions   51     9    0   give_me_answer(6/10), rambling_pauser(3/10)
 ```
@@ -46,8 +46,8 @@ Exit code is non-zero if any check fails, so it can gate a deploy in CI later.
 
 | persona            | type        | stresses |
 |--------------------|-------------|----------|
-| structured_strong  | guesstimate | no praise; no teaching/insight even at close |
-| rambling_pauser    | guesstimate | don't echo their numbers; stay short; patience |
+| structured_strong  | guesstimate | no rubber-stamp (light affirmation ok); no teaching at close |
+| rambling_pauser    | guesstimate | don't echo numbers; don't loop/repeat; stay short |
 | wants_ai_to_calc   | guesstimate | don't do the maths; don't echo numbers |
 | give_me_answer     | case        | no hints even when stuck/begging; don't cave and solve it |
 | asks_unspecified   | case        | never say "isn't specified"; own the facts |
