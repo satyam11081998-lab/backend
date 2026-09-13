@@ -49,11 +49,45 @@ MAX_SESSION_SECONDS = int(os.getenv("REALTIME_MAX_SESSION_SECONDS", "600"))
 # if legitimate shared-IP users (college / office wifi) hit it; env-tunable.
 REALTIME_FREE_IP_PER_DAY = int(os.getenv("REALTIME_FREE_IP_PER_DAY", "10"))
 
-# How long a candidate may pause mid-sentence before the interviewer decides they
-# have finished and replies. The realtime default (~0.5s) was far too short — a
-# natural thinking pause mid-calculation read as end-of-turn, so the interviewer
-# jumped in and repeated itself. ~1.4s lets them finish a thought. Env-tunable.
+# TURN DETECTION — the single biggest driver of "it doesn't wait / it repeats".
+#
+# semantic_vad (default) uses a classifier on the candidate's WORDS to decide they
+# have actually finished a thought, instead of firing on a fixed silence timer.
+# A fixed timer is a losing trade: any value either cuts off a candidate who
+# pauses mid-calculation or adds dead air after a quick answer. semantic_vad waits
+# through the thinking pause and fires when the sentence sounds complete —
+# ~2% mid-sentence interruptions vs ~18% for silence timeouts in published tests.
+# eagerness "low" = let them take their time (best for someone working out math
+# out loud); "high" = chunk as soon as possible. interrupt_response keeps barge-in.
+#
+# server_vad is kept as an env fallback (set REALTIME_TURN_MODE=server_vad) in case
+# a model rejects semantic_vad; REALTIME_VAD_SILENCE_MS then pads the silence
+# window well above the ~0.5s default so a mid-calc pause isn't read as "done".
+REALTIME_TURN_MODE = os.getenv("REALTIME_TURN_MODE", "semantic_vad")
+REALTIME_SEMANTIC_EAGERNESS = os.getenv("REALTIME_SEMANTIC_EAGERNESS", "low")
 REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
+
+
+def build_turn_detection() -> dict:
+    """Turn-detection config for the realtime session, chosen by REALTIME_TURN_MODE.
+
+    Default is semantic_vad (words-based end-of-turn); server_vad (fixed silence)
+    is the env-selectable fallback. Both keep barge-in — the candidate can always
+    cut the interviewer off mid-sentence.
+    """
+    if REALTIME_TURN_MODE == "semantic_vad":
+        return {
+            "type": "semantic_vad",
+            "eagerness": REALTIME_SEMANTIC_EAGERNESS,
+            "create_response": True,
+            "interrupt_response": True,
+        }
+    return {
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
+    }
 
 
 class RealtimeSessionRequest(BaseModel):
@@ -179,19 +213,12 @@ async def create_realtime_session(
             "instructions": instructions,
             "audio": {
                 "input": {
-                    # Server VAD is what buys real barge-in: OpenAI detects the
-                    # candidate starting to speak and interrupts the interviewer
-                    # without a round trip through us.
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        # Wait this long in silence before deciding the turn is
-                        # over. A thinking pause mid-calculation must NOT be
-                        # mistaken for "done" — that was the #1 cause of the
-                        # interviewer interrupting and repeating itself.
-                        "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
-                    },
+                    # Words-based end-of-turn (semantic_vad) by default so a
+                    # thinking pause mid-calculation is NOT mistaken for "done" —
+                    # that was the #1 cause of the interviewer interrupting and
+                    # repeating itself. See build_turn_detection() and the
+                    # REALTIME_TURN_MODE note above; barge-in stays on.
+                    "turn_detection": build_turn_detection(),
                     "transcription": {"model": "whisper-1"},
                 },
                 "output": {"voice": REALTIME_VOICE},
