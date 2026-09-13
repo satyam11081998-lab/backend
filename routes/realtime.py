@@ -89,19 +89,25 @@ async def create_realtime_session(
     # ONE snapshot serves the tier gate. Do not reintroduce a second read here;
     # see the note in services/ai_usage.assert_tts_quota about round-trips.
     quota = get_ai_input_quota(supabase, uid)
-    if quota["tier"] != "pro":
-        raise HTTPException(
-            status_code=403,
-            detail="Voice interview is a Pro feature. Upgrade to talk through a case out loud.",
-        )
+    tier = quota["tier"]
+    # Free-trial voice is capped tighter than Pro (advisory — the hard lifetime
+    # bound is the credit balance below, burnt down by the per-turn deduction).
+    session_cap = MAX_SESSION_SECONDS if tier == "pro" else int(os.getenv("REALTIME_FREE_SESSION_SECONDS", "420"))
 
-    # Real-time is CREDIT-metered — it costs ~10x the Groq pipeline, so it cannot be
-    # unlimited in the flat sub. Pro includes a monthly allowance; beyond it the user
-    # buys minute packs. (The standard pipeline voice mode stays unlimited for Pro.)
-    if not has_credit(supabase, uid, quota["tier"]):
+    # Real-time voice is CREDIT-metered for EVERYONE (it costs ~10x the Groq
+    # pipeline). Pro gets a monthly included allowance; a non-Pro user is seeded a
+    # ONE-TIME free trial (~2 short interviews) the first time get_balance runs,
+    # inside has_credit() just below. So the gate is simply "do you have credit?" —
+    # which lets a free user try the best-quality voice once, then hit the upsell.
+    if not has_credit(supabase, uid, tier):
+        if tier == "pro":
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of real-time interview minutes. Buy a minute pack, or switch to the standard voice mode — it's unlimited on Pro.",
+            )
         raise HTTPException(
             status_code=402,
-            detail="You're out of real-time interview minutes. Buy a minute pack, or switch to the standard voice mode — it's unlimited on Pro.",
+            detail="You've used your free voice interviews. Upgrade to Pro to keep talking through cases out loud.",
         )
 
     case = (
@@ -197,8 +203,8 @@ async def create_realtime_session(
             "expires_at": data.get("expires_at"),
             "model": REALTIME_MODEL,
             "voice": REALTIME_VOICE,
-            "max_session_seconds": MAX_SESSION_SECONDS,
-            "credits": get_balance(supabase, uid, quota["tier"]),
+            "max_session_seconds": session_cap,
+            "credits": get_balance(supabase, uid, tier),
         }
 
     except HTTPException:

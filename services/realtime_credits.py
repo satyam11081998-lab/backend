@@ -23,6 +23,10 @@ from services.supabase_client import get_supabase_client
 # Pro's monthly included real-time allowance (minutes). Env-tunable, no redeploy.
 INCLUDED_MIN_PRO = float(os.getenv("REALTIME_INCLUDED_MIN_PRO", "60"))
 PERIOD_DAYS = int(os.getenv("REALTIME_INCLUDED_PERIOD_DAYS", "30"))
+# One-time real-time TRIAL for non-Pro users (minutes). Seeded on their first-ever
+# balance read and NEVER refilled (only Pro's allowance refills), so it is a true
+# lifetime grant — enough for ~2 seven-minute voice interviews. Env-tunable.
+FREE_TRIAL_MIN = float(os.getenv("REALTIME_FREE_TRIAL_MIN", "14"))
 
 
 def _now() -> datetime:
@@ -47,12 +51,14 @@ def _parse_ts(v) -> datetime:
 def get_balance(supabase, user_id: str, tier: str) -> Dict[str, Any]:
     """Balance for the user, refilling Pro's monthly included allowance if the
     period has elapsed (or the row is new). Fails safe -> zeros on any error."""
-    allowance = INCLUDED_MIN_PRO if tier == "pro" else 0.0
+    is_pro = tier == "pro"
+    refill_allowance = INCLUDED_MIN_PRO if is_pro else 0.0        # only Pro refills monthly
+    first_grant = INCLUDED_MIN_PRO if is_pro else FREE_TRIAL_MIN  # one-time seed on a new row
     try:
         row = _row(supabase, user_id)
         now = _now()
         if row is None:
-            included = allowance      # a brand-new Pro starts with a full allowance
+            included = first_grant    # Pro: full allowance; non-Pro: one-time free trial
             purchased = 0.0
             period_start = now
             _write(supabase, user_id, included, period_start, purchased)
@@ -60,20 +66,20 @@ def get_balance(supabase, user_id: str, tier: str) -> Dict[str, Any]:
             included = float(row.get("included_remaining") or 0)
             purchased = float(row.get("purchased_remaining") or 0)
             period_start = _parse_ts(row.get("included_period_start"))
-            if tier == "pro" and (now - period_start) >= timedelta(days=PERIOD_DAYS):
-                included = allowance  # new monthly cycle
+            if is_pro and (now - period_start) >= timedelta(days=PERIOD_DAYS):
+                included = refill_allowance  # new monthly cycle (Pro only; non-Pro never refills)
                 period_start = now
                 _write(supabase, user_id, included, period_start, purchased)
         return {
             "included_remaining": round(included, 2),
             "purchased_remaining": round(purchased, 2),
             "total_remaining": round(included + purchased, 2),
-            "included_allowance": allowance,
+            "included_allowance": first_grant,
             "tier": tier,
         }
     except Exception:
         return {"included_remaining": 0, "purchased_remaining": 0, "total_remaining": 0,
-                "included_allowance": allowance, "tier": tier}
+                "included_allowance": (INCLUDED_MIN_PRO if is_pro else FREE_TRIAL_MIN), "tier": tier}
 
 
 def has_credit(supabase, user_id: str, tier: str) -> bool:
