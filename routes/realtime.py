@@ -49,6 +49,12 @@ MAX_SESSION_SECONDS = int(os.getenv("REALTIME_MAX_SESSION_SECONDS", "600"))
 # if legitimate shared-IP users (college / office wifi) hit it; env-tunable.
 REALTIME_FREE_IP_PER_DAY = int(os.getenv("REALTIME_FREE_IP_PER_DAY", "10"))
 
+# How long a candidate may pause mid-sentence before the interviewer decides they
+# have finished and replies. The realtime default (~0.5s) was far too short — a
+# natural thinking pause mid-calculation read as end-of-turn, so the interviewer
+# jumped in and repeated itself. ~1.4s lets them finish a thought. Env-tunable.
+REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
+
 
 class RealtimeSessionRequest(BaseModel):
     """`case_id` lets us build the interviewer instructions server-side."""
@@ -176,7 +182,16 @@ async def create_realtime_session(
                     # Server VAD is what buys real barge-in: OpenAI detects the
                     # candidate starting to speak and interrupts the interviewer
                     # without a round trip through us.
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        # Wait this long in silence before deciding the turn is
+                        # over. A thinking pause mid-calculation must NOT be
+                        # mistaken for "done" — that was the #1 cause of the
+                        # interviewer interrupting and repeating itself.
+                        "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
+                    },
                     "transcription": {"model": "whisper-1"},
                 },
                 "output": {"voice": REALTIME_VOICE},
