@@ -43,6 +43,12 @@ REALTIME_ENABLED = os.getenv("REALTIME_ENABLED", "1") != "0"
 # not from this constant.
 MAX_SESSION_SECONDS = int(os.getenv("REALTIME_MAX_SESSION_SECONDS", "600"))
 
+# Per-IP daily cap on NON-PRO (guest/free) voice sessions, bounding cost when a
+# single network cycles anonymous identities into fresh trials. In-memory +
+# per-instance (advisory); assert_daily_budget() is the hard backstop. Raise it
+# if legitimate shared-IP users (college / office wifi) hit it; env-tunable.
+REALTIME_FREE_IP_PER_DAY = int(os.getenv("REALTIME_FREE_IP_PER_DAY", "10"))
+
 
 class RealtimeSessionRequest(BaseModel):
     """`case_id` lets us build the interviewer instructions server-side."""
@@ -54,6 +60,7 @@ class RealtimeSessionRequest(BaseModel):
 async def create_realtime_session(
     body: RealtimeSessionRequest,
     authorization: Optional[str] = Header(default=None),
+    x_forwarded_for: Optional[str] = Header(default=None, alias="X-Forwarded-For"),
 ):
     """
     Mint a short-lived client secret so the browser can open a WebRTC session
@@ -94,6 +101,19 @@ async def create_realtime_session(
     # Free-trial voice is capped tighter than Pro (advisory — the hard lifetime
     # bound is the credit balance below, burnt down by the per-turn deduction).
     session_cap = MAX_SESSION_SECONDS if tier == "pro" else int(os.getenv("REALTIME_FREE_SESSION_SECONDS", "420"))
+
+    # Per-IP daily cap for NON-PRO (guest/free) voice, so one network can't cycle
+    # anonymous identities into unlimited free trials. In-memory + per-instance
+    # (advisory); assert_daily_budget() is the hard backstop. Pro is never capped.
+    if tier != "pro":
+        client_ip = (x_forwarded_for or "").split(",")[0].strip() or "unknown"
+        try:
+            check_rate_limit(f"rt_ip_day:{client_ip}", max_calls=REALTIME_FREE_IP_PER_DAY, window_seconds=86400)
+        except HTTPException:
+            raise HTTPException(
+                status_code=429,
+                detail="This network has reached today's free voice limit. Upgrade to Pro for unlimited voice, or try again tomorrow.",
+            )
 
     # Real-time voice is CREDIT-metered for EVERYONE (it costs ~10x the Groq
     # pipeline). Pro gets a monthly included allowance; a non-Pro user is seeded a
