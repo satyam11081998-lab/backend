@@ -21,12 +21,17 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
-from services.ai_providers import openai_client
+from services.ai_providers import openai_client, chat_with_fallback, resolve_llm
 from services.ai_usage import log_ai_usage
 
 from .specialists import DataAccess, SPECIALISTS, DIMENSIONS
 
-PLANNER_MODEL = "gpt-4o"
+# Orchestration (which specialist to deploy) is a CHEAP job and must not pay
+# gpt-4o rates. Routed through the `coach_planner` provider feature (gpt-4o-mini
+# by default, admin-toggleable to Groq); gpt-4o stays for scoring, not routing.
+PLANNER_FEATURE = "coach_planner"
+SYNTH_FEATURE = "coach_synthesis"   # the final plan the candidate READS — premium (gpt-4o)
+PLANNER_MODEL = "gpt-4o-mini"  # display / fallback label only
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +201,69 @@ exemplar the team surfaced; never invent a case, a score or a number. Structure 
 Keep it tight: a plan read once and acted on, not an essay. Short lines beat paragraphs."""
 
 
+_SYNTH_SYSTEM = """You are the MECE Prep Copilot writing the FINAL personalised prep plan for ONE candidate, \
+from what a team of specialists gathered. Write the way a sharp MBB coach talks — direct, warm, specific, \
+first person, Indian-English register, money in Rs/crore. Lead with the answer. No hype, no restating the \
+brief, never say 'as an AI'. Ground EVERY line in what the specialists returned: name the real case titles, \
+the real headline, the real exemplar; never invent a case, a score or a number. Structure exactly as:
+  1. Verdict — one line: the single thing to fix this week and why it matters for their target.
+  2. Diagnosis — two or three sentences: their weakest skill with its score and the trend, and the one \
+target-firm skill it collides with. A concrete pattern, not a platitude.
+  3. This week — Days 1-3, Days 4-6, Day 7: each a short line naming the specific case / stretch case / \
+news angle / exemplar to use and the technique to drill.
+  4. What good looks like — one line on how they will know the gap has closed.
+Keep it tight — read once and acted on, not an essay. Short lines beat paragraphs."""
+
+
+def _quality_synthesis(user_id: Optional[str], goal: str, context: Dict[str, Any],
+                       history: List[Dict[str, Any]]) -> str:
+    """Write the FINAL plan on the PREMIUM model (coach_synthesis / gpt-4o) from the
+    grounded specialist findings. Orchestration stays cheap; the prose the candidate
+    actually reads stays premium. Returns '' on failure so the caller falls back."""
+    findings: List[str] = []
+    for h in history:
+        r = h.get("result", {}) or {}
+        line = f"[{r.get('domain', '?')}] {r.get('headline', '')}"
+        data = r.get("data")
+        if data:
+            line += " :: " + json.dumps(data)[:1200]
+        findings.append(line)
+    user_msg = (
+        f"GOAL: {goal}\n"
+        f"TARGET COMPANY: {context.get('target_company', '') or '(unspecified)'}\n"
+        f"DOMAIN/ROLE: {context.get('domain', '') or '(unspecified)'}\n"
+        f"WEEKLY HOURS: {context.get('weekly_hours') or 5}\n\n"
+        "WHAT THE SPECIALISTS RETURNED (ground every line in this — invent nothing):\n"
+        + "\n".join(findings)
+    )
+    try:
+        t0 = time.time()
+        resp, model, _prov = chat_with_fallback(
+            SYNTH_FEATURE,
+            messages=[{"role": "system", "content": _SYNTH_SYSTEM},
+                      {"role": "user", "content": user_msg}],
+            temperature=0.4, max_tokens=700,
+        )
+        try:
+            log_ai_usage(user_id=user_id, endpoint="/coach/synthesize", model=model,
+                         response=resp, latency_ms=int((time.time() - t0) * 1000))
+        except Exception:
+            pass
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+
 def make_live_planner(user_id: Optional[str], data: DataAccess, context: Dict[str, Any]):
     """Returns (planner, model). The planner keeps its own message history so the
     model sees each specialist's result and orchestrates over it."""
     cli = openai_client()
     if cli is None:
         raise RuntimeError("OpenAI not configured")
+    try:
+        _c, disp_model, _p = resolve_llm(PLANNER_FEATURE)
+    except Exception:
+        disp_model = PLANNER_MODEL
 
     prof = {}
     try:
@@ -231,13 +293,13 @@ def make_live_planner(user_id: Optional[str], data: DataAccess, context: Dict[st
                              "content": f"RESULT from {last['agent']}: {json.dumps(last['result'])[:1800]}"})
 
         t0 = time.time()
-        resp = cli.chat.completions.create(
-            model=PLANNER_MODEL, messages=messages,
+        resp, used_model, _prov = chat_with_fallback(
+            PLANNER_FEATURE, messages=messages,
             tools=_planner_tools(), tool_choice="auto",
             temperature=0.3, max_tokens=900,
         )
         try:
-            log_ai_usage(user_id=user_id, endpoint="/coach/plan", model=PLANNER_MODEL,
+            log_ai_usage(user_id=user_id, endpoint="/coach/plan", model=used_model,
                          response=resp, latency_ms=int((time.time() - t0) * 1000))
         except Exception:
             pass
@@ -245,7 +307,9 @@ def make_live_planner(user_id: Optional[str], data: DataAccess, context: Dict[st
         msg = resp.choices[0].message
         tcs = getattr(msg, "tool_calls", None)
         if not tcs:
-            return {"action": "synthesize", "summary": (getattr(msg, "content", "") or "").strip()}
+            polished = _quality_synthesis(user_id, goal, context, history)
+            return {"action": "synthesize",
+                    "summary": polished or (getattr(msg, "content", "") or "").strip()}
 
         tc = tcs[0]
         messages.append({"role": "assistant", "content": msg.content or "",
@@ -259,7 +323,10 @@ def make_live_planner(user_id: Optional[str], data: DataAccess, context: Dict[st
         except json.JSONDecodeError:
             args = {}
         if name == "synthesize":
-            return {"action": "synthesize", "summary": args.get("summary", ""), "rationale": msg.content or None}
+            polished = _quality_synthesis(user_id, goal, context, history)
+            return {"action": "synthesize",
+                    "summary": polished or args.get("summary", ""),
+                    "rationale": msg.content or None}
         return {"action": "delegate", "agent": name, "args": args, "rationale": msg.content or None}
 
-    return planner, PLANNER_MODEL
+    return planner, disp_model

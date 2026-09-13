@@ -111,6 +111,18 @@ FEATURES: Dict[str, Dict[str, Any]] = {
         "default": "groq",  # cheap classifier-style pass; Groq is plenty
         "models": {"openai": "gpt-4o-mini", "groq": _GROQ_LLM},
     },
+    "coach_planner": {
+        "label": "Prep Copilot planner (tool orchestration)",
+        "providers": ["openai", "groq"],
+        "default": "openai",  # gpt-4o-mini — choosing which specialist to deploy must NEVER pay gpt-4o
+        "models": {"openai": "gpt-4o-mini", "groq": _GROQ_LLM},
+    },
+    "coach_synthesis": {
+        "label": "Prep Copilot final plan writing (quality)",
+        "providers": ["openai", "groq"],
+        "default": "openai",  # gpt-4o — this is the prose the candidate READS; keep it premium
+        "models": {"openai": "gpt-4o", "groq": _GROQ_LLM},
+    },
     "tts": {
         "label": "Interviewer voice (TTS)",
         "providers": ["openai", "google"],

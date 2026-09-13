@@ -516,8 +516,9 @@ async def post_realtime_turn(
     """
     supabase = get_supabase_client()
     user_id, user_obj = get_verified_user(supabase, authorization)
-    if is_guest_user(user_obj):
-        raise HTTPException(status_code=403, detail="Create an account to use voice interview mode.")
+    # Guests (anonymous auth) may report voice turns too, so their transcript
+    # actually saves and can be scored after they convert. Cost is bounded by the
+    # credit trial + the daily kill-switch.
 
     # Two turns per exchange, and the far end can be quick — looser than
     # /messages, still bounded.

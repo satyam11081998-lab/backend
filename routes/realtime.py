@@ -78,8 +78,9 @@ async def create_realtime_session(
 
     supabase = get_supabase_client()
     uid, user_obj = get_verified_user(supabase, authorization)          # 401
-    if is_guest_user(user_obj):
-        raise HTTPException(status_code=403, detail="Create an account to use voice interview mode.")
+    # Guests (anonymous auth) may try voice too — the one-time credit trial plus
+    # the daily kill-switch bound the cost, and they convert to a real account at
+    # the score (GuestSaveWall), which carries their usage over.
 
     # A session is expensive relative to a chat turn, so this is deliberately
     # tighter than /speak's 40/min.
