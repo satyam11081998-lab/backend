@@ -140,7 +140,12 @@ class RealtimeTurnRequest(BaseModel):
 
 
 class SubmitRequest(BaseModel):
-    final_recommendation: str = Field(..., min_length=20, max_length=RECOMMENDATION_MAX_CHARS)
+    # No minimum length: the "final recommendation" is no longer typed into a
+    # separate box — the client submits the candidate's last conversational turn
+    # (which can be short) and the scorer reads the WHOLE transcript. Empty is
+    # tolerated too; submit_attempt still rejects a genuinely empty conversation
+    # (len(transcript) == 0) below, which is the real guard.
+    final_recommendation: str = Field(default="", max_length=RECOMMENDATION_MAX_CHARS)
 
 
 class SubmitResponse(BaseModel):
