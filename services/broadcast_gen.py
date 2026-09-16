@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import time
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,14 @@ from services.ai_usage import log_ai_usage
 
 VALID_CASE_TYPES = {"profitability", "market_sizing", "growth"}
 VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
+# Short shareable code for /p/<code> broadcast links (no ambiguous chars: no 0/O/1/l/i).
+_CODE_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+
+
+def _gen_code(n: int = 6) -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(n))
+
 
 
 def _clean(v: Optional[str]) -> str:
@@ -220,13 +229,25 @@ def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = ""
                           "kind": "guesstimate" if is_guess else "case", "difficulty": diff},
     })
 
-    try:
-        ins = supabase.table("cases").insert(row).execute()
-        new = (ins.data or [None])[0]
-        if not new or not new.get("id"):
-            raise ValueError("Saved the case but no id came back.")
-        return {"case_id": new["id"], "title": row["title"], "type": row["type"], "difficulty": diff}
-    except ValueError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise ValueError(f"Could not save the chosen option: {type(e).__name__}: {e}")
+    # Give the case a short code so it can be shared as mece.in/p/<code> (kept short,
+    # with mece.in visible). cases.code has a FULL unique index; on the rare collision,
+    # regenerate and retry. The column is baseline (0001), so this needs no migration.
+    last_err = None
+    for _ in range(6):
+        row["code"] = _gen_code()
+        try:
+            ins = supabase.table("cases").insert(row).execute()
+            new = (ins.data or [None])[0]
+            if not new or not new.get("id"):
+                raise ValueError("Saved the case but no id came back.")
+            return {"case_id": new["id"], "code": row["code"], "title": row["title"],
+                    "type": row["type"], "difficulty": diff}
+        except ValueError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if "code" in msg and ("unique" in msg or "duplicate" in msg or "23505" in msg):
+                last_err = e
+                continue  # code collision — regenerate and retry
+            raise ValueError(f"Could not save the chosen option: {type(e).__name__}: {e}")
+    raise ValueError(f"Could not save the chosen option (code collisions): {last_err}")
