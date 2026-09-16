@@ -22,6 +22,38 @@ LITE_DAILY_EXTRA = {"case": 2, "guesstimate": 2}
 _TIER_RANK = {"free": 0, "lite": 1, "pro": 2}
 
 
+def _count_bank_used(supabase, candidate_ids, bucket: str) -> int:
+    """Count how many of `candidate_ids` count against the free/lite bank for `bucket`.
+
+    UNLISTED broadcast cases are free extra practice reached by a campaign link — they
+    must NEVER consume a user's one-time free bank (or a lite user's daily +2), or a
+    goodwill campaign case would silently cost the recipient their self-serve quota.
+
+    DEPLOY-ORDER SAFETY: `unlisted` does not exist until migration 0065. Selecting a
+    missing column makes PostgREST 400 and supabase-py raise — and this runs on the hot
+    path of every free/lite non-daily attempt, so an unguarded select would turn
+    "backend deployed a few minutes before the migration" into "no free user can start a
+    case". The fallback re-reads without the column, i.e. pre-0065 behaviour (unlisted
+    unknown -> counted), which is exactly today's behaviour. Mirrors effective_tier_and_guest.
+    """
+    if not candidate_ids:
+        return 0
+    try:
+        types = supabase.table("cases").select("id, type, unlisted").in_("id", candidate_ids).execute()
+    except Exception as exc:  # noqa: BLE001 — narrowed by the re-raise
+        if "unlisted" not in str(exc):
+            raise
+        types = supabase.table("cases").select("id, type").in_("id", candidate_ids).execute()
+    used = 0
+    for t in ((types.data or []) if types else []):
+        if t.get("unlisted"):
+            continue  # free extra practice by link — never consumes the bank
+        tb = "guesstimate" if t.get("type") == "guesstimate" else "case"
+        if tb == bucket:
+            used += 1
+    return used
+
+
 def _today_ist() -> str:
     return datetime.now(IST_OFFSET).date().isoformat()
 
@@ -110,6 +142,13 @@ def assert_tier_at_least(supabase, user_id: str, minimum: str) -> None:
 
 def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
     """Raise HTTPException(403) if this user may NOT attempt this case right now."""
+    # UNLISTED broadcast cases are attemptable by ANY tier via direct link. They never
+    # enter the daily rotation, practice lists, search, or leaderboard (is_active=false),
+    # so no tier/bank accounting applies. The SUBMIT wall (assert_can_submit) still requires
+    # an account to be SCORED — that is the campaign's sign-up funnel, left intact here.
+    # Deploy-safe: .get("unlisted") is falsy before migration 0065, so behaviour is unchanged.
+    if case.get("unlisted"):
+        return
     case_id = case["id"]
     case_type = case.get("type", "")
     bucket = "guesstimate" if case_type == "guesstimate" else "case"
@@ -175,13 +214,7 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
             r["case_id"] for r in ((rows.data or []) if rows else [])
             if not r.get("counted_for_daily") and r.get("case_id") not in daily_ids
         ]
-        used = 0
-        if candidate_ids:
-            types = supabase.table("cases").select("id, type").in_("id", candidate_ids).execute()
-            for t in ((types.data or []) if types else []):
-                tb = "guesstimate" if t.get("type") == "guesstimate" else "case"
-                if tb == bucket:
-                    used += 1
+        used = _count_bank_used(supabase, candidate_ids, bucket)
 
         # LinkedIn follow perk (2026-07): a one-time claim permanently raises
         # the free bank by +1 case and +1 guesstimate. Mirrors lib/access.ts
@@ -219,13 +252,7 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
         r["case_id"] for r in ((rows.data or []) if rows else [])
         if not r.get("counted_for_daily") and r.get("case_id") not in daily_ids
     ]
-    used = 0
-    if candidate_ids:
-        types = supabase.table("cases").select("id, type").in_("id", candidate_ids).execute()
-        for t in ((types.data or []) if types else []):
-            tb = "guesstimate" if t.get("type") == "guesstimate" else "case"
-            if tb == bucket:
-                used += 1
+    used = _count_bank_used(supabase, candidate_ids, bucket)
 
     if used >= LITE_DAILY_EXTRA[bucket]:
         label = "guesstimates" if bucket == "guesstimate" else "cases"

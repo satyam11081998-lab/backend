@@ -190,10 +190,12 @@ def _load_case(supabase, case_id: str, user_id=None) -> dict:
     row = supabase.table("cases").select("*").eq("id", case_id).maybe_single().execute()
     if not row.data:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    if row.data.get("is_active") is False:
+    if row.data.get("is_active") is False and not row.data.get("unlisted"):
         # Copilot-generated PRIVATE cases (is_active=false, owner_id set) are
         # attemptable by their OWNER — that is the whole point of the curated
         # tool. Everyone else still gets a 404 for a retired/private case.
+        # UNLISTED broadcast cases (unlisted=true) are attemptable by ANYONE with the
+        # link (broadcast recipients); they skip this owner-gate. Deploy-safe via .get().
         if not (user_id and row.data.get("owner_id") == user_id):
             raise HTTPException(status_code=404, detail="This case is no longer available.")
     return row.data

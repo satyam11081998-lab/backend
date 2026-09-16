@@ -80,8 +80,15 @@ async def submit_answer(
         )
 
     case = case_result.data
-    if case.get("is_active") is False and case.get("owner_id") != submission.user_id:
+    if (
+        case.get("is_active") is False
+        and not case.get("unlisted")
+        and case.get("owner_id") != submission.user_id
+    ):
         # Copilot-generated private cases (owner_id set) stay attemptable by their owner.
+        # UNLISTED broadcast cases (unlisted=true) stay attemptable by direct link — that
+        # is how a whole college practises a campaign case from a broadcast email. Deploy-
+        # safe: .get("unlisted") is falsy before migration 0065, so behaviour is unchanged.
         raise HTTPException(status_code=404, detail="This case is no longer available.")
     case_content = case["content"]
     case_type = case["type"]

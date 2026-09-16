@@ -74,3 +74,5 @@ from routes import coach as _coach
 app.include_router(_coach.router)
 from routes import seo as _seo
 app.include_router(_seo.router)
+from routes import broadcast as _broadcast
+app.include_router(_broadcast.router)
