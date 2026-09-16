@@ -21,6 +21,9 @@ from prompts.interview_prompts import (
     CONVERSATION_SCORING_SYSTEM_PROMPT,
     build_conversation_scoring_user_prompt,
 )
+from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
+from services.session_signals import compute_signals, build_signal_block
+from services.interviewer_decision import StreamTagStripper, parse_control_tag
 
 load_dotenv()
 
@@ -61,6 +64,44 @@ class InterviewEngineError(Exception):
     pass
 
 
+# --- Adaptive interviewer (Phase 1) ------------------------------------------
+# Behind ADAPTIVE_INTERVIEWER: when on, each turn is built from the adaptive v2
+# prompt + a deterministic SESSION SIGNALS block and the model's control tag is
+# stripped. Off (default) = the v1 behaviour, byte-for-byte. Read at call time so
+# the flag can flip without a code change.
+
+def _adaptive_enabled() -> bool:
+    return os.getenv("ADAPTIVE_INTERVIEWER", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _teaching_policy() -> str:
+    p = os.getenv("INTERVIEWER_TEACHING_POLICY", "coached").strip().lower()
+    return p if p in ("exam", "coached") else "coached"
+
+
+def _build_messages(case_content, case_type, transcript, new_user_message, clarifications_exhausted):
+    """v2 adaptive messages when the flag is on; the v1 messages (unchanged) otherwise."""
+    if _adaptive_enabled():
+        tlist = list(transcript)  # materialise: used twice (signals + messages)
+        signals = compute_signals(tlist, new_user_message, _teaching_policy())
+        return build_adaptive_interviewer_messages(
+            case_content=case_content,
+            case_type=case_type,
+            transcript=tlist,
+            new_user_message=new_user_message,
+            teaching_policy=_teaching_policy(),
+            signals_block=build_signal_block(signals),
+            clarifications_exhausted=clarifications_exhausted,
+        )
+    return build_interviewer_messages(
+        case_content=case_content,
+        case_type=case_type,
+        transcript=transcript,
+        new_user_message=new_user_message,
+        clarifications_exhausted=clarifications_exhausted,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Live turn (streaming)
 # -----------------------------------------------------------------------------
@@ -81,12 +122,8 @@ def stream_interviewer_reply(
     `clarifications_exhausted` makes the interviewer decline the clarification
     and redirect, rather than the caller returning no reply at all.
     """
-    messages = build_interviewer_messages(
-        case_content=case_content,
-        case_type=case_type,
-        transcript=transcript,
-        new_user_message=new_user_message,
-        clarifications_exhausted=clarifications_exhausted,
+    messages = _build_messages(
+        case_content, case_type, transcript, new_user_message, clarifications_exhausted
     )
     cli, model, provider = resolve_llm("interviewer")
 
@@ -123,6 +160,7 @@ def stream_interviewer_reply(
         id = None
 
     final = _U()
+    stripper = StreamTagStripper() if _adaptive_enabled() else None
     try:
         for chunk in stream:
             if getattr(chunk, "usage", None):
@@ -134,7 +172,14 @@ def stream_interviewer_reply(
             except (AttributeError, IndexError):
                 token = None
             if token:
-                yield token
+                if stripper is not None:
+                    for _out in stripper.feed(token):
+                        yield _out
+                else:
+                    yield token
+        if stripper is not None:
+            for _out in stripper.flush():
+                yield _out
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
@@ -150,12 +195,8 @@ def complete_interviewer_reply(
     clarifications_exhausted: bool = False,
 ) -> str:
     """Non-streaming variant — used when SSE is not available."""
-    messages = build_interviewer_messages(
-        case_content=case_content,
-        case_type=case_type,
-        transcript=transcript,
-        new_user_message=new_user_message,
-        clarifications_exhausted=clarifications_exhausted,
+    messages = _build_messages(
+        case_content, case_type, transcript, new_user_message, clarifications_exhausted
     )
     cli, model, provider = resolve_llm("interviewer")
 
@@ -180,7 +221,10 @@ def complete_interviewer_reply(
                 raise InterviewEngineError(f"OpenAI call failed: {e2}")
         else:
             raise InterviewEngineError(f"OpenAI call failed: {e}")
-    return (resp.choices[0].message.content or "").strip()
+    text = (resp.choices[0].message.content or "").strip()
+    if _adaptive_enabled():
+        _tag, text = parse_control_tag(text)
+    return text
 
 
 # -----------------------------------------------------------------------------
