@@ -32,6 +32,8 @@ from services.interview_engine import (
     count_clarifications,
     InterviewEngineError,
 )
+from services.session_signals import compute_signals
+from services.interviewer_decision import update_session_state, detect_violations
 from services.badge_awarder import award_badges_for_submission
 from services.ai_usage import assert_daily_budget, log_realtime_usage
 from services.realtime_credits import deduct as deduct_realtime_credit
@@ -412,6 +414,11 @@ async def post_message(
     case = _load_case(supabase, attempt["case_id"], user_id)
     transcript = _fetch_transcript(supabase, attempt_id)
 
+    # Adaptive interviewer (Phase 2): persisted learner state + per-case teaching policy.
+    # Both are select("*")-safe -- an absent column just yields None, handled below.
+    session_state = attempt.get("session_state") or {}
+    teaching_policy = case.get("teaching_policy") or None
+
     # Does this turn consume clarification quota?
     clar_count = count_clarifications(body.content, body.kind)
     remaining = attempt["clarification_quota"] - attempt["clarification_used"]
@@ -457,6 +464,7 @@ async def post_message(
     # ---------- Stream assistant reply ----------
     def event_stream():
         chunks: List[str] = []
+        ctl: Dict[str, Any] = {}
         try:
             yield (
                 f"event: meta\ndata: {{"
@@ -472,6 +480,9 @@ async def post_message(
                 new_user_message=body.content,
                 user_id=user_id,
                 clarifications_exhausted=clarifications_spent,
+                teaching_policy=teaching_policy,
+                prior_state=session_state,
+                control_out=ctl,
             ):
                 chunks.append(token)
                 # SSE data lines must not contain literal newlines — escape them.
@@ -493,6 +504,20 @@ async def post_message(
                 .execute()
             )
             msg_id = saved.data[0]["id"] if saved.data else None
+            # Phase 2: fold the model's control tag into persisted session_state, and
+            # record any deterministic guardrail violation for evals/metrics. Wrapped:
+            # a pre-migration DB (no session_state column) degrades to no-op, never a 500.
+            tag = ctl.get("tag") or {}
+            if tag:
+                try:
+                    _sig = compute_signals(transcript, body.content, teaching_policy or "coached", session_state)
+                    _new_state = update_session_state(session_state, tag, _sig)
+                    supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
+                    _viol = detect_violations(final_text, teaching_policy or "coached")
+                    if _viol:
+                        print(f"[interviewer] guardrail_violation {_viol} attempt={attempt_id} tag={tag}")
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[interviewer] session_state update skipped: {type(_e).__name__}: {_e}")
             yield f"event: done\ndata: {{\"message_id\": \"{msg_id}\"}}\n\n"
         except InterviewEngineError as e:
             yield f"event: error\ndata: {str(e)[:200]}\n\n"

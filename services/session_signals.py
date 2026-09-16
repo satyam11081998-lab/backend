@@ -148,7 +148,7 @@ def _stuckish(turn_norm: str) -> bool:
 
 
 def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
-                    teaching_policy: str = "coached") -> Dict[str, Any]:
+                    teaching_policy: str = "coached", prior_state=None) -> Dict[str, Any]:
     transcript = list(transcript or [])
     cand = _candidate_turns(transcript)
     asst = _assistant_turns(transcript)
@@ -184,6 +184,9 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     return {
         "intent": intent["intent"],
         "teaching_policy": teaching_policy,
+        "hint_level": int((prior_state or {}).get("hint_level", 0) or 0),
+        "learner_level": (prior_state or {}).get("learner_level", "unknown"),
+        "repairs_done": int((prior_state or {}).get("repairs_done", 0) or 0),
         "help_requested": intent["help_requested"],
         "solution_requested": intent["solution_requested"],
         "skip_or_stop": intent["skip_or_stop"],
@@ -221,6 +224,11 @@ def build_signal_block(signals: Dict[str, Any]) -> str:
         lines.append("- scope/fact question -> answer with a specific number, own the facts")
     if signals["looks_garbage"]:
         lines.append("- last message looks like noise/typo -> ask them to restate briefly; do not analyse it")
+    if signals.get("hint_level", 0) > 0:
+        lines.append(f"- current hint rung already given: H{signals['hint_level']} -> escalate ONLY on "
+                     "repeated stuckness or an explicit ask; step DOWN a rung when they regain momentum")
+    if signals.get("learner_level", "unknown") not in ("unknown", None):
+        lines.append(f"- learner looks {signals['learner_level']} so far -> calibrate challenge vs scaffolding to that")
     block = ("SESSION SIGNALS (deterministic read of the learner right now; use them, never quote them):\n"
              + "\n".join(lines))
     block += f"\nTEACHING POLICY: {signals['teaching_policy']}"

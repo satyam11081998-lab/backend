@@ -12,7 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.session_signals import (  # noqa: E402
     detect_intent, compute_signals, build_signal_block, _looks_garbage,
 )
-from services.interviewer_decision import parse_control_tag, StreamTagStripper  # noqa: E402
+from services.interviewer_decision import (  # noqa: E402
+    parse_control_tag, StreamTagStripper, update_session_state, detect_violations,
+)
 
 _fail = []
 
@@ -101,6 +103,40 @@ check("stream strips tag", run_stream(StreamTagStripper(), ["<<mode=", "coach>>"
 check("stream no-tag passthrough", run_stream(StreamTagStripper(), ["Hello ", "there, ", "go on"]) == "Hello there, go on")
 check("stream tag as single chunk", run_stream(StreamTagStripper(), ["<<mode=coach>>\n\nGo on."]) == "Go on.")
 check("stream unterminated tag flushes reply", "Go on" in run_stream(StreamTagStripper(budget=20), ["<<mode=coach no close ", "and more text Go on now here"]))
+
+# ---- Phase 2: persisted hint ladder + state update + violations -------------
+sigp = compute_signals(transcript=[{"role": "assistant", "content": "and then?"}],
+                       new_user_message="help", teaching_policy="coached",
+                       prior_state={"hint_level": 2, "learner_level": "developing"})
+check("prior hint_level surfaced", sigp["hint_level"] == 2)
+check("signal block shows the rung", "H2" in build_signal_block(sigp))
+
+st = update_session_state({"hint_level": 1}, {"intervention": "micro_hint"},
+                          {"help_requested": True, "turns_without_progress": 2})
+check("hint escalates on help", st["hint_level"] >= 2)
+
+st2 = update_session_state({"hint_level": 3}, {"intervention": "probe"},
+                           {"help_requested": False, "turns_without_progress": 0, "looks_garbage": False})
+check("hint steps DOWN on progress", st2["hint_level"] == 2)
+
+st3 = update_session_state({}, {"intervention": "repair", "mode": "coach"},
+                           {"frustration": "high", "recent_probes": 3})
+check("repair counted", st3["repairs_done"] == 1 and st3["mode"] == "coach")
+
+st4 = update_session_state({"hint_level": 0}, {"intervention": "reveal", "hint": "5"}, {})
+check("explicit tag hint respected", st4["hint_level"] == 5)
+
+check("violation: banned 'isn't specified'",
+      "banned_isnt_specified" in detect_violations("That detail isn't specified, so assume a value."))
+check("violation: rubber-stamp",
+      "possible_rubber_stamp" in detect_violations("That's a solid structure! Well done."))
+check("no violation on a clean probe",
+      detect_violations("How did you get to 20 million? Take it forward.") == [])
+
+sc = StreamTagStripper()
+_ = run_stream(sc, ["<<mode=coach; intervention=micro_hint; hint=1>>\n\nYou're one step away."])
+check("stream captured the tag dict", sc.tag.get("mode") == "coach" and sc.tag.get("intervention") == "micro_hint")
+
 
 print()
 if _fail:

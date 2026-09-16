@@ -74,22 +74,35 @@ def _adaptive_enabled() -> bool:
     return os.getenv("ADAPTIVE_INTERVIEWER", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _teaching_policy() -> str:
-    p = os.getenv("INTERVIEWER_TEACHING_POLICY", "coached").strip().lower()
+def _teaching_policy(explicit=None) -> str:
+    """Per-case policy wins; else env; else coached."""
+    p = (explicit or os.getenv("INTERVIEWER_TEACHING_POLICY", "coached") or "").strip().lower()
     return p if p in ("exam", "coached") else "coached"
 
 
-def _build_messages(case_content, case_type, transcript, new_user_message, clarifications_exhausted):
+def _resolve_adaptive_llm():
+    """Pin the ADAPTIVE interviewer to ONE model so the same prompt stops producing
+    two opposite personas (the Groq vs gpt-4o-mini split that made the interviewer a
+    harsh refuser for some users and a sycophant for others). Always OpenAI for
+    consistency; model via INTERVIEWER_ADAPTIVE_MODEL (default gpt-4o-mini). The v1
+    path still honours the admin provider toggle unchanged."""
+    model = (os.getenv("INTERVIEWER_ADAPTIVE_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+    return openai_client() or _client, model, "openai"
+
+
+def _build_messages(case_content, case_type, transcript, new_user_message,
+                    clarifications_exhausted, teaching_policy=None, prior_state=None):
     """v2 adaptive messages when the flag is on; the v1 messages (unchanged) otherwise."""
     if _adaptive_enabled():
         tlist = list(transcript)  # materialise: used twice (signals + messages)
-        signals = compute_signals(tlist, new_user_message, _teaching_policy())
+        policy = _teaching_policy(teaching_policy)
+        signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
         return build_adaptive_interviewer_messages(
             case_content=case_content,
             case_type=case_type,
             transcript=tlist,
             new_user_message=new_user_message,
-            teaching_policy=_teaching_policy(),
+            teaching_policy=policy,
             signals_block=build_signal_block(signals),
             clarifications_exhausted=clarifications_exhausted,
         )
@@ -113,6 +126,9 @@ def stream_interviewer_reply(
     new_user_message: str,
     user_id: Optional[str] = None,
     clarifications_exhausted: bool = False,
+    teaching_policy: Optional[str] = None,
+    prior_state: Optional[dict] = None,
+    control_out: Optional[dict] = None,
 ) -> Generator[str, None, None]:
     """Yield text chunks as the interviewer responds.
 
@@ -122,10 +138,12 @@ def stream_interviewer_reply(
     `clarifications_exhausted` makes the interviewer decline the clarification
     and redirect, rather than the caller returning no reply at all.
     """
+    adaptive = _adaptive_enabled()
     messages = _build_messages(
-        case_content, case_type, transcript, new_user_message, clarifications_exhausted
+        case_content, case_type, transcript, new_user_message, clarifications_exhausted,
+        teaching_policy=teaching_policy, prior_state=prior_state,
     )
-    cli, model, provider = resolve_llm("interviewer")
+    cli, model, provider = _resolve_adaptive_llm() if adaptive else resolve_llm("interviewer")
 
     def _open_stream(c, m):
         return c.chat.completions.create(
@@ -160,7 +178,7 @@ def stream_interviewer_reply(
         id = None
 
     final = _U()
-    stripper = StreamTagStripper() if _adaptive_enabled() else None
+    stripper = StreamTagStripper() if adaptive else None
     try:
         for chunk in stream:
             if getattr(chunk, "usage", None):
@@ -180,6 +198,8 @@ def stream_interviewer_reply(
         if stripper is not None:
             for _out in stripper.flush():
                 yield _out
+            if control_out is not None:
+                control_out["tag"] = getattr(stripper, "tag", {}) or {}
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
@@ -193,12 +213,17 @@ def complete_interviewer_reply(
     transcript: Iterable[Dict[str, str]],
     new_user_message: str,
     clarifications_exhausted: bool = False,
+    teaching_policy: Optional[str] = None,
+    prior_state: Optional[dict] = None,
+    control_out: Optional[dict] = None,
 ) -> str:
     """Non-streaming variant — used when SSE is not available."""
+    adaptive = _adaptive_enabled()
     messages = _build_messages(
-        case_content, case_type, transcript, new_user_message, clarifications_exhausted
+        case_content, case_type, transcript, new_user_message, clarifications_exhausted,
+        teaching_policy=teaching_policy, prior_state=prior_state,
     )
-    cli, model, provider = resolve_llm("interviewer")
+    cli, model, provider = _resolve_adaptive_llm() if adaptive else resolve_llm("interviewer")
 
     def _complete(c, m):
         return c.chat.completions.create(
@@ -222,8 +247,10 @@ def complete_interviewer_reply(
         else:
             raise InterviewEngineError(f"OpenAI call failed: {e}")
     text = (resp.choices[0].message.content or "").strip()
-    if _adaptive_enabled():
-        _tag, text = parse_control_tag(text)
+    if adaptive:
+        tag, text = parse_control_tag(text)
+        if control_out is not None:
+            control_out["tag"] = tag or {}
     return text
 
 

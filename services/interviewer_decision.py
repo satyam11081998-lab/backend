@@ -46,6 +46,7 @@ class StreamTagStripper:
         self.resolved = False
         self.budget = budget
         self._strip_leading = False
+        self.tag = {}
 
     def feed(self, token: str) -> Generator[str, None, None]:
         if self.resolved:
@@ -64,6 +65,7 @@ class StreamTagStripper:
         if stripped.startswith("<<"):
             end = self.buf.find(">>")
             if end != -1:
+                self.tag = parse_control_tag(self.buf[:end + 2])[0]
                 rest = self.buf[end + 2:].lstrip("\n").lstrip()
                 self.resolved, self.buf = True, ""
                 if rest:
@@ -90,3 +92,82 @@ class StreamTagStripper:
             out = out[m.end():].lstrip()
         if out:
             yield out
+
+
+# --- state update + guardrail telemetry (Phase 2) ----------------------------
+_HINT_INTERVENTIONS = {"micro_hint", "reframe", "analogy", "decompose", "demonstrate", "reveal"}
+_HINT_FLOOR = {"reframe": 1, "analogy": 1, "micro_hint": 2, "decompose": 3, "demonstrate": 4, "reveal": 5}
+
+_BANNED_PHRASES = (
+    "isn't specified", "isnt specified", "not specified", "isn't in the prompt",
+    "not in the prompt", "isn't provided", "not provided", "isn't given", "not given",
+    "i can't give you that", "i cannot give you that", "i won't provide", "i wont provide",
+    "i cannot provide", "that detail isn't", "information isn't provided",
+)
+_RUBBER_STAMP = (
+    "solid structure", "great job", "well done", "impressive", "well-structured",
+    "well structured", "comprehensive", "excellent job",
+)
+
+
+def _infer_learner_level(prior_level, signals):
+    tw = signals.get("turns_without_progress", 0)
+    if tw >= 3:
+        return "weak" if prior_level in ("developing", "weak") else "developing"
+    if signals.get("has_work") and signals.get("frustration") == "none" and tw == 0:
+        return "strong" if prior_level in ("unknown", "developing") else prior_level
+    return prior_level if prior_level else "unknown"
+
+
+def update_session_state(prior_state, tag, signals):
+    """Fold the model's control tag + this turn's signals into the persisted state.
+    Keeps the hint ladder monotonic within a stuck streak and steps it DOWN when the
+    learner regains momentum (preserves productive struggle). Pure; caller persists it."""
+    ps = dict(prior_state or {})
+    tag = tag or {}
+    intervention = (tag.get("intervention") or "").strip().lower()
+    prior_hint = int(ps.get("hint_level", 0) or 0)
+    try:
+        tag_hint = int(tag["hint"]) if tag.get("hint") not in (None, "") else None
+    except (TypeError, ValueError, KeyError):
+        tag_hint = None
+
+    progressed = not (signals.get("help_requested") or signals.get("looks_garbage")
+                      or signals.get("turns_without_progress", 0) >= 1)
+    if intervention in _HINT_INTERVENTIONS:
+        rung = tag_hint if tag_hint is not None else max(_HINT_FLOOR.get(intervention, 1), prior_hint + 1)
+        hint_level = max(prior_hint, rung)
+    elif progressed and prior_hint > 0:
+        hint_level = prior_hint - 1
+    else:
+        hint_level = prior_hint
+    hint_level = max(0, min(5, hint_level))
+
+    ps.update({
+        "mode": (tag.get("mode") or ps.get("mode") or "interviewer"),
+        "hint_level": hint_level,
+        "last_intervention": intervention or ps.get("last_intervention"),
+        "repairs_done": int(ps.get("repairs_done", 0) or 0) + (1 if intervention == "repair" else 0),
+        "frustration": signals.get("frustration", "none"),
+        "consecutive_probes": signals.get("recent_probes", 0),
+        "updated_turn": signals.get("candidate_turn_count", ps.get("updated_turn", 0)),
+        "learner_level": _infer_learner_level(ps.get("learner_level", "unknown"), signals),
+    })
+    return ps
+
+
+def detect_violations(reply_text, policy="coached"):
+    """Deterministic invariant checks on the model's reply, for telemetry + evals.
+    Streaming means we don't rewrite the live reply; we RECORD violations so the eval
+    harness and metrics catch a disobedient model (and flag the case for review)."""
+    import re
+    t = (reply_text or "").lower()
+    out = []
+    if any(p in t for p in _BANNED_PHRASES):
+        out.append("banned_isnt_specified")
+    if any(p in t for p in _RUBBER_STAMP):
+        out.append("possible_rubber_stamp")
+    sents = [x for x in re.split(r"[.!?]+", reply_text or "") if x.strip()]
+    if len(sents) > 5:
+        out.append("too_long")
+    return out
