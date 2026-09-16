@@ -24,6 +24,7 @@ from prompts.interview_prompts import (
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
 from services.session_signals import compute_signals, build_signal_block
 from services.interviewer_decision import StreamTagStripper, parse_control_tag
+from services.learning_model import evaluate_intervention_outcome, build_learning_block
 
 load_dotenv()
 
@@ -97,13 +98,16 @@ def _build_messages(case_content, case_type, transcript, new_user_message,
         tlist = list(transcript)  # materialise: used twice (signals + messages)
         policy = _teaching_policy(teaching_policy)
         signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
+        outcome = evaluate_intervention_outcome(prior_state, signals)
+        block = build_signal_block(signals) + "\n\n" + build_learning_block(
+            (prior_state or {}).get("profile"), signals, outcome)
         return build_adaptive_interviewer_messages(
             case_content=case_content,
             case_type=case_type,
             transcript=tlist,
             new_user_message=new_user_message,
             teaching_policy=policy,
-            signals_block=build_signal_block(signals),
+            signals_block=block,
             clarifications_exhausted=clarifications_exhausted,
         )
     return build_interviewer_messages(

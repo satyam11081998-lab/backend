@@ -513,7 +513,7 @@ async def post_message(
                     _sig = compute_signals(transcript, body.content, teaching_policy or "coached", session_state)
                     _new_state = update_session_state(session_state, tag, _sig)
                     supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
-                    _viol = detect_violations(final_text, teaching_policy or "coached")
+                    _viol = detect_violations(final_text, teaching_policy or "coached", tag)
                     if _viol:
                         print(f"[interviewer] guardrail_violation {_viol} attempt={attempt_id} tag={tag}")
                 except Exception as _e:  # noqa: BLE001
@@ -773,6 +773,26 @@ async def submit_attempt(
         )
     except InterviewEngineError as e:
         raise HTTPException(status_code=500, detail=f"Scoring failed: {e}")
+
+    # Phase 4: personalised debrief + longitudinal skill profile. The per-attempt
+    # learner profile was accumulated on session_state during the session. Fully
+    # best-effort: a pre-migration DB or any error degrades to no debrief, never a 500.
+    try:
+        from services.learning_model import build_debrief, merge_longitudinal_profile
+        _attempt_profile = (attempt.get("session_state") or {}).get("profile") or {}
+        feedback["learning_debrief"] = build_debrief(_attempt_profile)
+        try:
+            _r = supabase.table("user_skill_profile").select("profile").eq("user_id", user_id).maybe_single().execute()
+            _existing = ((_r.data or {}) or {}).get("profile") or {}
+        except Exception:
+            _existing = {}
+        _merged = merge_longitudinal_profile(_existing, _attempt_profile)
+        supabase.table("user_skill_profile").upsert(
+            {"user_id": user_id, "profile": _merged, "updated_at": datetime.now(timezone.utc).isoformat()},
+            on_conflict="user_id",
+        ).execute()
+    except Exception as _e:  # noqa: BLE001
+        print(f"WARN: learning debrief/profile skipped: {_e}")
 
     # Build a flat answer_text from the transcript so the legacy
     # `submissions.answer_text` column stays populated and the existing

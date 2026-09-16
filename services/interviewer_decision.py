@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from typing import Dict, Generator, Tuple
 
+from services.learning_model import evaluate_intervention_outcome, update_learning_profile
+
 _TAG_RE = re.compile(r"^\s*<<(.*?)>>\s*", re.DOTALL)
 
 
@@ -153,10 +155,18 @@ def update_session_state(prior_state, tag, signals):
         "updated_turn": signals.get("candidate_turn_count", ps.get("updated_turn", 0)),
         "learner_level": _infer_learner_level(ps.get("learner_level", "unknown"), signals),
     })
+    # Phase 4: fold this turn into the learner model (skill/error/modality + outcome).
+    outcome = evaluate_intervention_outcome(prior_state, signals)
+    ps["last_intervention_effect"] = outcome
+    ps["profile"] = update_learning_profile(
+        ps.get("profile"), tag, outcome,
+        hint_level=int((prior_state or {}).get("hint_level", 0) or 0),
+        signals=signals, prior_modality=(prior_state or {}).get("last_intervention"),
+    )
     return ps
 
 
-def detect_violations(reply_text, policy="coached"):
+def detect_violations(reply_text, policy="coached", tag=None):
     """Deterministic invariant checks on the model's reply, for telemetry + evals.
     Streaming means we don't rewrite the live reply; we RECORD violations so the eval
     harness and metrics catch a disobedient model (and flag the case for review)."""
@@ -170,4 +180,15 @@ def detect_violations(reply_text, policy="coached"):
     sents = [x for x in re.split(r"[.!?]+", reply_text or "") if x.strip()]
     if len(sents) > 5:
         out.append("too_long")
+    # Behavioral: DECLARED action (tag) vs ACTUAL reply (points 20, 21). Textual
+    # bans catch phrasing; these catch behaviour the model narrated but didn't do.
+    if (reply_text or "").count("?") >= 2:
+        out.append("multiple_questions")   # a good interviewer asks ONE
+    interv = ((tag or {}).get("intervention") or "").strip().lower()
+    looks_full_solution = (len(re.findall(r"\d", reply_text or "")) >= 4 and len(sents) >= 5
+                           and ("=" in (reply_text or "") or "the answer is" in t or "the total is" in t))
+    if interv in ("continue", "probe") and looks_full_solution:
+        out.append("solved_when_declared_continue")   # solved it while claiming to only nudge
+    if policy == "exam" and looks_full_solution:
+        out.append("revealed_full_solution_in_exam")
     return out
