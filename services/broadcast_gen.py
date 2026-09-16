@@ -62,7 +62,8 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
 
 _CASE_SHAPE = (
-    '{"options":[{'
+    '{"focus":"a short, correctly-spelled, presentable 2-4 word label naming the REAL brand or sector this targets (extract the actual company, FIX typos, Title Case; e.g. bluestone jhwellery -> BlueStone Jewellery). NEVER echo the user phrasing verbatim.",'
+    '"options":[{'
     '"title":"short candidate-facing title (no real brand name unless generic)",'
     '"type":"profitability|market_sizing|growth",'
     '"difficulty":"easy|medium|hard",'
@@ -76,7 +77,8 @@ _CASE_SHAPE = (
 )
 
 _GUESS_SHAPE = (
-    '{"options":[{'
+    '{"focus":"a short, correctly-spelled, presentable 2-4 word label naming the REAL brand or sector this targets (extract the actual company, FIX typos, Title Case; e.g. bluestone jhwellery -> BlueStone Jewellery). NEVER echo the user phrasing verbatim.",'
+    '"options":[{'
     '"title":"short estimation question",'
     '"difficulty":"easy|medium|hard",'
     '"hook":"ONE line (<=90 chars) that makes an aspirant want to try it; concrete, no hype",'
@@ -168,6 +170,10 @@ def generate_options(topic: str, kind: str, difficulty: str, count: int = 3) -> 
 
     if not out:
         raise ValueError("The model returned options in the wrong shape; try again.")
+    focus = _clean(data.get("focus"))
+    if focus:
+        for _o in out:
+            _o["focus"] = focus
     return out
 
 
