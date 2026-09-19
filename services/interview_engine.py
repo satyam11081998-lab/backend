@@ -1,9 +1,9 @@
 """
 Interview Engine — runs one interviewer turn against OpenAI.
 
-Implements the MECE Transcript-Grounded Control Layer (v0.5).
+Implements the MECE Transcript-Grounded Control Layer (v0.51).
 Pipeline: Signals -> Contextual Assessor (if needed) -> Gate -> Modality -> Generate -> Safely Emit.
-Eliminates blank bubbles by managing a CONVERSATIONAL_PRESENCE gate explicitly.
+HARD RULE APPLIED: Zero blank responses. All turns yield conversational presence.
 """
 
 import os
@@ -109,16 +109,8 @@ def stream_interviewer_reply(
             context_state = assess_context_with_llm(tlist, new_user_message, case_content)
             signals.update(context_state)
             
-        intervene, mode, reason = evaluate_intervention_gate(signals)
-        
-        # True Silence (only triggers on rapid fragments or immediately following an ack)
-        if mode == "NO_INTERVENTION":
-            if control_out is not None:
-                control_out["tag"] = {"mode": "NO_INTERVENTION", "intervention": "silence"}
-                control_out["mode"] = "NO_INTERVENTION"
-                control_out["reason"] = reason
-            yield ""
-            return
+        # Intervention gate no longer returns a boolean, it always assigns a mode
+        _, mode, reason = evaluate_intervention_gate(signals)
             
         allow_questions = ALLOW_QUESTIONS.get(mode, False)
         instruction = get_modality_instruction(mode, policy, new_user_message, signals)
@@ -254,14 +246,7 @@ def complete_interviewer_reply(
             context_state = assess_context_with_llm(transcript, new_user_message, case_content)
             signals.update(context_state)
             
-        intervene, mode, reason = evaluate_intervention_gate(signals)
-        
-        if mode == "NO_INTERVENTION":
-            if control_out is not None:
-                control_out["tag"] = {"mode": "NO_INTERVENTION", "intervention": "silence"}
-                control_out["mode"] = "NO_INTERVENTION"
-                control_out["reason"] = reason
-            return ""
+        _, mode, reason = evaluate_intervention_gate(signals)
             
         allow_questions = ALLOW_QUESTIONS.get(mode, False)
         instruction = get_modality_instruction(mode, policy, new_user_message, signals)
