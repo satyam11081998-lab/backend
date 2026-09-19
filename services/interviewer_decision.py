@@ -1,6 +1,6 @@
 """
 Control-tag parsing, streaming strip, Contextual Assessor, and Intervention Gate.
-Implements the v0.4 MECE pipeline separation.
+Implements the v0.5 MECE architecture separating Substantive Gates from Conversational Presence.
 """
 from __future__ import annotations
 
@@ -106,13 +106,20 @@ Output ONLY a JSON object with these exact keys and values from the enums below:
 """
 
 def assess_context_with_llm(transcript: list, new_message: str, case_content: str) -> Dict[str, Any]:
-    """Invoked only when deterministic signals classify the turn as ambiguous."""
     cli = openai_client()
     if not cli:
         return {}
         
-    history = "\n".join([f"{t.get('role', 'user').upper()}: {t.get('content', '')}" for t in transcript[-4:]])
-    user_prompt = f"CASE CONTEXT: {case_content[:500]}...\n\nRECENT TRANSCRIPT:\n{history}\n\nCANDIDATE CURRENT TURN:\n{new_message}"
+    history_lines = []
+    for t in transcript[-4:]:
+        role = t.get('role', 'user')
+        content = t.get('content', '')
+        if content:
+            history_lines.append(f"{role.upper()}: {content}")
+    history = "\n".join(history_lines)
+    
+    case_ctx = (case_content or "")[:500]
+    user_prompt = f"CASE CONTEXT: {case_ctx}...\n\nRECENT TRANSCRIPT:\n{history}\n\nCANDIDATE CURRENT TURN:\n{new_message}"
     
     try:
         resp = cli.chat.completions.create(
@@ -135,16 +142,15 @@ def assess_context_with_llm(transcript: list, new_message: str, case_content: st
 def evaluate_intervention_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
     """
     Returns (intervention_required, recommended_modality, reason).
-    Optimizes for NO_INTERVENTION when candidate is processing effectively.
+    Splits decision into Substantive Needs vs. Conversational Presence.
     """
     if not signals:
         return True, "PROBE", "no_signals"
 
-    # 1. Deterministic Overrides (Explicit Requests & Boundaries)
-    if signals.get("is_session_open"):
-        return True, "OPEN", "session_start"
-    if signals.get("is_session_close"):
-        return True, "CLOSE", "session_end"
+    # --- STAGE 1: SUBSTANTIVE INTERVENTION GATE ---
+    
+    if signals.get("is_session_open"): return True, "OPEN", "session_start"
+    if signals.get("is_session_close"): return True, "CLOSE", "session_end"
     if signals.get("wants_to_advance") or signals.get("intent") == "wants_to_stop":
         return True, "TRANSITION", "candidate_transition"
         
@@ -152,47 +158,47 @@ def evaluate_intervention_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]
         return True, "DELIVER_SOLUTION", "solution_requested"
     if signals.get("help_requested") or signals.get("intent") == "asking_for_help":
         return True, "HINT", "help_requested"
-    if signals.get("looks_garbage"):
-        return True, "NOISE", "noise"
-    if signals.get("is_meta") or signals.get("intent") == "meta":
-        return True, "DEFLECT_META", "meta"
+    if signals.get("looks_garbage"): return True, "NOISE", "noise"
+    if signals.get("is_meta") or signals.get("intent") == "meta": return True, "DEFLECT_META", "meta"
 
-    # 2. Material Errors & Frustration
     if signals.get("error_materiality") == "material" or signals.get("materiality") in ["material", "critical"]:
         return True, "CORRECT_MATERIAL", "material_error"
-    if signals.get("states_final_estimate"):
-        return True, "RETHINK_CUE", "final_estimate_check"
-    if signals.get("confident_unsupported_claim"):
-        return True, "RETHINK_CUE", "unsupported_claim"
+    if signals.get("states_final_estimate") or signals.get("confident_unsupported_claim"):
+        return True, "RETHINK_CUE", "check_suspicious_claim"
     if signals.get("frustration_explicit") or signals.get("progress") in ["stuck", "repeatedly_stuck"]:
         return True, "REPAIR", "frustration_or_stuck"
 
-    # 3. Valid Progress (Gate Shuts -> NO_INTERVENTION)
-    if signals.get("candidate_working") or signals.get("candidate_mid_thought") or signals.get("wants_space"):
-        return False, "NO_INTERVENTION", "candidate_thinking"
-    
-    # Let valid hypotheses continue unless they explicitly need data
-    if signals.get("intent") == "hypothesis":
-        if signals.get("asks_owned_fact") or signals.get("is_scope_question") or signals.get("intent") == "clarification":
-            return True, "DATA_REVEAL", "hypothesis_needs_data"
-        if signals.get("progress") == "progressing":
-            return False, "NO_INTERVENTION", "hypothesis_valid"
-
-    if signals.get("progress") in ["progressing", "recovering", "completed_step"]:
-        return False, "NO_INTERVENTION", "productive_reasoning"
-        
-    if signals.get("has_work") and signals.get("error_materiality") != "material":
-        # Intermediate math, reasonable assumptions, structure layouts
-        return False, "NO_INTERVENTION", "intermediate_work"
-
-    # 4. Clarifications / Data Needs
     if signals.get("why_this_question") or signals.get("product_ux_question") or signals.get("intent") == "clarification":
         return True, "ANSWER_DIRECT", "clarification"
     if signals.get("asks_owned_fact") or signals.get("is_scope_question"):
         return True, "DATA_REVEAL", "fact_requested"
 
-    # 5. Default Fallback
-    return True, "TARGETED_PROBE", "fallback_probe"
+    if signals.get("intent") == "hypothesis":
+        if signals.get("progress") != "progressing":
+            return True, "DATA_REVEAL", "hypothesis_needs_data"
+            
+    # --- STAGE 2: CONVERSATIONAL PRESENCE GATE ---
+    # Candidate is progressing normally. Substantive intervention is NOT needed.
+    # Determine if a conversational beat is appropriate or if we should stay truly silent.
+    
+    is_fragment = signals.get("is_fragment", False)
+    just_acknowledged = signals.get("last_turn_was_short_ack", False)
+    
+    # 1. True Silence (NO_INTERVENTION)
+    # If the candidate sends rapid fragments, or we just gave a short beat, stay out of the way.
+    if is_fragment or just_acknowledged:
+        return False, "NO_INTERVENTION", "fragment_or_recently_acknowledged"
+    if signals.get("candidate_working") or signals.get("wants_space"):
+        return False, "NO_INTERVENTION", "candidate_needs_space"
+        
+    # 2. Validation / Returning Floor (HAND_BACK)
+    # If candidate pauses expectantly or hedges, explicitly hand the floor back.
+    if signals.get("hedged_self_estimate") or "?" in signals.get("new_message_norm", ""):
+        return True, "HAND_BACK", "return_floor_explicitly"
+        
+    # 3. Active Listening (LISTENING_BEAT)
+    # Default for a solid block of reasoning that doesn't need correction.
+    return True, "LISTENING_BEAT", "conversational_presence"
 
 
 # --- state update + guardrail telemetry --------------------------------------
@@ -324,6 +330,7 @@ _SOLICIT_RE = re.compile(
 _MODE_FALLBACK = {
     "CLOSE": "Good — that's a reasonable place to close the case.",
     "HAND_BACK": "Go ahead.",
+    "LISTENING_BEAT": "Got it.",
     "DELIVER_SOLUTION": "In short: work the cost side first, then tie it back to the profit impact.",
     "DATA_REVEAL": "The data confirms that.",
     "CORRECT_MATERIAL": "Check the denominator.",
