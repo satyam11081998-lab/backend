@@ -1,15 +1,6 @@
 """
-Deterministic session signals for the adaptive interviewer (Phase 1).
-
-Pure Python. NO model call, NO API key (so it is unit-testable in isolation).
-Reads the transcript + the new candidate message and produces:
-  (a) a machine dict of signals, and
-  (b) a compact human-readable block injected into the interviewer prompt.
-
-These are SIGNALS, not scripted responses. We never map a phrase to a reply
-(that is the brittle approach the redesign rejects). We tell the model what
-situation it is in -- stuck vs progressing, asked-for-help vs answering,
-frustrated vs calm, looping vs fresh -- and the model chooses the move.
+Deterministic session signals for the adaptive interviewer.
+Separates explicit intents from ambiguous domain activity to route safely to the gate.
 """
 from __future__ import annotations
 
@@ -17,7 +8,6 @@ import re
 import difflib
 from typing import Any, Dict, Iterable, List
 
-# --- keyword families (lowercased substring match) ---------------------------
 _HELP = (
     "help", "hint", "i am stuck", "i'm stuck", "im stuck", " stuck",
     "not getting", "not able to", "unable to", "don't get", "dont get",
@@ -34,6 +24,9 @@ _SOLUTION = (
     "correct approach", "the correct approach", "solve it for me",
     "solve this for me", "what is the correct", "show the correct",
     "show me how", "what is the answer you", "you tell me first",
+    "give me the final", "tell me the final", "just the final answer",
+    "the final answer now", "what's the final answer", "whats the final answer",
+    "give me the answer", "just give me the",
 )
 _SKIP_STOP = (
     "leave it", "skip", "move on", "next question", "forget it",
@@ -64,7 +57,6 @@ _INTERROGATIVE = (
 _GREETING = ("hi", "hii", "hello", "hey", "ok", "okay", "start", "let's start",
              "lets start", "so", "good morning", "good evening", "yo")
 
-# --- mode-selector families (deterministic; drive services/interviewer_mode) ---
 _MID_THOUGHT = (
     "let me think", "let me redo", "let me recompute", "let me recalculate",
     "no wait", "wait no", "hold on", "give me a sec", "give me a second",
@@ -95,7 +87,9 @@ _OWNED_FACT = (
 )
 _CONFIDENT = (
     "obviously", "definitely", "everyone in", "everyone buys", "always",
-    "100%", "hundred percent", "surely", "no doubt", "clearly it", "must be 100",
+    "100%", "hundred percent", "surely", "no doubt", "clearly", "must be 100",
+    "almost everyone", "nearly everyone", "basically everyone", "everyone uses",
+    "everyone drives", "everyone has", "literally everyone",
 )
 _RECOVERY = (
     "oh right", "ohh", "oh i see", "i see so", "i see, so", "got it, so",
@@ -111,11 +105,6 @@ _RECOMMEND = (
     "i recommend", "overall i'd", "overall i would", "so overall i", "in summary",
     "to summarize", "to sum up", "my final recommendation", "overall my",
 )
-_POST_CLOSE = (
-    "how did i do", "how'd i do", "any tips", "any feedback", "how was i",
-    "what's my score", "whats my score", "how did that go", "any advice",
-    "any pointers",
-)
 _FINAL_ESTIMATE = (
     "final answer", "final number", "so my answer", "my answer is",
     "thats my number", "that's my number", "final figure",
@@ -123,6 +112,20 @@ _FINAL_ESTIMATE = (
 _PLANNING = (
     "i need to think about", "let me first", "i'll start with", "step one",
     "i need to figure out how many",
+)
+_WORK_MARKERS = (
+    "i'll ", "i'd ", "i will ", "let me ", "i want to", "i'm going to", "im going to",
+    "instead of", "rather than", "i'll go", "i'll use", "i'll take", "i'll split",
+    "i'll size", "i would", "i'd go", "i'd start",
+)
+_HEDGE = (
+    "maybe", "i think", "not sure", "not fully sure", "not totally", "feels about",
+    "feels right", "seems okay", "seems right", "i'd guess", "around", "roughly",
+    "probably", "kind of", "sort of", "somewhere near", "ish",
+)
+_KICKOFF = (
+    "start", "begin", "let's go", "lets go", "let's do this", "lets do this",
+    "ready", "shall we", "kick off", "kickoff", "go ahead",
 )
 
 
@@ -135,18 +138,19 @@ def _has_any(text: str, needles) -> bool:
 
 
 def _looks_garbage(text: str) -> bool:
-    """Keyboard mash / ASR noise: letters but no real word structure."""
     t = (text or "").strip()
     if not t:
         return True
-    if re.search(r"(.)\1{4,}", t):            # "bhhhhhh", "kloooool"
+    if re.search(r"(.)\1{4,}", t):
         return True
     letters = re.sub(r"[^a-zA-Z]", "", t)
     if len(letters) >= 6:
         vowels = len(re.findall(r"[aeiou]", letters.lower()))
-        if vowels / max(1, len(letters)) < 0.12:   # almost no vowels -> mash
+        if vowels / max(1, len(letters)) < 0.12:
             return True
-    if len(letters) >= 10 and len(set(letters.lower())) <= 5:   # "yibuybuyb..." — few unique letters
+    if len(letters) >= 10 and len(set(letters.lower())) <= 5:
+        return True
+    if " " not in t and len(letters) >= 8 and re.search(r"[bcdfghjklmnpqrstvwxz]{5,}", letters.lower()):
         return True
     return False
 
@@ -160,7 +164,6 @@ def _similar(a: str, b: str) -> bool:
 
 
 def detect_intent(text: str) -> Dict[str, Any]:
-    """Primary intent + flags for ONE candidate message. Signals, not scripts."""
     t = _norm(text)
     flags = {
         "help_requested": _has_any(t, _HELP),
@@ -175,7 +178,7 @@ def detect_intent(text: str) -> Dict[str, Any]:
     if flags["is_meta"]:
         primary = "meta"
     elif flags["solution_requested"]:
-        primary = "wants_solution"
+        primary = "asking_for_solution"
     elif flags["skip_or_stop"]:
         primary = "wants_to_stop"
     elif flags["help_requested"]:
@@ -183,7 +186,7 @@ def detect_intent(text: str) -> Dict[str, Any]:
     elif flags["is_greeting_only"]:
         primary = "greeting"
     elif flags["is_question"]:
-        primary = "scope_question"
+        primary = "clarification"
     else:
         primary = "answering"
     flags["intent"] = primary
@@ -209,9 +212,6 @@ def _stuckish(turn_norm: str) -> bool:
 
 
 def _error_materiality(t: str) -> str:
-    """Conservative error sizing. 'material' only for clear high-impact mistakes,
-    'trivial' for small hedged arithmetic, else 'none'. Doctrine: err toward silence
-    so we don't nitpick (a false 'material' interrogates a fine candidate)."""
     unit_scale = ("ml" in t) and ("litre" in t or "liter" in t)
     double_count = (("add" in t and "whole" in t and "population" in t)
                     or "add all of them" in t or "add them all" in t)
@@ -224,7 +224,7 @@ def _error_materiality(t: str) -> str:
     hedged = _has_any(t, ("roughly", "about", "call it", "approx", "i'll round",
                           "ill round", "round to", "ballpark", "give or take"))
     if hedged:
-        return "trivial"
+        return "minor"
     return "none"
 
 
@@ -236,7 +236,8 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     new_norm = _norm(new_user_message)
     intent = detect_intent(new_user_message)
 
-    has_work = any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
+    has_work = (any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
+                or _has_any(new_norm, _WORK_MARKERS))
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
@@ -262,7 +263,6 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     repair_due = (recent_probes >= 2 and (intent["help_requested"] or tw >= 2
                   or candidate_repeating or interviewer_repeating)) or frustration == "high"
 
-    # --- mode-selector signals (deterministic read; feed services/interviewer_mode) ---
     ends_ellipsis = new_norm.endswith("...") or "..." in new_norm
     candidate_mid_thought = _has_any(new_norm, _MID_THOUGHT) or ends_ellipsis
     wants_space = _has_any(new_norm, _WANTS_SPACE)
@@ -272,9 +272,16 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
                          and not intent["solution_requested"])
     product_ux_question = _has_any(new_norm, _PRODUCT_UX)
     why_this_question = _has_any(new_norm, _WHY_THIS)
-    asks_owned_fact = intent["is_question"] and _has_any(new_norm, _OWNED_FACT)
+    
+    # Needs explicit grammatical question to trigger data reveal, preventing intent conflation
+    asks_owned_fact = intent["is_question"] and _has_any(new_norm, _OWNED_FACT) and not intent["help_requested"]
 
-    is_session_open = (intent["intent"] == "greeting") or (len(asst) == 0 and len(cand) == 0)
+    is_session_open = (
+        (intent["intent"] == "greeting")
+        or (len(asst) == 0 and len(cand) == 0)
+        or (len(cand) == 0 and len(new_norm) <= 24 and _has_any(new_norm, _KICKOFF)
+            and not intent["is_question"] and not intent["solution_requested"]
+            and not intent["help_requested"]))
     is_final_recommendation = _has_any(new_norm, _RECOMMEND)
     is_post_close = _has_any(new_norm, _POST_CLOSE)
     wants_to_end = _has_any(new_norm, _END_SESSION) and not wants_to_advance
@@ -284,7 +291,11 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     has_number = bool(re.search(r"\d", new_norm))
     defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
     confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
+    
+    # Must explicitly state finality to trigger sanity check, sparing intermediate calculations
     states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
+    
+    hedged_self_estimate = has_number and _has_any(new_norm, _HEDGE)
     just_recovered = _has_any(new_norm, _RECOVERY) and len(asst) >= 1
     error_materiality = _error_materiality(new_norm)
 
@@ -298,7 +309,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "solution_requested": intent["solution_requested"],
         "skip_or_stop": intent["skip_or_stop"],
         "is_meta": intent["is_meta"],
-        "is_scope_question": intent["intent"] == "scope_question",
+        "is_scope_question": intent["intent"] == "clarification",
         "looks_garbage": intent["looks_garbage"],
         "has_work": has_work,
         "recent_probes": recent_probes,
@@ -309,7 +320,6 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "frustration_explicit": intent["frustration"],
         "repair_due": repair_due,
         "candidate_turn_count": len(cand) + 1,
-        # --- mode-selector signals ---
         "is_session_open": is_session_open,
         "is_session_close": is_session_close,
         "candidate_mid_thought": candidate_mid_thought,
@@ -321,37 +331,45 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "asks_owned_fact": asks_owned_fact,
         "confident_unsupported_claim": confident_unsupported_claim,
         "states_final_estimate": states_final_estimate,
+        "hedged_self_estimate": hedged_self_estimate,
         "just_recovered": just_recovered,
         "error_materiality": error_materiality,
     }
 
+def needs_contextual_assessment(sig: Dict[str, Any]) -> bool:
+    """Determines if the deterministic layer lacks confidence for an active domain turn."""
+    # Obvious deterministic overrides that bypass assessor
+    if sig.get("help_requested") or sig.get("solution_requested"):
+        return False
+    if sig.get("is_meta") or sig.get("looks_garbage") or sig.get("is_session_open") or sig.get("is_session_close"):
+        return False
+    if sig.get("error_materiality") == "material":
+        return False
+    
+    # Active reasoning/analysis turns require contextual assessment (e.g., hypotheses, math)
+    if sig.get("has_work") or sig.get("asks_owned_fact") or sig.get("candidate_working"):
+        return True
+        
+    return False
 
 def build_signal_block(signals: Dict[str, Any]) -> str:
-    lines = [f"- intent this turn: {signals['intent']}"]
-    lines.append("- learner has real work on the table already" if signals["has_work"]
-                 else "- learner has put little/nothing concrete down yet")
-    if signals["repair_due"]:
-        lines.append("- YOUR RECENT MOVES ARE NOT WORKING -> repair is due: stop probing, change "
-                     "strategy (reframe / simple analogy / a partial step), restore momentum")
-    if signals["turns_without_progress"] >= 2:
-        lines.append(f"- stuck for {signals['turns_without_progress']} turns with no progress")
-    if signals["frustration"] != "none":
-        lines.append(f"- frustration: {signals['frustration']} -> change what you DO; never say "
-                     "'I understand your frustration'")
-    if signals["interviewer_repeating"]:
-        lines.append("- you have repeated yourself -> do NOT reuse a previous line; find a fresh move")
-    if signals["candidate_repeating"]:
-        lines.append("- learner is repeating themselves -> your last move did not land; try a different tack")
-    if signals["is_scope_question"]:
-        lines.append("- scope/fact question -> answer with a specific number, own the facts")
-    if signals["looks_garbage"]:
-        lines.append("- last message looks like noise/typo -> ask them to restate briefly; do not analyse it")
-    if signals.get("hint_level", 0) > 0:
-        lines.append(f"- current hint rung already given: H{signals['hint_level']} -> escalate ONLY on "
-                     "repeated stuckness or an explicit ask; step DOWN a rung when they regain momentum")
-    if signals.get("learner_level", "unknown") not in ("unknown", None):
-        lines.append(f"- learner looks {signals['learner_level']} so far -> calibrate challenge vs scaffolding to that")
-    block = ("SESSION SIGNALS (deterministic read of the learner right now; use them, never quote them):\n"
+    lines = [f"- intent this turn: {signals.get('intent', 'unknown')}"]
+    lines.append(f"- case phase: {signals.get('case_phase', 'unknown')}")
+    lines.append(f"- progress status: {signals.get('progress', 'unknown')}")
+    
+    lines.append("- learner has real work on the table already" if signals.get("has_work") else "- learner has put little/nothing concrete down yet")
+    if signals.get("repair_due"):
+        lines.append("- YOUR RECENT MOVES ARE NOT WORKING -> repair is due: stop probing, change strategy.")
+    if signals.get("turns_without_progress", 0) >= 2:
+        lines.append(f"- stuck for {signals['turns_without_progress']} turns with no progress.")
+    if signals.get("frustration", "none") != "none":
+        lines.append(f"- frustration: {signals['frustration']} -> change what you DO.")
+    if signals.get("interviewer_repeating"):
+        lines.append("- you have repeated yourself -> do NOT reuse a previous line; find a fresh move.")
+    if signals.get("looks_garbage"):
+        lines.append("- last message looks like noise/typo -> ask them to restate briefly.")
+    
+    block = ("SESSION SIGNALS (contextual read of the learner right now; use them, never quote them):\n"
              + "\n".join(lines))
-    block += f"\nTEACHING POLICY: {signals['teaching_policy']}"
+    block += f"\nTEACHING POLICY: {signals.get('teaching_policy', 'coached')}"
     return block
