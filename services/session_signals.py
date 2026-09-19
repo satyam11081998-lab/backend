@@ -1,6 +1,6 @@
 """
 Deterministic session signals for the adaptive interviewer.
-Separates explicit intents from ambiguous domain activity to route safely to the gate.
+Extracts intents, domain activity, and conversational rhythm markers (fragments, history).
 """
 from __future__ import annotations
 
@@ -229,7 +229,7 @@ def _error_materiality(t: str) -> str:
     hedged = _has_any(t, ("roughly", "about", "call it", "approx", "i'll round",
                           "ill round", "round to", "ballpark", "give or take"))
     if hedged:
-        return "minor"
+        return "trivial"
     return "none"
 
 
@@ -246,6 +246,16 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
+
+    # Conversational Rhythm Tracking
+    recent_assistant_turns = asst[-3:] if len(asst) > 0 else []
+    last_turn_was_short_ack = False
+    if len(asst) > 0:
+        last_turn = asst[-1]
+        last_turn_was_short_ack = len(last_turn.split()) <= 6 and not "?" in last_turn
+
+    # Fragment Detection (e.g. candidate just says "0.46 billion" or "yes")
+    is_fragment = len(new_norm.split()) <= 4 and not "?" in new_norm
 
     tw = 0
     for c in reversed(cand + [new_norm]):
@@ -278,7 +288,6 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     product_ux_question = _has_any(new_norm, _PRODUCT_UX)
     why_this_question = _has_any(new_norm, _WHY_THIS)
     
-    # Needs explicit grammatical question to trigger data reveal, preventing intent conflation
     asks_owned_fact = intent["is_question"] and _has_any(new_norm, _OWNED_FACT) and not intent["help_requested"]
 
     is_session_open = (
@@ -297,7 +306,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
     confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
     
-    # Must explicitly state finality to trigger sanity check, sparing intermediate calculations
+    # Needs explicit finality to trigger sanity check, sparing intermediate calculations
     states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
     
     hedged_self_estimate = has_number and _has_any(new_norm, _HEDGE)
@@ -320,6 +329,9 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "recent_probes": recent_probes,
         "interviewer_repeating": interviewer_repeating,
         "candidate_repeating": candidate_repeating,
+        "recent_assistant_turns": recent_assistant_turns,
+        "last_turn_was_short_ack": last_turn_was_short_ack,
+        "is_fragment": is_fragment,
         "turns_without_progress": tw,
         "frustration": frustration,
         "frustration_explicit": intent["frustration"],
@@ -339,11 +351,10 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "hedged_self_estimate": hedged_self_estimate,
         "just_recovered": just_recovered,
         "error_materiality": error_materiality,
+        "new_message_norm": new_norm
     }
 
 def needs_contextual_assessment(sig: Dict[str, Any]) -> bool:
-    """Determines if the deterministic layer lacks confidence for an active domain turn."""
-    # Obvious deterministic overrides that bypass assessor
     if sig.get("help_requested") or sig.get("solution_requested"):
         return False
     if sig.get("is_meta") or sig.get("looks_garbage") or sig.get("is_session_open") or sig.get("is_session_close"):
@@ -351,7 +362,6 @@ def needs_contextual_assessment(sig: Dict[str, Any]) -> bool:
     if sig.get("error_materiality") == "material":
         return False
     
-    # Active reasoning/analysis turns require contextual assessment (e.g., hypotheses, math)
     if sig.get("has_work") or sig.get("asks_owned_fact") or sig.get("candidate_working"):
         return True
         
