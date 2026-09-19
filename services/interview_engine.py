@@ -1,9 +1,8 @@
 """
 Interview Engine — runs one interviewer turn against OpenAI.
 
-Used by /attempts/{id}/messages to generate the assistant's live reply
-when a candidate sends a new message. Streaming-capable: callers can
-iterate over `stream_interviewer_reply(...)` to forward tokens via SSE.
+Implements the MECE Transcript-Grounded Control Layer (v0.4).
+Pipeline: Signals -> Contextual Assessor (if needed) -> Gate -> Modality -> Generate -> Safely Emit.
 """
 
 import os
@@ -22,10 +21,11 @@ from prompts.interview_prompts import (
     build_conversation_scoring_user_prompt,
 )
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
-from services.session_signals import compute_signals, build_signal_block
-from services.interviewer_mode import select_mode, build_mode_block
+from services.session_signals import compute_signals, needs_contextual_assessment, build_signal_block
+from services.interviewer_mode import get_modality_instruction, ALLOW_QUESTIONS, build_mode_block
 from services.interviewer_decision import (
-    StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode,
+    StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode, 
+    assess_context_with_llm, evaluate_intervention_gate
 )
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 
@@ -37,29 +37,10 @@ if not _OPENAI_API_KEY:
 
 _client = OpenAI(api_key=_OPENAI_API_KEY)
 
-# Mini is fine for the interviewer — replies are 1-3 sentences and the
-# heavy lifting (final scoring) still uses gpt-4o.
 INTERVIEWER_MODEL = "gpt-4o-mini"
 SCORING_MODEL = "gpt-4o"
 
-# The interviewer's provider (Groq Llama vs OpenAI gpt-4o-mini) is chosen by the
-# admin toggle via services/ai_providers.resolve_llm("interviewer"). Groq is
-# cheaper + faster; on any Groq error we fall back to OpenAI so the interviewer
-# never goes silent. SCORING stays on OpenAI gpt-4o (locked, quality-critical).
-
-# Live-turn sampling. Was 0.4, which — combined with a prompt that literally
-# contained the words "say 'Let's assume X'" — made the interviewer open EVERY
-# reply with that exact phrase. A whole 7-question transcript read as one
-# sentence repeated with different nouns. 0.75 buys phrasing variety without
-# loosening the behavioural rules (those live in the system prompt, and the
-# 1-3 sentence cap plus max_tokens still bound the reply).
-# Scoring deliberately stays at its own low temperature — do NOT reuse this.
 INTERVIEWER_TEMPERATURE = 0.75
-
-# Repetition pressure at the sampler level, belt-and-braces with the prompt's
-# "never open two consecutive replies the same way" rule. Small values only:
-# these penalise token reuse, and the interviewer legitimately needs to repeat
-# domain nouns (revenue, market, segment) turn after turn.
 INTERVIEWER_FREQUENCY_PENALTY = 0.35
 INTERVIEWER_PRESENCE_PENALTY = 0.25
 
@@ -68,59 +49,34 @@ class InterviewEngineError(Exception):
     pass
 
 
-# --- Adaptive interviewer (Phase 1) ------------------------------------------
-# Behind ADAPTIVE_INTERVIEWER: when on, each turn is built from the adaptive v2
-# prompt + a deterministic SESSION SIGNALS block and the model's control tag is
-# stripped. Off (default) = the v1 behaviour, byte-for-byte. Read at call time so
-# the flag can flip without a code change.
-
 def _adaptive_enabled() -> bool:
     return os.getenv("ADAPTIVE_INTERVIEWER", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _teaching_policy(explicit=None) -> str:
-    """Per-case policy wins; else env; else coached."""
     p = (explicit or os.getenv("INTERVIEWER_TEACHING_POLICY", "coached") or "").strip().lower()
     return p if p in ("exam", "coached") else "coached"
 
 
 def _resolve_adaptive_llm():
-    """Pin the ADAPTIVE interviewer to ONE model so the same prompt stops producing
-    two opposite personas (the Groq vs gpt-4o-mini split that made the interviewer a
-    harsh refuser for some users and a sycophant for others). Always OpenAI for
-    consistency; model via INTERVIEWER_ADAPTIVE_MODEL (default gpt-4o-mini). The v1
-    path still honours the admin provider toggle unchanged."""
     model = (os.getenv("INTERVIEWER_ADAPTIVE_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
     return openai_client() or _client, model, "openai"
 
 
-def _build_messages(case_content, case_type, transcript, new_user_message,
-                    clarifications_exhausted, teaching_policy=None, prior_state=None):
-    """v2 adaptive messages when the flag is on; the v1 messages (unchanged) otherwise."""
-    if _adaptive_enabled():
-        tlist = list(transcript)  # materialise: used twice (signals + messages)
-        policy = _teaching_policy(teaching_policy)
-        signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
-        mode, instruction, q_budget = select_mode(signals, policy, new_user_message)
-        outcome = evaluate_intervention_outcome(prior_state, signals)
-        block = (build_signal_block(signals)
-                 + "\n\n" + build_mode_block(mode, instruction, q_budget)
-                 + "\n\n" + build_learning_block(
-                     (prior_state or {}).get("profile"), signals, outcome))
-        return build_adaptive_interviewer_messages(
-            case_content=case_content,
-            case_type=case_type,
-            transcript=tlist,
-            new_user_message=new_user_message,
-            teaching_policy=policy,
-            signals_block=block,
-            clarifications_exhausted=clarifications_exhausted,
-        )
-    return build_interviewer_messages(
+def _build_adaptive_messages(case_content, case_type, transcript, new_user_message,
+                             clarifications_exhausted, signals, mode, instruction, allow_questions,
+                             policy, prior_state, outcome):
+    block = (build_signal_block(signals)
+             + "\n\n" + build_mode_block(mode, instruction, allow_questions)
+             + "\n\n" + build_learning_block(
+                 (prior_state or {}).get("profile"), signals, outcome))
+    return build_adaptive_interviewer_messages(
         case_content=case_content,
         case_type=case_type,
         transcript=transcript,
         new_user_message=new_user_message,
+        teaching_policy=policy,
+        signals_block=block,
         clarifications_exhausted=clarifications_exhausted,
     )
 
@@ -140,20 +96,57 @@ def stream_interviewer_reply(
     prior_state: Optional[dict] = None,
     control_out: Optional[dict] = None,
 ) -> Generator[str, None, None]:
-    """Yield text chunks as the interviewer responds.
-
-    Intended to be wrapped in an SSE StreamingResponse. Each yielded chunk
-    is a partial string suitable for client-side concatenation.
-
-    `clarifications_exhausted` makes the interviewer decline the clarification
-    and redirect, rather than the caller returning no reply at all.
-    """
     adaptive = _adaptive_enabled()
-    messages = _build_messages(
-        case_content, case_type, transcript, new_user_message, clarifications_exhausted,
-        teaching_policy=teaching_policy, prior_state=prior_state,
-    )
-    cli, model, provider = _resolve_adaptive_llm() if adaptive else resolve_llm("interviewer")
+    
+    if adaptive:
+        tlist = list(transcript)
+        policy = _teaching_policy(teaching_policy)
+        
+        # 1. State Estimation (Deterministic)
+        signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
+        
+        # 2. Ambiguity Routing (Contextual Assessor)
+        if needs_contextual_assessment(signals):
+            context_state = assess_context_with_llm(tlist, new_user_message, case_content)
+            signals.update(context_state)
+            
+        # 3. Intervention Gate
+        intervene, mode, reason = evaluate_intervention_gate(signals)
+        
+        if not intervene:
+            if control_out is not None:
+                control_out["tag"] = {"mode": "NO_INTERVENTION", "intervention": "silence"}
+                control_out["mode"] = "NO_INTERVENTION"
+                control_out["reason"] = reason
+            yield ""
+            return
+            
+        # 4. Modality Router
+        allow_questions = ALLOW_QUESTIONS.get(mode, False)
+        instruction = get_modality_instruction(mode, policy, new_user_message)
+        outcome = evaluate_intervention_outcome(prior_state, signals)
+        
+        messages = _build_adaptive_messages(
+            case_content, case_type, tlist, new_user_message, clarifications_exhausted,
+            signals, mode, instruction, allow_questions, policy, prior_state, outcome
+        )
+        cli, model, provider = _resolve_adaptive_llm()
+    else:
+        messages = build_interviewer_messages(
+            case_content=case_content, case_type=case_type, transcript=transcript,
+            new_user_message=new_user_message, clarifications_exhausted=clarifications_exhausted
+        )
+        cli, model, provider = resolve_llm("interviewer")
+
+    def _complete(c, m):
+        return c.chat.completions.create(
+            model=m,
+            messages=messages,
+            temperature=INTERVIEWER_TEMPERATURE,
+            frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
+            presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
+            max_tokens=180,
+        )
 
     def _open_stream(c, m):
         return c.chat.completions.create(
@@ -162,19 +155,43 @@ def stream_interviewer_reply(
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
             presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
-            max_tokens=180,   # cap — interviewer replies must stay short
+            max_tokens=180,
             stream=True,
-            stream_options={"include_usage": True},  # final chunk carries token usage
+            stream_options={"include_usage": True},
         )
 
+    # 5. Pre-Emission Safety & Generation
+    t0 = time.time()
+    
+    if adaptive and not allow_questions:
+        # Pre-emission safety block: synchronous generation for zero-question modes
+        try:
+            resp = _complete(cli, model)
+        except Exception as e:
+            if provider != "openai":
+                cli, model = openai_client(), INTERVIEWER_MODEL
+                resp = _complete(cli, model)
+            else:
+                raise InterviewEngineError(f"OpenAI call failed: {e}")
+        
+        raw_text = (resp.choices[0].message.content or "").strip()
+        tag, clean_text = parse_control_tag(raw_text)
+        final_text = enforce_mode(clean_text, mode, allow_questions, policy)
+        
+        if control_out is not None:
+            control_out["tag"] = tag or {}
+            control_out["mode"] = mode
+            
+        yield final_text
+        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
+                     response=resp, latency_ms=int((time.time() - t0) * 1000))
+        return
+
+    # Standard Streaming (for allowed question modes or legacy)
     try:
-        t0 = time.time()
         stream = _open_stream(cli, model)
     except Exception as e:
         if provider != "openai":
-            # Non-OpenAI (Groq) failed to start the stream → fall back to OpenAI so
-            # the interviewer never goes silent because of the cheaper provider.
-            print(f"[interviewer] {provider} stream failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
             cli, model = openai_client(), INTERVIEWER_MODEL
             try:
                 stream = _open_stream(cli, model)
@@ -183,7 +200,7 @@ def stream_interviewer_reply(
         else:
             raise InterviewEngineError(f"OpenAI streaming call failed: {e}")
 
-    class _U:  # tiny shim so log_ai_usage can read .usage off a response-like object
+    class _U:
         usage = None
         id = None
 
@@ -210,6 +227,7 @@ def stream_interviewer_reply(
                 yield _out
             if control_out is not None:
                 control_out["tag"] = getattr(stripper, "tag", {}) or {}
+                control_out["mode"] = mode
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
@@ -227,14 +245,40 @@ def complete_interviewer_reply(
     prior_state: Optional[dict] = None,
     control_out: Optional[dict] = None,
 ) -> str:
-    """Non-streaming variant — used when SSE is not available."""
     adaptive = _adaptive_enabled()
-    transcript = list(transcript)   # materialise: reused for the mode recompute below
-    messages = _build_messages(
-        case_content, case_type, transcript, new_user_message, clarifications_exhausted,
-        teaching_policy=teaching_policy, prior_state=prior_state,
-    )
-    cli, model, provider = _resolve_adaptive_llm() if adaptive else resolve_llm("interviewer")
+    transcript = list(transcript)
+    
+    if adaptive:
+        policy = _teaching_policy(teaching_policy)
+        signals = compute_signals(transcript, new_user_message, policy, prior_state=prior_state)
+        
+        if needs_contextual_assessment(signals):
+            context_state = assess_context_with_llm(transcript, new_user_message, case_content)
+            signals.update(context_state)
+            
+        intervene, mode, reason = evaluate_intervention_gate(signals)
+        
+        if not intervene:
+            if control_out is not None:
+                control_out["tag"] = {"mode": "NO_INTERVENTION", "intervention": "silence"}
+                control_out["mode"] = "NO_INTERVENTION"
+            return ""
+            
+        allow_questions = ALLOW_QUESTIONS.get(mode, False)
+        instruction = get_modality_instruction(mode, policy, new_user_message)
+        outcome = evaluate_intervention_outcome(prior_state, signals)
+        
+        messages = _build_adaptive_messages(
+            case_content, case_type, transcript, new_user_message, clarifications_exhausted,
+            signals, mode, instruction, allow_questions, policy, prior_state, outcome
+        )
+        cli, model, provider = _resolve_adaptive_llm()
+    else:
+        messages = build_interviewer_messages(
+            case_content=case_content, case_type=case_type, transcript=transcript,
+            new_user_message=new_user_message, clarifications_exhausted=clarifications_exhausted
+        )
+        cli, model, provider = resolve_llm("interviewer")
 
     def _complete(c, m):
         return c.chat.completions.create(
@@ -250,20 +294,17 @@ def complete_interviewer_reply(
         resp = _complete(cli, model)
     except Exception as e:
         if provider != "openai":
-            print(f"[interviewer] {provider} failed ({e}); falling back to OpenAI {INTERVIEWER_MODEL}")
             try:
                 resp = _complete(openai_client(), INTERVIEWER_MODEL)
             except Exception as e2:
                 raise InterviewEngineError(f"OpenAI call failed: {e2}")
         else:
             raise InterviewEngineError(f"OpenAI call failed: {e}")
+            
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
-        policy = _teaching_policy(teaching_policy)
-        signals = compute_signals(transcript, new_user_message, policy, prior_state=prior_state)
-        mode, _instruction, q_budget = select_mode(signals, policy, new_user_message)
-        text = enforce_mode(text, mode, q_budget, policy)
+        text = enforce_mode(text, mode, allow_questions, policy)
         if control_out is not None:
             control_out["tag"] = tag or {}
             control_out["mode"] = mode
@@ -273,21 +314,11 @@ def complete_interviewer_reply(
 # -----------------------------------------------------------------------------
 # Final scoring (at submit)
 # -----------------------------------------------------------------------------
-# Two independent paths:
-#   case_type == 'guesstimate' -> reuse the existing 5-dim rubric + arithmetic
-#                                 backstop in services/ai_scorer.score_guesstimate_answer
-#   anything else              -> general conversation analysis (case rubric TBD)
 
 def _flatten_for_legacy_scorer(
     transcript: Iterable[Dict[str, str]],
     final_recommendation: str,
 ) -> str:
-    """Collapse the conversation + recommendation into the single answer_text
-    string that the legacy guesstimate scorer expects. The structured format
-    mirrors what a candidate would have typed into the old textarea, with the
-    interviewer's turns folded in as light prompts so segmentation reasoning
-    stays readable to the scorer.
-    """
     lines: List[str] = []
     for t in transcript:
         role = (t.get("role") or "user").upper()
@@ -295,10 +326,6 @@ def _flatten_for_legacy_scorer(
         content = (t.get("content") or "").strip()
         if not content:
             continue
-        # Voice is collapsed to text for SCORING (owner decision 2026-08-13): a
-        # spoken attempt must be judged on the same document as a typed one, or
-        # talk mode quietly becomes a different exam. image/file stay tagged —
-        # those genuinely change what the turn means (a chart was uploaded).
         display_kind = "text" if kind == "voice" else kind
         prefix = role if display_kind == "text" else f"{role} ({display_kind})"
         lines.append(f"[{prefix}] {content}")
@@ -308,15 +335,6 @@ def _flatten_for_legacy_scorer(
 
 
 def _transcript_body_text(transcript: Iterable[Dict[str, str]]) -> str:
-    """The CANDIDATE's own conversation turns only — NO final recommendation.
-
-    This is the body of work the validity gate judges. Keeping the recommendation
-    OUT means a junk/empty recommendation can never drag a genuine conversation
-    down to a gibberish/off-topic verdict and zero the whole session. The
-    interviewer's coherent prods are excluded too, so a gibberish session cannot
-    borrow the interviewer's words to look genuine. The recommendation message
-    (kind == 'recommendation') is excluded here because it is judged separately.
-    """
     parts: List[str] = []
     for t in transcript:
         if (t.get("role") or "user") != "user":
@@ -330,17 +348,11 @@ def _transcript_body_text(transcript: Iterable[Dict[str, str]]) -> str:
 
 
 def _rec_is_weak(recommendation: str) -> bool:
-    """True when the closing recommendation is empty or blatant nonsense.
-
-    Used only to (a) decide whether the recommendation may RESCUE a session whose
-    conversation body failed the gate, and (b) hint the scorer to look for the
-    recommendation elsewhere. NEVER used to cap or zero a score.
-    """
     from services.answer_validity import deterministic_verdict
     r = (recommendation or "").strip()
     if not r:
         return True
-    return deterministic_verdict(r) is not None  # deterministic gibberish only, no API cost
+    return deterministic_verdict(r) is not None
 
 
 def _score_case_conversation(
@@ -351,40 +363,23 @@ def _score_case_conversation(
     user_id: Optional[str] = None,
     case_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Evidence-based scoring for CASE sessions (not guesstimates).
-
-    Reuses the same hardening as the single-answer scorer: a validity gate
-    (gibberish/off-topic sessions score 0), then a 6-dimension evidence-based
-    rubric with per-dimension feedback / red_flags / model_answer, then
-    deterministic enforcement (clamp each dimension, recompute the total from the
-    breakdown). Returns the standard case feedback shape.
-    """
-    # Lazy imports — avoid a hard dep on ai_scorer at module load, matching the
-    # existing guesstimate branch and keeping this file unit-testable in isolation.
     from services.answer_validity import screen_answer
     from services.ai_scorer import _enforce_case, _rejection_case, _is_hard_reject
 
-    body = _transcript_body_text(transcript)          # candidate turns only, NO recommendation
+    body = _transcript_body_text(transcript)
     rec = (final_recommendation or "").strip()
-
-    # Gate on the BODY of the candidate's work — never on the recommendation alone.
-    # A genuine conversation with a junk/empty recommendation must still be scored.
     body_validity = screen_answer(case_content, case_type, body, user_id)
 
     if _is_hard_reject(body_validity):
-        # The conversation itself shows no genuine attempt. Before zeroing, give the
-        # RECOMMENDATION a chance to carry the session (someone who said little in
-        # chat but wrote a real closing recommendation). The recommendation can only
-        # RESCUE here — it can never be the reason a genuine conversation is zeroed.
         if rec and not _rec_is_weak(rec):
             rec_validity = screen_answer(case_content, case_type, rec, user_id)
             if _is_hard_reject(rec_validity):
-                return _rejection_case(case_type, body_validity)   # nothing genuine anywhere -> 0
+                return _rejection_case(case_type, body_validity)
             validity = rec_validity
         else:
-            return _rejection_case(case_type, body_validity)       # no real body, no real rec -> 0
+            return _rejection_case(case_type, body_validity)
     else:
-        validity = body_validity                                   # genuine conversation -> scored
+        validity = body_validity
 
     recommendation_missing = _rec_is_weak(rec)
 
@@ -397,9 +392,6 @@ def _score_case_conversation(
         recommendation_missing=recommendation_missing,
     )
 
-    # Silent calibration: enrich the scorer with strong prior work on THIS case, if
-    # any has been banked. Never shown to the candidate. Fails open (no exemplars ->
-    # unchanged prompt) and can never break scoring.
     try:
         from services.exemplar_bank import build_exemplar_reference_block
         ref = build_exemplar_reference_block(case_id=case_id, case_content=case_content)
@@ -407,12 +399,7 @@ def _score_case_conversation(
             user_prompt = user_prompt + "\n\n" + ref
     except Exception:
         pass
-    # Richer output now (per-dimension feedback + model answer + 3 approaches), so the
-    # token ceiling is raised from 4000 to 8000 — at 4000 the fuller JSON could
-    # truncate mid-object and fail json.loads, 500-ing the whole submission. gpt-4o
-    # supports well beyond 8000 output tokens. We also retry ONCE on a parse failure
-    # (a rare truncation/format hiccup) before giving up, so a transient blip never
-    # nukes a genuine attempt.
+
     feedback = None
     last_err = None
     for _attempt in range(2):
@@ -438,7 +425,8 @@ def _score_case_conversation(
             feedback = json.loads(raw)
             break
         except json.JSONDecodeError as e:
-            last_err = e  # retry once, then surface
+            last_err = e
+            
     if feedback is None:
         raise InterviewEngineError(f"Scorer returned invalid JSON after retry: {last_err}. Raw: {raw[:200]}")
 
@@ -449,8 +437,6 @@ def _score_case_conversation(
     if not isinstance(feedback.get("breakdown"), dict):
         raise InterviewEngineError("Scorer 'breakdown' is not an object")
 
-    # Enforce marking deterministically (clamp dims, recompute total, attach the
-    # richer fields + validity). Missing dimensions default to 0 inside _enforce_case.
     return _enforce_case(feedback, validity)
 
 
@@ -462,22 +448,8 @@ def score_conversation(
     user_id: Optional[str] = None,
     case_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Top-level scorer. Branches on case_type:
-
-    - 'guesstimate' -> hands off to the existing
-      `services.ai_scorer.score_guesstimate_answer`, feeding it a flattened
-      transcript so the 5-dim rubric + deterministic arithmetic backstop run
-      unchanged. The session conversation is treated as one long answer.
-    - any other type -> general conversation analysis (the formal case rubric
-      is being developed separately and will replace the prompt body in place).
-
-    Returns the same dict shape in both branches:
-      { score, breakdown, strengths, improvements, summary, rubric, backstop? }
-    """
     is_guesstimate = (case_type or "").lower() == "guesstimate"
     if is_guesstimate:
-        # Lazy import — avoids a hard dep on ai_scorer at module load and lets
-        # this file be unit-tested in isolation.
         from services.ai_scorer import score_guesstimate_answer, AIScoringError
         flat = _flatten_for_legacy_scorer(transcript, final_recommendation)
         try:
@@ -494,12 +466,4 @@ def score_conversation(
         case_id=case_id,
     )
 
-
-# -----------------------------------------------------------------------------
-# Clarification classifier
-# -----------------------------------------------------------------------------
-# Lives in services/clarification_counter.py — a pure string heuristic with no
-# OpenAI dependency, moved out so it can be tested without an API key (this
-# module builds a client at import time and raises without one). Re-exported
-# here so every existing importer keeps working unchanged.
 from services.clarification_counter import count_clarifications  # noqa: E402,F401
