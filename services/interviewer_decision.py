@@ -1,6 +1,7 @@
 """
 Control-tag parsing, streaming strip, Contextual Assessor, and Intervention Gate.
-Implements the v0.5 MECE architecture separating Substantive Gates from Conversational Presence.
+Implements the v0.51 MECE architecture separating Substantive Gates from Conversational Presence.
+HARD RULE APPLIED: Zero blank responses. All turns yield conversational presence.
 """
 from __future__ import annotations
 
@@ -142,7 +143,8 @@ def assess_context_with_llm(transcript: list, new_message: str, case_content: st
 def evaluate_intervention_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
     """
     Returns (intervention_required, recommended_modality, reason).
-    Splits decision into Substantive Needs vs. Conversational Presence.
+    HARD RULE APPLIED: Zero blank responses allowed. NO_INTERVENTION is removed.
+    All non-substantive turns route to a conversational presence mode.
     """
     if not signals:
         return True, "PROBE", "no_signals"
@@ -178,26 +180,16 @@ def evaluate_intervention_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]
             return True, "DATA_REVEAL", "hypothesis_needs_data"
             
     # --- STAGE 2: CONVERSATIONAL PRESENCE GATE ---
-    # Candidate is progressing normally. Substantive intervention is NOT needed.
-    # Determine if a conversational beat is appropriate or if we should stay truly silent.
+    # Hard Rule Applied: Never any blank responses.
+    # We must return LISTENING_BEAT or HAND_BACK for all remaining healthy cases.
     
-    is_fragment = signals.get("is_fragment", False)
-    just_acknowledged = signals.get("last_turn_was_short_ack", False)
-    
-    # 1. True Silence (NO_INTERVENTION)
-    # If the candidate sends rapid fragments, or we just gave a short beat, stay out of the way.
-    if is_fragment or just_acknowledged:
-        return False, "NO_INTERVENTION", "fragment_or_recently_acknowledged"
-    if signals.get("candidate_working") or signals.get("wants_space"):
-        return False, "NO_INTERVENTION", "candidate_needs_space"
-        
-    # 2. Validation / Returning Floor (HAND_BACK)
-    # If candidate pauses expectantly or hedges, explicitly hand the floor back.
     if signals.get("hedged_self_estimate") or "?" in signals.get("new_message_norm", ""):
         return True, "HAND_BACK", "return_floor_explicitly"
         
-    # 3. Active Listening (LISTENING_BEAT)
-    # Default for a solid block of reasoning that doesn't need correction.
+    if signals.get("candidate_working") or signals.get("wants_space"):
+        return True, "HAND_BACK", "candidate_needs_space"
+        
+    # Default for progressing math, valid structure, and fragmented reasoning:
     return True, "LISTENING_BEAT", "conversational_presence"
 
 
