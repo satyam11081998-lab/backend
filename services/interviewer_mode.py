@@ -1,14 +1,16 @@
 """
 Modality Router and Instruction generation.
-Implements specific boolean ALLOW_QUESTIONS to remove the Q_BUDGET interrogation incentive.
+Includes the LISTENING_BEAT modality and explicit anti-repetition guardrails.
+Maintains backward compatibility for legacy tests via Q_BUDGET and select_mode proxies.
 """
 from __future__ import annotations
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 ALLOW_QUESTIONS: Dict[str, bool] = {
     "OPEN": True,
     "CLOSE": False,
     "NO_INTERVENTION": False,
+    "LISTENING_BEAT": False,
     "HAND_BACK": False,
     "DATA_REVEAL": False,
     "TARGETED_PROBE": True,
@@ -23,18 +25,38 @@ ALLOW_QUESTIONS: Dict[str, bool] = {
     "DEFLECT_META": False,
     "NOISE": True,
     "PROBE": True,
+    # Legacy fallbacks
+    "ACK_ADVANCE": False,
+    "CHALLENGE_CLAIM": True,
+    "SANITY_CHECK": True,
+    "RELEASE": False,
 }
 
+Q_BUDGET: Dict[str, int] = {k: (1 if v else 0) for k, v in ALLOW_QUESTIONS.items()}
 
-def get_modality_instruction(mode: str, policy: str, new_message: str) -> str:
+
+def get_modality_instruction(mode: str, policy: str, new_message: str, signals: Dict[str, Any] = None) -> str:
     """Returns the explicit generation boundary for the given modality."""
+    if signals is None:
+        signals = {}
+        
+    recent_phrases = signals.get("recent_assistant_turns", [])
+    recent_str = " | ".join(recent_phrases) if recent_phrases else "none"
+
     if mode == "NO_INTERVENTION":
         return "Generate nothing. Stay silent."
         
+    if mode == "LISTENING_BEAT":
+        return (f"You are actively listening to the candidate. Output a 1-3 word conversational acknowledgement "
+                f"(e.g., 'Got it', 'Alright', 'Okay', 'Makes sense'). "
+                f"DO NOT ask a question. DO NOT summarize. "
+                f"CRITICAL: Do NOT use these exact phrases you recently used: [{recent_str}]. Stop.")
+        
     if mode == "HAND_BACK":
-        return ("Acknowledge concisely. Return cognitive ownership. "
-                "Say 'Go ahead', 'Proceed', or 'Makes sense'. "
-                "Do not summarize. Do not ask what they will do next. Stop.")
+        return (f"Acknowledge concisely and return cognitive ownership. "
+                f"Say something like 'Go ahead', 'Proceed', or 'Take it from there'. "
+                f"Do not summarize. Do not ask what they will do next. "
+                f"CRITICAL: Do NOT use these exact phrases you recently used: [{recent_str}]. Stop.")
                 
     if mode == "DATA_REVEAL":
         return ("Provide ONLY the specific case data required to test their hypothesis or answer their fact request. "
@@ -43,7 +65,7 @@ def get_modality_instruction(mode: str, policy: str, new_message: str) -> str:
     if mode == "TARGETED_PROBE":
         return ("Drill into a specific missing branch or driver in their structure. "
                 "Ask ONE narrowly targeted question (e.g., 'What about the supply side?'). "
-                "Do not ask generic questions like 'What else?'.")
+                "Do not ask generic questions like 'What else?' or 'Why?'.")
                 
     if mode == "RETHINK_CUE":
         return ("Trigger self-correction on a suspicious estimate. "
@@ -87,7 +109,6 @@ def get_modality_instruction(mode: str, policy: str, new_message: str) -> str:
     if mode == "NOISE":
         return "The message is garbled. Ask them to restate it briefly."
         
-    # Default fallback
     return "Ask ONE advancing question that deepens the case. Push for structure or specifics."
 
 
@@ -96,3 +117,15 @@ def build_mode_block(mode: str, instruction: str, allow_questions: bool) -> str:
     return (f"YOUR MOVE THIS TURN: {mode}\n"
             f"QUESTIONS ALLOWED: {q_str}\n"
             f"{instruction}")
+
+
+# -----------------------------------------------------------------------------
+# LEGACY COMPATIBILITY
+# -----------------------------------------------------------------------------
+def select_mode(sig: Dict[str, Any], policy: str = "coached",
+                new_message: str = "") -> Tuple[str, str, int]:
+    from services.interviewer_decision import evaluate_intervention_gate
+    _intervene, mode, _reason = evaluate_intervention_gate(sig)
+    instruction = get_modality_instruction(mode, policy, new_message, sig)
+    budget = Q_BUDGET.get(mode, 1)
+    return mode, instruction, budget
