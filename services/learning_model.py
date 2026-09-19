@@ -160,7 +160,6 @@ def build_learning_block(profile: Optional[dict], signals: Dict[str, Any], outco
         lines.append("- your last help LANDED -> step back and let them run independently now (fade the support).")
     weak = weak_skills(profile)
     if weak:
-        # Toned down: Used purely as a contextual tie-breaker, preventing unprompted intervention overrides.
         lines.append("- HISTORICAL CONTEXT: This learner has previously been shaky on: " + ", ".join(w.replace("_", " ") for w in weak)
                      + " -> Use this strictly to personalize your hint ONLY IF the Intervention Gate has already authorized you to intervene. Do not use this to proactively flag healthy reasoning.")
     return "LEARNING SIGNALS:\n" + "\n".join(lines)
