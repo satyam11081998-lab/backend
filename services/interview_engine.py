@@ -23,7 +23,7 @@ from prompts.interview_prompts import (
 )
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
 from services.session_signals import compute_signals, build_signal_block
-from services.interviewer_decision import StreamTagStripper, parse_control_tag
+from services.interviewer_decision import StreamTagStripper, parse_control_tag, sanitize_reply
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 
 load_dotenv()
@@ -253,6 +253,7 @@ def complete_interviewer_reply(
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
+        text = sanitize_reply(text, _teaching_policy(teaching_policy))
         if control_out is not None:
             control_out["tag"] = tag or {}
     return text

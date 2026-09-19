@@ -192,3 +192,34 @@ def detect_violations(reply_text, policy="coached", tag=None):
     if policy == "exam" and looks_full_solution:
         out.append("revealed_full_solution_in_exam")
     return out
+
+
+_PRAISE_OPENERS = (
+    "good start", "great", "good question", "great question", "nice", "well done",
+    "solid approach", "solid figure", "solid reasoning", "good plan", "perfect",
+    "excellent", "impressive", "brilliant", "awesome", "that sounds",
+    "that's a solid", "thats a solid", "that's a good", "thats a good",
+    "that's a great", "thats a great", "that's a strong", "thats a strong",
+    "that's a bold", "thats a bold", "that's a thoughtful", "thats a thoughtful",
+    "that's an interesting", "thats an interesting", "that's interesting", "thats interesting",
+    "you're on the right track", "youre on the right track", "you've got", "youve got",
+    "that's a good start", "thats a good start", "solid start", "solid starting",
+    "solid rationale", "sound direction", "sound approach", "good rationale",
+)
+
+
+def sanitize_reply(text: str, policy: str = "coached") -> str:
+    """Deterministic guardrail behind the prompt: strip a leading praise opener and
+    keep at most ONE question. Small models do not reliably obey these format rules
+    even when told, so we ENFORCE them here (the prompt still asks first)."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    m = re.match(r"^\s*([^.!?\n]{0,80}[.!?])\s+(\S.*)$", t, re.DOTALL)
+    if m:
+        first = m.group(1).lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+        if any(pp in first for pp in _PRAISE_OPENERS):
+            t = m.group(2).strip()
+    if t.count("?") >= 2:
+        t = t[: t.find("?") + 1].strip()
+    return t
