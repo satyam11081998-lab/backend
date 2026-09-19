@@ -1,32 +1,15 @@
 """
 Learning-intelligence layer (Phase 4). Turns the adaptive CONVERSATION into an
-adaptive LEARNING engine: a skill + misconception taxonomy, intervention-outcome
-tracking, per-skill independence accumulation (scaffolding + fading), next-drill
-recommendation, a minimum-assistance learning block for the prompt, and a
-personalised post-case debrief.
-
-All PURE -- no model call, no DB -- so it is unit-testable and cheap. The
-interviewer tags each turn (skill=, error=, modality=, intervention=) in its
-control tag; this module folds those tags + the deterministic signals into the
-learner model, which persists on attempts.session_state.profile (per attempt)
-and, later, on a longitudinal user_skill_profile row.
-
-DESIGN PRINCIPLE (owner, point 16): optimise for the MINIMUM assistance that
-restores INDEPENDENT reasoning -- NOT 'maximise the chance the user eventually
-gets the answer'. Coached is not easy. That objective is enforced in the prompt
-and reflected in the 'independence' the profile tracks.
+adaptive LEARNING engine.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-# --- taxonomies --------------------------------------------------------------
 SKILLS = {
-    # sizing / guesstimate
     "segmentation", "population_decomposition", "penetration", "frequency",
     "unit_conversion", "annualization", "capacity_bridge", "sanity_check",
     "sensitivity", "assumption_defense",
-    # case
     "structuring", "profit_tree", "revenue_decomposition", "cost_decomposition",
     "fixed_vs_variable", "driver_identification", "quantification",
     "prioritization", "synthesis", "business_judgment", "communication",
@@ -38,13 +21,11 @@ ERROR_TYPES = {
     "capacity_bridge",
 }
 
-# HOW help is delivered (point 9): different learners unlock differently.
 MODALITIES = {
     "direct_hint", "reframe", "analogy", "concrete_example", "counterexample",
     "partial_demonstration", "decompose", "micro_hint", "demonstrate",
 }
 
-# error_type -> (human label, one-line reusable rule for the debrief)
 _REMEDIES: Dict[str, tuple] = {
     "capacity_bridge": ("bridging demand to capacity",
                         "When you size outlets/stores, build the bridge: total demand ÷ capacity per outlet."),
@@ -90,12 +71,7 @@ def _independence_band(hint_level) -> str:
             4: "after_demo", 5: "needed_solution"}[h]
 
 
-# --- intervention outcome (point 8) ------------------------------------------
 def evaluate_intervention_outcome(prior_state: Optional[dict], signals: Dict[str, Any]) -> str:
-    """Did the PRIOR turn's HELP move work? Deterministic: the learner recovered
-    if this turn they are no longer stuck/repeating/asking-for-help/frustrated and
-    have something down. Only judged for actual help moves (not continue/probe).
-    Returns 'worked' | 'failed' | 'na'."""
     last = (prior_state or {}).get("last_intervention")
     if not last or last in ("continue", "probe", "skip", None):
         return "na"
@@ -108,11 +84,9 @@ def evaluate_intervention_outcome(prior_state: Optional[dict], signals: Dict[str
     return "failed" if stuck_now else "worked"
 
 
-# --- profile accumulation (points 8, 17) -------------------------------------
 def update_learning_profile(profile: Optional[dict], tag: Dict[str, str],
                             outcome: str, hint_level, signals: Dict[str, Any],
                             prior_modality: Optional[str] = None) -> Dict[str, Any]:
-    """Fold ONE turn's control tag + outcome into the per-attempt learner profile."""
     p = dict(profile or _blank_profile())
     for k in ("skills", "errors", "modalities", "independence"):
         p.setdefault(k, {})
@@ -128,13 +102,10 @@ def update_learning_profile(profile: Optional[dict], tag: Dict[str, str],
         m = p["modalities"].setdefault(modality, {"worked": 0, "failed": 0})
         m[outcome] += 1
 
-    # Independence (point 17): when a skill is RESOLVED (help landed), record the
-    # rung it took. Lower rung over time = fading = real learning.
     if skill and outcome == "worked":
         band = _independence_band(hint_level)
         s = p["independence"].setdefault(skill, {})
         s[band] = s.get(band, 0) + 1
-    # Independent success with no help this turn also counts.
     if skill and outcome == "na" and not signals.get("help_requested") \
             and signals.get("has_work") and int(hint_level or 0) == 0:
         s = p["independence"].setdefault(skill, {})
@@ -144,7 +115,6 @@ def update_learning_profile(profile: Optional[dict], tag: Dict[str, str],
 
 
 def best_modality(profile: Optional[dict]) -> Optional[str]:
-    """Which help modality has landed most for THIS learner (point 8/9)."""
     mods = (profile or {}).get("modalities", {})
     best, best_net = None, 0
     for name, wl in mods.items():
@@ -155,16 +125,11 @@ def best_modality(profile: Optional[dict]) -> Optional[str]:
 
 
 def weak_skills(profile: Optional[dict], k: int = 3) -> List[str]:
-    """Skills the learner has stumbled on most (by error tally)."""
     errors = (profile or {}).get("errors", {})
     return [e for e, _ in sorted(errors.items(), key=lambda kv: kv[1], reverse=True)[:k]]
 
 
-# --- next-best practice (points 14, 28) --------------------------------------
 def recommend_next_drill(profile: Optional[dict]) -> Optional[Dict[str, str]]:
-    """Weakest area -> a concrete next-practice suggestion with a difficulty tilt.
-    Difficulty is multi-dimensional: a math error keeps business complexity but
-    dials down numerical load; a structural error keeps numbers, dials up structure."""
     weak = weak_skills(profile, k=1)
     if not weak:
         return None
@@ -181,11 +146,7 @@ def recommend_next_drill(profile: Optional[dict]) -> Optional[Dict[str, str]]:
     return {"focus_error": err, "focus_label": label, "remember": rule, "suggested_practice": tilt}
 
 
-# --- prompt injection (points 8, 9, 16) --------------------------------------
 def build_learning_block(profile: Optional[dict], signals: Dict[str, Any], outcome: str) -> str:
-    """Compact LEARNING SIGNALS block for the interviewer prompt. Always carries the
-    minimum-assistance objective; adds modality-switch guidance when help failed, and
-    the learner's recurring weak spots so the coach watches for them."""
     lines = [
         "- MINIMUM ASSISTANCE: give the LEAST help that lets THEM take the next step "
         "themselves. Coached is not easy -- never hand over the answer just to get them there.",
@@ -199,15 +160,13 @@ def build_learning_block(profile: Optional[dict], signals: Dict[str, Any], outco
         lines.append("- your last help LANDED -> step back and let them run independently now (fade the support).")
     weak = weak_skills(profile)
     if weak:
-        lines.append("- this learner has been shaky on: " + ", ".join(w.replace("_", " ") for w in weak)
-                     + " -> coach it lightly if it recurs, don't force it.")
+        # Toned down: Used purely as a contextual tie-breaker, preventing unprompted intervention overrides.
+        lines.append("- HISTORICAL CONTEXT: This learner has previously been shaky on: " + ", ".join(w.replace("_", " ") for w in weak)
+                     + " -> Use this strictly to personalize your hint ONLY IF the Intervention Gate has already authorized you to intervene. Do not use this to proactively flag healthy reasoning.")
     return "LEARNING SIGNALS:\n" + "\n".join(lines)
 
 
-# --- post-case debrief (points 27, 28) ---------------------------------------
 def build_debrief(profile: Optional[dict]) -> Dict[str, Any]:
-    """A concise, personalised debrief from the accumulated tags. Pure; meant to
-    enrich the results page beyond the generic scorer output ('MECE knows how I think')."""
     p = profile or {}
     indep = p.get("independence", {})
     errors = p.get("errors", {})
@@ -232,10 +191,7 @@ def build_debrief(profile: Optional[dict]) -> Dict[str, Any]:
     }
 
 
-# --- longitudinal profile (point 28) -----------------------------------------
 def merge_longitudinal_profile(existing: Optional[dict], attempt: Optional[dict]) -> Dict[str, Any]:
-    """Deep-ADD two learner profiles (counts accumulate) into the user's lifetime
-    skill profile. Pure. Called at submit to roll one attempt into the whole history."""
     out = _blank_profile()
     for src in (existing or {}, attempt or {}):
         for cat in ("errors", "skills"):
