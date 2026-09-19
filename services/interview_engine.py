@@ -1,8 +1,9 @@
 """
 Interview Engine — runs one interviewer turn against OpenAI.
 
-Implements the MECE Transcript-Grounded Control Layer (v0.4).
+Implements the MECE Transcript-Grounded Control Layer (v0.5).
 Pipeline: Signals -> Contextual Assessor (if needed) -> Gate -> Modality -> Generate -> Safely Emit.
+Eliminates blank bubbles by managing a CONVERSATIONAL_PRESENCE gate explicitly.
 """
 
 import os
@@ -102,18 +103,16 @@ def stream_interviewer_reply(
         tlist = list(transcript)
         policy = _teaching_policy(teaching_policy)
         
-        # 1. State Estimation (Deterministic)
         signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
         
-        # 2. Ambiguity Routing (Contextual Assessor)
         if needs_contextual_assessment(signals):
             context_state = assess_context_with_llm(tlist, new_user_message, case_content)
             signals.update(context_state)
             
-        # 3. Intervention Gate
         intervene, mode, reason = evaluate_intervention_gate(signals)
         
-        if not intervene:
+        # True Silence (only triggers on rapid fragments or immediately following an ack)
+        if mode == "NO_INTERVENTION":
             if control_out is not None:
                 control_out["tag"] = {"mode": "NO_INTERVENTION", "intervention": "silence"}
                 control_out["mode"] = "NO_INTERVENTION"
@@ -121,9 +120,8 @@ def stream_interviewer_reply(
             yield ""
             return
             
-        # 4. Modality Router
         allow_questions = ALLOW_QUESTIONS.get(mode, False)
-        instruction = get_modality_instruction(mode, policy, new_user_message)
+        instruction = get_modality_instruction(mode, policy, new_user_message, signals)
         outcome = evaluate_intervention_outcome(prior_state, signals)
         
         messages = _build_adaptive_messages(
@@ -160,11 +158,10 @@ def stream_interviewer_reply(
             stream_options={"include_usage": True},
         )
 
-    # 5. Pre-Emission Safety & Generation
     t0 = time.time()
     
+    # PRE-EMISSION SAFETY: Synchronously generate & validate zero-question modes
     if adaptive and not allow_questions:
-        # Pre-emission safety block: synchronous generation for zero-question modes
         try:
             resp = _complete(cli, model)
         except Exception as e:
@@ -181,13 +178,14 @@ def stream_interviewer_reply(
         if control_out is not None:
             control_out["tag"] = tag or {}
             control_out["mode"] = mode
+            control_out["reason"] = reason if 'reason' in locals() else ""
             
         yield final_text
         log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
                      response=resp, latency_ms=int((time.time() - t0) * 1000))
         return
 
-    # Standard Streaming (for allowed question modes or legacy)
+    # STANDARD STREAMING (for probing modes or non-adaptive fallbacks)
     try:
         stream = _open_stream(cli, model)
     except Exception as e:
@@ -258,14 +256,15 @@ def complete_interviewer_reply(
             
         intervene, mode, reason = evaluate_intervention_gate(signals)
         
-        if not intervene:
+        if mode == "NO_INTERVENTION":
             if control_out is not None:
                 control_out["tag"] = {"mode": "NO_INTERVENTION", "intervention": "silence"}
                 control_out["mode"] = "NO_INTERVENTION"
+                control_out["reason"] = reason
             return ""
             
         allow_questions = ALLOW_QUESTIONS.get(mode, False)
-        instruction = get_modality_instruction(mode, policy, new_user_message)
+        instruction = get_modality_instruction(mode, policy, new_user_message, signals)
         outcome = evaluate_intervention_outcome(prior_state, signals)
         
         messages = _build_adaptive_messages(
@@ -308,6 +307,7 @@ def complete_interviewer_reply(
         if control_out is not None:
             control_out["tag"] = tag or {}
             control_out["mode"] = mode
+            control_out["reason"] = reason
     return text
 
 
