@@ -23,7 +23,10 @@ from prompts.interview_prompts import (
 )
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
 from services.session_signals import compute_signals, build_signal_block
-from services.interviewer_decision import StreamTagStripper, parse_control_tag, sanitize_reply
+from services.interviewer_mode import select_mode, build_mode_block
+from services.interviewer_decision import (
+    StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode,
+)
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 
 load_dotenv()
@@ -98,9 +101,12 @@ def _build_messages(case_content, case_type, transcript, new_user_message,
         tlist = list(transcript)  # materialise: used twice (signals + messages)
         policy = _teaching_policy(teaching_policy)
         signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
+        mode, instruction, q_budget = select_mode(signals, policy, new_user_message)
         outcome = evaluate_intervention_outcome(prior_state, signals)
-        block = build_signal_block(signals) + "\n\n" + build_learning_block(
-            (prior_state or {}).get("profile"), signals, outcome)
+        block = (build_signal_block(signals)
+                 + "\n\n" + build_mode_block(mode, instruction, q_budget)
+                 + "\n\n" + build_learning_block(
+                     (prior_state or {}).get("profile"), signals, outcome))
         return build_adaptive_interviewer_messages(
             case_content=case_content,
             case_type=case_type,
@@ -223,6 +229,7 @@ def complete_interviewer_reply(
 ) -> str:
     """Non-streaming variant — used when SSE is not available."""
     adaptive = _adaptive_enabled()
+    transcript = list(transcript)   # materialise: reused for the mode recompute below
     messages = _build_messages(
         case_content, case_type, transcript, new_user_message, clarifications_exhausted,
         teaching_policy=teaching_policy, prior_state=prior_state,
@@ -253,9 +260,13 @@ def complete_interviewer_reply(
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
-        text = sanitize_reply(text, _teaching_policy(teaching_policy))
+        policy = _teaching_policy(teaching_policy)
+        signals = compute_signals(transcript, new_user_message, policy, prior_state=prior_state)
+        mode, _instruction, q_budget = select_mode(signals, policy, new_user_message)
+        text = enforce_mode(text, mode, q_budget, policy)
         if control_out is not None:
             control_out["tag"] = tag or {}
+            control_out["mode"] = mode
     return text
 
 

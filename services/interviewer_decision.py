@@ -16,6 +16,20 @@ from services.learning_model import evaluate_intervention_outcome, update_learni
 
 _TAG_RE = re.compile(r"^\s*<<(.*?)>>\s*", re.DOTALL)
 
+_DEC = "\u0001"  # placeholder protecting decimal points from sentence splitting
+
+
+def _sentences(text: str, keep_punct: bool = True):
+    """Split into sentences WITHOUT breaking on decimal points (0.95, 5.5 crore).
+    keep_punct=True keeps each sentence's trailing .!? (for question/solicitation
+    stripping); False drops it (for counting)."""
+    t = re.sub(r"(\d)\.(\d)", r"\1" + _DEC + r"\2", text or "")
+    if keep_punct:
+        parts = re.findall(r"[^.!?]*[.!?]|[^.!?]+$", t)
+    else:
+        parts = re.split(r"[.!?]+", t)
+    return [p.replace(_DEC, ".").strip() for p in parts if p.strip()]
+
 
 def parse_control_tag(text: str) -> Tuple[Dict[str, str], str]:
     """Return (tag_dict, cleaned_reply). Strips a leading <<...>> tag if present."""
@@ -177,7 +191,7 @@ def detect_violations(reply_text, policy="coached", tag=None):
         out.append("banned_isnt_specified")
     if any(p in t for p in _RUBBER_STAMP):
         out.append("possible_rubber_stamp")
-    sents = [x for x in re.split(r"[.!?]+", reply_text or "") if x.strip()]
+    sents = _sentences(reply_text, keep_punct=False)   # decimal-safe: 0.95 is not 2 sentences
     if len(sents) > 5:
         out.append("too_long")
     # Behavioral: DECLARED action (tag) vs ACTUAL reply (points 20, 21). Textual
@@ -205,6 +219,13 @@ _PRAISE_OPENERS = (
     "you're on the right track", "youre on the right track", "you've got", "youve got",
     "that's a good start", "thats a good start", "solid start", "solid starting",
     "solid rationale", "sound direction", "sound approach", "good rationale",
+    # expansions (seen surviving in live evals)
+    "good approach", "great approach", "nice approach", "good work", "good call",
+    "that's a start", "thats a start", "that's a reasonable", "thats a reasonable",
+    "reasonable start", "that's a significant", "thats a significant", "significant number",
+    "that makes sense", "makes sense", "that's a valid", "thats a valid",
+    "valid perspective", "valid approach", "fair enough", "good instinct",
+    "that's fair", "thats fair", "that's a fair", "thats a fair",
 )
 
 
@@ -223,3 +244,51 @@ def sanitize_reply(text: str, policy: str = "coached") -> str:
     if t.count("?") >= 2:
         t = t[: t.find("?") + 1].strip()
     return t
+
+
+# --- mode-aware enforcement (Phase: intervention necessity) ------------------
+# Some interviewer moves must ask NOTHING: CLOSE (take the recommendation and end),
+# HOLD_SPACE (let them think), RELEASE (they recovered -> step back), and an EARNED
+# DELIVER_SOLUTION (give the answer, don't deflect). The prompt asks the model to do
+# this; the gate GUARANTEES it, because small models still tack on a question. A
+# question hidden as an imperative ("please share your final thoughts") slips past a
+# '?'-only strip, so we also drop trailing solicitations.
+
+_ZERO_Q_MODES = {"CLOSE", "HOLD_SPACE", "RELEASE", "DELIVER_SOLUTION"}
+
+_SOLICIT_RE = re.compile(
+    r"(?i)\b(please\s+)?(share|tell me|give me|walk me|provide|explain|describe|outline|"
+    r"let me know|talk me through|elaborate)\b[^.!?]*\b"
+    r"(thoughts?|final|recommendations?|insights?|feedback|answer|reasoning|next step)\b")
+
+_MODE_FALLBACK = {
+    "CLOSE": "Good — that's a reasonable place to close the case.",
+    "HOLD_SPACE": "Take your time.",
+    "RELEASE": "Exactly — run with that.",
+    "DELIVER_SOLUTION": "In short: work the cost side first, then tie it back to the profit impact.",
+}
+
+
+def strip_all_questions(text: str) -> str:
+    """Drop every sentence that ends in '?'."""
+    kept = [s for s in _sentences(text, keep_punct=True) if not s.rstrip().endswith("?")]
+    return " ".join(kept).strip()
+
+
+def strip_solicitations(text: str) -> str:
+    """Drop imperative asks ('please share your final thoughts') that dodge the '?' strip."""
+    kept = [s for s in _sentences(text, keep_punct=True) if not _SOLICIT_RE.search(s)]
+    return " ".join(kept).strip()
+
+
+def enforce_mode(text: str, mode: str, q_budget=None, policy: str = "coached") -> str:
+    """Apply the base guardrail (praise strip + 1-question cap) and, for a zero-budget
+    mode, strip ALL questions and solicitations. Falls back to a short mode-appropriate
+    line if nothing survives (never returns empty)."""
+    t = sanitize_reply(text, policy)
+    budget = q_budget if q_budget is not None else (0 if mode in _ZERO_Q_MODES else 1)
+    if budget == 0:
+        t = strip_solicitations(strip_all_questions(t)).strip()
+        if not t:
+            t = _MODE_FALLBACK.get(mode, "Let's move on.")
+    return t.strip()

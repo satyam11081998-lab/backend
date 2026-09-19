@@ -64,6 +64,67 @@ _INTERROGATIVE = (
 _GREETING = ("hi", "hii", "hello", "hey", "ok", "okay", "start", "let's start",
              "lets start", "so", "good morning", "good evening", "yo")
 
+# --- mode-selector families (deterministic; drive services/interviewer_mode) ---
+_MID_THOUGHT = (
+    "let me think", "let me redo", "let me recompute", "let me recalculate",
+    "no wait", "wait no", "hold on", "give me a sec", "give me a second",
+    "one sec", "let me re-do", "scratch that", "let me redo the",
+)
+_WANTS_SPACE = (
+    "let me solve", "let me work", "let me try", "just let me", "let me do it",
+    "stop asking", "too many questions", "let me finish", "give me a moment",
+)
+_WANTS_ADVANCE = (
+    "move on", "next part", "next question", "let's move", "lets move",
+    "moving on", "shift gears", "next topic", "next section",
+)
+_PRODUCT_UX = (
+    "where do i see", "where will i see", "my results", "results page",
+    "results after", "where do i find", "how do i submit", "where is the",
+    "what happens after", "after this", "after we finish", "see my score",
+)
+_WHY_THIS = (
+    "why are you asking", "why do you ask", "why this question",
+    "why that question", "what's the point of", "whats the point of",
+    "why do you want to know", "why are we", "why does that matter",
+)
+_OWNED_FACT = (
+    "population", "growth rate", "market growth", "competitors", "how many players",
+    "market size", "gdp", "per capita", "how big is the market", "what's the price",
+    "whats the price", "how many people", "what is the market",
+)
+_CONFIDENT = (
+    "obviously", "definitely", "everyone in", "everyone buys", "always",
+    "100%", "hundred percent", "surely", "no doubt", "clearly it", "must be 100",
+)
+_RECOVERY = (
+    "oh right", "ohh", "oh i see", "i see so", "i see, so", "got it, so",
+    "okay so i just", "so i just", "makes sense so", "ah so", "oh so",
+)
+_END_SESSION = (
+    "i'm done", "im done", "i am done", "leave it", "i don't want to continue",
+    "dont want to continue", "don't want to continue", "i give up", "give up",
+    "quit", "let's wrap", "lets wrap", "we can wrap", "i'm finished", "im finished",
+)
+_RECOMMEND = (
+    "my recommendation", "i'd recommend", "id recommend", "i would recommend",
+    "i recommend", "overall i'd", "overall i would", "so overall i", "in summary",
+    "to summarize", "to sum up", "my final recommendation", "overall my",
+)
+_POST_CLOSE = (
+    "how did i do", "how'd i do", "any tips", "any feedback", "how was i",
+    "what's my score", "whats my score", "how did that go", "any advice",
+    "any pointers",
+)
+_FINAL_ESTIMATE = (
+    "final answer", "final number", "so my answer", "my answer is",
+    "thats my number", "that's my number", "final figure",
+)
+_PLANNING = (
+    "i need to think about", "let me first", "i'll start with", "step one",
+    "i need to figure out how many",
+)
+
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
@@ -147,6 +208,26 @@ def _stuckish(turn_norm: str) -> bool:
                 or f["looks_garbage"] or f["frustration"])
 
 
+def _error_materiality(t: str) -> str:
+    """Conservative error sizing. 'material' only for clear high-impact mistakes,
+    'trivial' for small hedged arithmetic, else 'none'. Doctrine: err toward silence
+    so we don't nitpick (a false 'material' interrogates a fine candidate)."""
+    unit_scale = ("ml" in t) and ("litre" in t or "liter" in t)
+    double_count = (("add" in t and "whole" in t and "population" in t)
+                    or "add all of them" in t or "add them all" in t)
+    wrong_denom = ("market share" in t) and ("own sales" in t or "divided by our own" in t)
+    mece_overlap = (("split them into" in t or "segment" in t or "categorize" in t
+                     or "break them into" in t or "buckets" in t)
+                    and ("buy a lot" in t or "heavy" in t or "people who" in t))
+    if unit_scale or double_count or wrong_denom or mece_overlap:
+        return "material"
+    hedged = _has_any(t, ("roughly", "about", "call it", "approx", "i'll round",
+                          "ill round", "round to", "ballpark", "give or take"))
+    if hedged:
+        return "trivial"
+    return "none"
+
+
 def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
                     teaching_policy: str = "coached", prior_state=None) -> Dict[str, Any]:
     transcript = list(transcript or [])
@@ -155,7 +236,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     new_norm = _norm(new_user_message)
     intent = detect_intent(new_user_message)
 
-    has_work = any((len(c) > 60 or re.search(r"\d", c)) for c in cand)
+    has_work = any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
@@ -181,6 +262,32 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     repair_due = (recent_probes >= 2 and (intent["help_requested"] or tw >= 2
                   or candidate_repeating or interviewer_repeating)) or frustration == "high"
 
+    # --- mode-selector signals (deterministic read; feed services/interviewer_mode) ---
+    ends_ellipsis = new_norm.endswith("...") or "..." in new_norm
+    candidate_mid_thought = _has_any(new_norm, _MID_THOUGHT) or ends_ellipsis
+    wants_space = _has_any(new_norm, _WANTS_SPACE)
+    wants_to_advance = _has_any(new_norm, _WANTS_ADVANCE)
+    candidate_working = (_has_any(new_norm, _PLANNING)
+                         and not intent["help_requested"]
+                         and not intent["solution_requested"])
+    product_ux_question = _has_any(new_norm, _PRODUCT_UX)
+    why_this_question = _has_any(new_norm, _WHY_THIS)
+    asks_owned_fact = intent["is_question"] and _has_any(new_norm, _OWNED_FACT)
+
+    is_session_open = (intent["intent"] == "greeting") or (len(asst) == 0 and len(cand) == 0)
+    is_final_recommendation = _has_any(new_norm, _RECOMMEND)
+    is_post_close = _has_any(new_norm, _POST_CLOSE)
+    wants_to_end = _has_any(new_norm, _END_SESSION) and not wants_to_advance
+    is_session_close = ((is_final_recommendation or is_post_close or wants_to_end)
+                        and not is_session_open)
+
+    has_number = bool(re.search(r"\d", new_norm))
+    defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
+    confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
+    states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
+    just_recovered = _has_any(new_norm, _RECOVERY) and len(asst) >= 1
+    error_materiality = _error_materiality(new_norm)
+
     return {
         "intent": intent["intent"],
         "teaching_policy": teaching_policy,
@@ -199,8 +306,23 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "candidate_repeating": candidate_repeating,
         "turns_without_progress": tw,
         "frustration": frustration,
+        "frustration_explicit": intent["frustration"],
         "repair_due": repair_due,
         "candidate_turn_count": len(cand) + 1,
+        # --- mode-selector signals ---
+        "is_session_open": is_session_open,
+        "is_session_close": is_session_close,
+        "candidate_mid_thought": candidate_mid_thought,
+        "wants_space": wants_space,
+        "wants_to_advance": wants_to_advance,
+        "candidate_working": candidate_working,
+        "product_ux_question": product_ux_question,
+        "why_this_question": why_this_question,
+        "asks_owned_fact": asks_owned_fact,
+        "confident_unsupported_claim": confident_unsupported_claim,
+        "states_final_estimate": states_final_estimate,
+        "just_recovered": just_recovered,
+        "error_materiality": error_materiality,
     }
 
 
