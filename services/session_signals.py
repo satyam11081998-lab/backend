@@ -105,6 +105,11 @@ _RECOMMEND = (
     "i recommend", "overall i'd", "overall i would", "so overall i", "in summary",
     "to summarize", "to sum up", "my final recommendation", "overall my",
 )
+_POST_CLOSE = (
+    "how did i do", "how'd i do", "any tips", "any feedback", "how was i",
+    "what's my score", "whats my score", "how did that go", "any advice",
+    "any pointers",
+)
 _FINAL_ESTIMATE = (
     "final answer", "final number", "so my answer", "my answer is",
     "thats my number", "that's my number", "final figure",
