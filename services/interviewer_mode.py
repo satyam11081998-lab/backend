@@ -1,6 +1,7 @@
 """
 Modality Router and Instruction generation.
 Includes the LISTENING_BEAT modality and explicit anti-repetition guardrails.
+NO_INTERVENTION has been removed.
 Maintains backward compatibility for legacy tests via Q_BUDGET and select_mode proxies.
 """
 from __future__ import annotations
@@ -9,7 +10,6 @@ from typing import Any, Dict, Tuple
 ALLOW_QUESTIONS: Dict[str, bool] = {
     "OPEN": True,
     "CLOSE": False,
-    "NO_INTERVENTION": False,
     "LISTENING_BEAT": False,
     "HAND_BACK": False,
     "DATA_REVEAL": False,
@@ -43,9 +43,6 @@ def get_modality_instruction(mode: str, policy: str, new_message: str, signals: 
     recent_phrases = signals.get("recent_assistant_turns", [])
     recent_str = " | ".join(recent_phrases) if recent_phrases else "none"
 
-    if mode == "NO_INTERVENTION":
-        return "Generate nothing. Stay silent."
-        
     if mode == "LISTENING_BEAT":
         return (f"You are actively listening to the candidate. Output a 1-3 word conversational acknowledgement "
                 f"(e.g., 'Got it', 'Alright', 'Okay', 'Makes sense'). "
