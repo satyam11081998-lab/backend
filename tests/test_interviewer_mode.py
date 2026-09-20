@@ -16,6 +16,7 @@ from services.session_signals import compute_signals          # noqa: E402
 from services.interviewer_mode import select_mode              # noqa: E402
 from services.interviewer_decision import enforce_mode         # noqa: E402
 from tools.eval_interviewer_behavior import SCENARIOS          # noqa: E402  (lazy live imports)
+from tools.scenario_variants import VARIANTS, ACCEPTABLE       # noqa: E402
 
 # Intended interviewer move per scenario id, read off each scenario's `required` behaviour.
 EXPECTED = {
@@ -116,7 +117,26 @@ def test_gate_budgets() -> int:
     return bad
 
 
+def test_generalization() -> int:
+    """Every paraphrase variant (not just the fixed 50 strings) must route to an
+    acceptable move -- this is the guard against overfitting the router to exact wording."""
+    tx = {s["id"]: s["transcript"] for s in SCENARIOS}
+    orig = {s["id"]: s["new"] for s in SCENARIOS}
+    total = bad = 0
+    for sid, transcript in tx.items():
+        for msg in [orig[sid]] + list(VARIANTS.get(sid, [])):
+            total += 1
+            sig = compute_signals(transcript, msg, "coached")
+            mode, _i, _q = select_mode(sig, "coached", msg)
+            if mode not in ACCEPTABLE.get(sid, set()):
+                bad += 1
+                print(f"MISROUTE  {sid:<34} {mode:<15} not in {sorted(ACCEPTABLE.get(sid, []))}  | '{msg[:44]}'")
+    pct = round(100 * (total - bad) / total, 1) if total else 0
+    print(f"generalization: {total} phrasings, {bad} misroute(s) -> {pct}%")
+    return bad
+
+
 if __name__ == "__main__":
-    total = test_mode_mapping() + test_gate_budgets()
+    total = test_mode_mapping() + test_generalization() + test_gate_budgets()
     print("\nRESULT:", "ALL PASS" if total == 0 else f"{total} FAILURE(S)")
     sys.exit(1 if total else 0)

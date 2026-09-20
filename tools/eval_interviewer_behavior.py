@@ -25,10 +25,21 @@ from __future__ import annotations
 import os
 import sys
 import json
+import random
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.session_signals import compute_signals, build_signal_block  # noqa: E402
+from tools.scenario_variants import VARIANTS  # noqa: E402
+
+
+def _pick_message(s: dict, vary: bool) -> str:
+    """The candidate message to test. vary=True samples one of the scenario's paraphrase
+    variants at random, so each run exercises DIFFERENT phrasings -- the score then reflects
+    whether the router generalises, not a memorised pass over 50 fixed strings."""
+    if not vary:
+        return s["new"]
+    return random.choice([s["new"]] + list(VARIANTS.get(s["id"], [])))
 
 SCENARIOS = [
     # ---- STATE / INTENT ----
@@ -328,12 +339,56 @@ MAX_SCENARIOS = 50
 assert len(SCENARIOS) <= MAX_SCENARIOS, f"keep this to {MAX_SCENARIOS} scenarios (breadth of shapes, not volume)"
 
 
-def run_offline(verbose: bool = False) -> bool:
-    print(f"OFFLINE signal eval — {len(SCENARIOS)} scenarios (deterministic, no API)")
+_JUDGE_RUBRIC = (
+    "You grade ONE interviewer reply in a case-interview practice app. Judge whether the reply "
+    "accomplishes the INTENT of the required behaviour below -- NOT whether it matches example "
+    "wording. Apply this calibration (it overrides a naive reading):\n"
+    "- Any DEFENSIBLE specific number satisfies an 'own the facts' requirement. If the requirement "
+    "gives an example like 'three players, ~30% each', then 'five players, ~20% each' is EQUALLY "
+    "fine -- do not fail it for using different but plausible numbers.\n"
+    "- A brief, earned acknowledgement ('Good', 'Fair point', 'That's a solid recommendation') is "
+    "natural and GOOD; do NOT fail it as praise. Only fail GUSHING or rubber-stamping of weak/wrong "
+    "work (e.g. 'Amazing! Brilliant structure!' on a vague answer).\n"
+    "- Giving a thinking or self-correcting candidate space ('Take your time.') SATISFIES a "
+    "'do not interrupt / give space' requirement; do not fail it for 'not engaging'.\n"
+    "- Judge the behaviour, not length or spelling. One short question is acceptable unless the "
+    "requirement explicitly says to ask nothing.\n"
+    'Return strict JSON {"pass": true|false, "why": "<one line>"}.'
+)
+
+
+def _judge_once(judge, model, s, msg, reply):
+    jp = (f"{_JUDGE_RUBRIC}\n\nREQUIRED interviewer behaviour: {s['required']}\n\n"
+          f'Candidate said: "{msg}"\nInterviewer replied: "{reply}"')
+    jr = judge.chat.completions.create(
+        model=model, temperature=0.4,
+        messages=[{"role": "user", "content": jp}],
+        response_format={"type": "json_object"})
+    return json.loads(jr.choices[0].message.content or "{}")
+
+
+def _judge(judge, model, s, msg, reply, n=3):
+    """Best-of-n majority vote to de-noise a single flaky LLM judgement."""
+    votes, why = [], ""
+    for _ in range(max(1, n)):
+        try:
+            v = _judge_once(judge, model, s, msg, reply)
+        except Exception as e:  # noqa: BLE001
+            return {"pass": None, "why": f"judge error: {e}", "votes": "err"}
+        votes.append(bool(v.get("pass")))
+        why = v.get("why") or why
+    p = sum(votes)
+    return {"pass": p > len(votes) / 2, "why": why, "votes": f"{p}/{len(votes)}"}
+
+
+def run_offline(verbose: bool = False, vary: bool = True) -> bool:
+    print(f"OFFLINE signal eval — {len(SCENARIOS)} scenarios (deterministic, no API)"
+          + ("  [varied phrasings]" if vary else ""))
     print("=" * 68)
     fails = []
     for i, s in enumerate(SCENARIOS, 1):
-        sig = compute_signals(s["transcript"], s["new"], s.get("policy", "coached"))
+        msg = _pick_message(s, vary)
+        sig = compute_signals(s["transcript"], msg, s.get("policy", "coached"))
         bad = []
         for k, v in s["expect_signals"].items():
             got = sig.get(k)
@@ -342,7 +397,7 @@ def run_offline(verbose: bool = False) -> bool:
                 fails.append((s["id"], k, got, v))
         head = "PASS" if not bad else "FAIL"
         print(f"\n[{i:>2}/{len(SCENARIOS)}] {head}  {s['id']}  ({s['case_type']})")
-        print(f'      user: "{s["new"]}"')
+        print(f'      user: "{msg}"')
         print(f"      read: intent={sig['intent']}  frustration={sig['frustration']}  "
               f"repair_due={sig['repair_due']}  has_work={sig['has_work']}  garbage={sig['looks_garbage']}")
         for line in bad:
@@ -357,7 +412,7 @@ def run_offline(verbose: bool = False) -> bool:
     return not fails
 
 
-def run_live(verbose: bool = False) -> int:
+def run_live(verbose: bool = False, vary: bool = True, judge_n: int = 3) -> int:
     # Load .env the same way the app does, so the eval sees the key prod would use.
     try:
         from dotenv import load_dotenv
@@ -379,16 +434,20 @@ def run_live(verbose: bool = False) -> int:
         return 0
     judge = OpenAI()
     judge_model = os.getenv("JUDGE_MODEL", "gpt-4o")
-    print(f"LIVE eval — {len(SCENARIOS)} scenarios (adaptive model + judge={judge_model})")
+    print(f"LIVE eval — {len(SCENARIOS)} scenarios (adaptive model + judge={judge_model} x{judge_n})"
+          + ("  [varied phrasings]" if vary else ""))
     print("=" * 68)
     passed = 0
+    det_clean = 0        # replies with no deterministic violation (gush / extra question)
+    judge_only_fail = 0  # deterministically clean but the judge still failed it
     for i, s in enumerate(SCENARIOS, 1):
         ctl: dict = {}
+        msg = _pick_message(s, vary)
         try:
             reply = complete_interviewer_reply(
                 case_content=f"A {s['case_type']} case for practice on MECE.",
                 case_type=s["case_type"], transcript=s["transcript"],
-                new_user_message=s["new"], teaching_policy=s.get("policy", "coached"),
+                new_user_message=msg, teaching_policy=s.get("policy", "coached"),
                 control_out=ctl,
             )
         except Exception as e:  # noqa: BLE001
@@ -406,30 +465,28 @@ def run_live(verbose: bool = False) -> int:
                 return passed
             continue
         det = detect_violations(reply)
-        jp = (f"REQUIRED interviewer behaviour: {s['required']}\n\n"
-              f'Candidate said: "{s["new"]}"\nInterviewer replied: "{reply}"\n\n'
-              'Did the reply satisfy the REQUIRED behaviour? '
-              'Reply strict JSON {"pass": true|false, "why": "<one line>"}.')
-        try:
-            jr = judge.chat.completions.create(
-                model=judge_model, temperature=0,
-                messages=[{"role": "user", "content": jp}],
-                response_format={"type": "json_object"})
-            verdict = json.loads(jr.choices[0].message.content or "{}")
-        except Exception as e:  # noqa: BLE001
-            verdict = {"pass": None, "why": f"judge error: {e}"}
+        verdict = _judge(judge, judge_model, s, msg, reply, judge_n)
         ok = bool(verdict.get("pass")) and not det
         passed += 1 if ok else 0
+        if not det:
+            det_clean += 1
+            if verdict.get("pass") is False:
+                judge_only_fail += 1
         head = "PASS" if ok else "FAIL"
         print(f"\n[{i:>2}/{len(SCENARIOS)}] {head}  {s['id']}  ({s['case_type']})")
-        print(f'      user:  "{s["new"]}"')
+        print(f'      user:  "{msg}"')
         print(f'      reply: "{reply.strip()[:200]}"')
-        print(f"      judge: {verdict.get('why')}" + (f"   VIOLATIONS={det}" if det else ""))
+        print(f"      judge: {verdict.get('why')}  [{verdict.get('votes')}]"
+              + (f"   VIOLATIONS={det}" if det else ""))
         if verbose:
             print(f"      tag: {ctl.get('tag')}")
+    n = len(SCENARIOS)
     print("\n" + "=" * 68)
-    print(f"LIVE: {passed}/{len(SCENARIOS)} pass ({passed / max(1, len(SCENARIOS)):.0%}). "
-          "Raise this to your bar before flipping ADAPTIVE_INTERVIEWER in prod.")
+    print(f"LIVE: {passed}/{n} pass ({passed / max(1, n):.0%}).")
+    print(f"  deterministically clean (no gush / no stray question): {det_clean}/{n} ({det_clean / max(1, n):.0%})")
+    print(f"  clean but judge failed (judge disagreements to review): {judge_only_fail}")
+    print("  -> the gap between 'clean' and 'pass' is the JUDGE, not the interviewer. "
+          "Review those, and see --judge-n / the rubric before raising your bar.")
     return passed
 
 
@@ -458,7 +515,16 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Adaptive-interviewer behavioural eval (50 user-voiced scenarios).")
     ap.add_argument("--live", action="store_true", help="call the model + LLM judge (needs venv + OPENAI_API_KEY)")
     ap.add_argument("-v", "--verbose", action="store_true", help="show the full signal block (offline) / control tag (live)")
+    ap.add_argument("--fixed", action="store_true",
+                    help="use the original fixed phrasings (default: a random paraphrase per scenario "
+                         "each run, so the score reflects generalisation not memorised strings)")
+    ap.add_argument("--seed", type=int, default=None, help="seed the paraphrase sampling for a reproducible run")
+    ap.add_argument("--judge-n", type=int, default=3,
+                    help="LLM-judge votes per scenario, majority wins (default 3, de-noises the judge; 1 = fast)")
     args = ap.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+    vary = not args.fixed
 
     # Full run is saved to a .txt right next to this script — open it or paste it back.
     _mode = ("live_" + os.getenv("INTERVIEWER_ADAPTIVE_MODEL", "gpt-4o-mini").replace("/", "-")) if args.live else "offline"
@@ -469,9 +535,9 @@ if __name__ == "__main__":
     rc = 0
     try:
         if args.live:
-            run_live(args.verbose)
+            run_live(args.verbose, vary, args.judge_n)   # behavioural eval: varies phrasing each run
         else:
-            rc = 0 if run_offline(args.verbose) else 1
+            rc = 0 if run_offline(args.verbose, False) else 1   # signal unit-test: fixed inputs
     finally:
         sys.stdout = sys.__stdout__
         tee.close()

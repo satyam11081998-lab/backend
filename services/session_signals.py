@@ -34,6 +34,9 @@ _SOLUTION = (
     "correct approach", "the correct approach", "solve it for me",
     "solve this for me", "what is the correct", "show the correct",
     "show me how", "what is the answer you", "you tell me first",
+    "give me the final", "tell me the final", "just the final answer",
+    "the final answer now", "what's the final answer", "whats the final answer",
+    "give me the answer", "just give me the",
 )
 _SKIP_STOP = (
     "leave it", "skip", "move on", "next question", "forget it",
@@ -95,7 +98,9 @@ _OWNED_FACT = (
 )
 _CONFIDENT = (
     "obviously", "definitely", "everyone in", "everyone buys", "always",
-    "100%", "hundred percent", "surely", "no doubt", "clearly it", "must be 100",
+    "100%", "hundred percent", "surely", "no doubt", "clearly", "must be 100",
+    "almost everyone", "nearly everyone", "basically everyone", "everyone uses",
+    "everyone drives", "everyone has", "literally everyone",
 )
 _RECOVERY = (
     "oh right", "ohh", "oh i see", "i see so", "i see, so", "got it, so",
@@ -124,6 +129,23 @@ _PLANNING = (
     "i need to think about", "let me first", "i'll start with", "step one",
     "i need to figure out how many",
 )
+# candidate is putting an APPROACH on the table (that is "work", regardless of length)
+_WORK_MARKERS = (
+    "i'll ", "i'd ", "i will ", "let me ", "i want to", "i'm going to", "im going to",
+    "instead of", "rather than", "i'll go", "i'll use", "i'll take", "i'll split",
+    "i'll size", "i would", "i'd go", "i'd start",
+)
+# hedged self-estimate ("maybe 20 lakh?", "around 15, not sure") -> affirm, don't quiz
+_HEDGE = (
+    "maybe", "i think", "not sure", "not fully sure", "not totally", "feels about",
+    "feels right", "seems okay", "seems right", "i'd guess", "around", "roughly",
+    "probably", "kind of", "sort of", "somewhere near", "ish",
+)
+# session-opening kickoff phrases (when there is no candidate work yet)
+_KICKOFF = (
+    "start", "begin", "let's go", "lets go", "let's do this", "lets do this",
+    "ready", "shall we", "kick off", "kickoff", "go ahead",
+)
 
 
 def _norm(s: str) -> str:
@@ -148,6 +170,8 @@ def _looks_garbage(text: str) -> bool:
             return True
     if len(letters) >= 10 and len(set(letters.lower())) <= 5:   # "yibuybuyb..." — few unique letters
         return True
+    if " " not in t and len(letters) >= 8 and re.search(r"[bcdfghjklmnpqrstvwxz]{5,}", letters.lower()):
+        return True                                            # "asdkjhaskjd" — 5+ consonant run, one token
     return False
 
 
@@ -236,7 +260,8 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     new_norm = _norm(new_user_message)
     intent = detect_intent(new_user_message)
 
-    has_work = any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
+    has_work = (any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
+                or _has_any(new_norm, _WORK_MARKERS))
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
@@ -274,7 +299,12 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     why_this_question = _has_any(new_norm, _WHY_THIS)
     asks_owned_fact = intent["is_question"] and _has_any(new_norm, _OWNED_FACT)
 
-    is_session_open = (intent["intent"] == "greeting") or (len(asst) == 0 and len(cand) == 0)
+    is_session_open = (
+        (intent["intent"] == "greeting")
+        or (len(asst) == 0 and len(cand) == 0)
+        or (len(cand) == 0 and len(new_norm) <= 24 and _has_any(new_norm, _KICKOFF)
+            and not intent["is_question"] and not intent["solution_requested"]
+            and not intent["help_requested"]))
     is_final_recommendation = _has_any(new_norm, _RECOMMEND)
     is_post_close = _has_any(new_norm, _POST_CLOSE)
     wants_to_end = _has_any(new_norm, _END_SESSION) and not wants_to_advance
@@ -285,6 +315,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
     confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
     states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
+    hedged_self_estimate = has_number and _has_any(new_norm, _HEDGE)
     just_recovered = _has_any(new_norm, _RECOVERY) and len(asst) >= 1
     error_materiality = _error_materiality(new_norm)
 
@@ -321,6 +352,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "asks_owned_fact": asks_owned_fact,
         "confident_unsupported_claim": confident_unsupported_claim,
         "states_final_estimate": states_final_estimate,
+        "hedged_self_estimate": hedged_self_estimate,
         "just_recovered": just_recovered,
         "error_materiality": error_materiality,
     }

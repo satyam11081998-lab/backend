@@ -68,9 +68,10 @@ def select_mode(sig: Dict[str, Any], policy: str = "coached",
     # 4. session close (final recommendation / done / stop / post-close small talk)
     if sig.get("is_session_close"):
         return ("CLOSE",
-                "WRAP UP. Acknowledge their recommendation/decision in one line; you may add a "
-                "one-line verdict or the brief recommendation itself (or the fuller one if they "
-                "asked). Then close. Ask NOTHING and do not reopen a solved thread.",
+                "WRAP UP. Acknowledge their recommendation/decision in one line (brief and warm, "
+                "but no gushing or 'well done'); you may add a one-line verdict or the brief "
+                "recommendation itself (or the fuller one if they asked). Then close. Ask NOTHING; "
+                "do not reopen a solved thread.",
                 Q_BUDGET["CLOSE"])
 
     # 5. mid-thought / wants space / working productively -> stay out of the way
@@ -117,7 +118,8 @@ def select_mode(sig: Dict[str, Any], policy: str = "coached",
                 "Answer the product/logistics question plainly in one line (e.g. results appear "
                 "on the results page). Then hand back to the case. Do not treat it as a case question.",
                 Q_BUDGET["ANSWER_DIRECT"])
-    if sig.get("asks_owned_fact") or sig.get("is_scope_question"):
+    if (sig.get("asks_owned_fact") or sig.get("is_scope_question")) \
+            and not sig.get("hedged_self_estimate"):
         return ("ANSWER_DIRECT",
                 "Own the facts: give a SPECIFIC, defensible number (invent a realistic one, e.g. "
                 "'three main players, ~30% each'), then hand back. Never say 'not specified'.",
@@ -188,9 +190,10 @@ def select_mode(sig: Dict[str, Any], policy: str = "coached",
     # 15. reasonable move with work on the table -> acknowledge and advance (the default)
     if sig.get("has_work"):
         return ("ACK_ADVANCE",
-                "Acknowledge briefly WITHOUT praise, accept a reasonable assumption/approach, and "
-                "move to the NEXT concrete step (or, if their reasoning is vague, ask for one "
-                "specific/structured next step). Do NOT re-interrogate what they just did.",
+                "Acknowledge briefly -- a light earned 'Good' / 'Fair point' is fine (never gush "
+                "or rubber-stamp) -- accept a reasonable assumption/approach, and move to the NEXT "
+                "concrete step (or, if their reasoning is vague, ask for one specific/structured "
+                "next step). Do NOT re-interrogate what they just did.",
                 Q_BUDGET["ACK_ADVANCE"])
 
     # 16. fallback -> one advancing probe

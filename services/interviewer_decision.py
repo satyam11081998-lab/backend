@@ -208,39 +208,41 @@ def detect_violations(reply_text, policy="coached", tag=None):
     return out
 
 
-_PRAISE_OPENERS = (
-    "good start", "great", "good question", "great question", "nice", "well done",
-    "solid approach", "solid figure", "solid reasoning", "good plan", "perfect",
-    "excellent", "impressive", "brilliant", "awesome", "that sounds",
-    "that's a solid", "thats a solid", "that's a good", "thats a good",
-    "that's a great", "thats a great", "that's a strong", "thats a strong",
-    "that's a bold", "thats a bold", "that's a thoughtful", "thats a thoughtful",
-    "that's an interesting", "thats an interesting", "that's interesting", "thats interesting",
-    "you're on the right track", "youre on the right track", "you've got", "youve got",
-    "that's a good start", "thats a good start", "solid start", "solid starting",
-    "solid rationale", "sound direction", "sound approach", "good rationale",
-    # expansions (seen surviving in live evals)
-    "good approach", "great approach", "nice approach", "good work", "good call",
-    "that's a start", "thats a start", "that's a reasonable", "thats a reasonable",
-    "reasonable start", "that's a significant", "thats a significant", "significant number",
-    "that makes sense", "makes sense", "that's a valid", "thats a valid",
-    "valid perspective", "valid approach", "fair enough", "good instinct",
-    "that's fair", "thats fair", "that's a fair", "thats a fair",
+# GUSH = effusive / rubber-stamp praise ONLY. A brief earned "Good", "Fair point",
+# "That's a good point" is natural and matches the real casebook transcripts -- we do NOT
+# strip that. We strip only over-the-top praise, and praise of weak work (rubber-stamp).
+_GUSH = (
+    "great job", "great work", "great instinct", "great answer", "well done",
+    "impressive", "brilliant", "awesome", "amazing", "excellent", "excellent job",
+    "fantastic", "outstanding", "superb", "spot on", "nailed it", "perfect",
+    "flawless", "masterful", "genius", "incredible", "love it", "really impressive",
+    "solid structure", "well structured", "well-structured", "comprehensive",
+    "you're on the right track", "youre on the right track", "phenomenal", "stellar",
+    "you nailed", "beautifully done", "top notch", "top-notch",
 )
 
 
+def _is_gush(sentence: str) -> bool:
+    s = sentence.lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+    return any(g in s for g in _GUSH)
+
+
 def sanitize_reply(text: str, policy: str = "coached") -> str:
-    """Deterministic guardrail behind the prompt: strip a leading praise opener and
-    keep at most ONE question. Small models do not reliably obey these format rules
-    even when told, so we ENFORCE them here (the prompt still asks first)."""
+    """Deterministic guardrail behind the prompt: strip GUSH (effusive / rubber-stamp
+    praise) while keeping brief earned acknowledgement, and keep at most ONE question.
+    Small models over-praise even when told not to, so we ENFORCE it here."""
     t = (text or "").strip()
     if not t:
         return t
-    m = re.match(r"^\s*([^.!?\n]{0,80}[.!?])\s+(\S.*)$", t, re.DOTALL)
-    if m:
-        first = m.group(1).lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
-        if any(pp in first for pp in _PRAISE_OPENERS):
-            t = m.group(2).strip()
+    # 1) strip a leading gush clause ("Great job, ..." / "Well done. ...")
+    m = re.match(r"^\s*([^.!?\n]{0,90}?[.!?,])\s+(\S.*)$", t, re.DOTALL)
+    if m and _is_gush(m.group(1)):
+        t = m.group(2).strip()
+    # 2) drop any remaining standalone gush sentence ("Well done." / "Impressive!")
+    kept = [s for s in _sentences(t, keep_punct=True) if not _is_gush(s)]
+    if kept:
+        t = " ".join(kept).strip()
+    # 3) at most one question
     if t.count("?") >= 2:
         t = t[: t.find("?") + 1].strip()
     return t
