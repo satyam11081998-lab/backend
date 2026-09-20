@@ -369,8 +369,48 @@ OUTPUT — return ONLY valid JSON (no markdown, no prose) in EXACTLY this shape:
       "body": "<5-8 short lines: a DIFFERENT but equally valid MECE structure for the same case (e.g. a customer-segment cut instead of revenue/cost, or a value-chain lens instead of a market lens), and the ONE non-obvious insight that alternative surfaces which the first road hides.>",
       "insight": "<one line: the non-obvious takeaway>"
     }
-  }
+  },
+  "visuals": [ <0-3 figures — see VISUALS below. Omit or use [] when the case has no quantitative spine.> ]
 }
+
+VISUALS — the CASE drawn, not the score drawn.
+The results page already charts the score from the rubric. These figures are
+about the case itself: the structure or economics a strong answer would have
+built. Return DATA only — never markdown, image links, ASCII art or chart code.
+
+Rules that matter more than coverage:
+- Use ONLY numbers stated in, or directly derivable from, the case prompt and
+  the interviewer's own turns. If the case supplies no figures, return [] — do
+  NOT invent them. A fabricated chart is worse than no chart, because it looks
+  authoritative and the candidate will revise from it.
+- 0-3 figures. Choose the one or two that carry this case's actual logic.
+- Keep every label under ~40 characters.
+
+Shapes, matched to the case's spine:
+
+{"kind":"waterfall","title":"...","caption":"<one sentence>","unit":"<e.g. Rs crore>",
+ "steps":[{"label":"Revenue","value":120},{"label":"COGS","value":-70},{"label":"Profit","value":50,"total":true}]}
+   -> profitability / profit-bridge. Signed values; "total":true draws from zero.
+
+{"kind":"quadrant","title":"...","xLabel":"Market attractiveness","yLabel":"Right to win",
+ "quadrantLabels":["Invest","Win big","Hold","Avoid"],
+ "points":[{"label":"Tier-1 metros","x":0.8,"y":0.7,"recommended":true,"note":"<why>"}]}
+   -> market entry, prioritisation, make-vs-buy. x/y are 0..1. Mark exactly one
+      point "recommended":true when the case supports a clear answer.
+
+{"kind":"tree","title":"...","root":{"label":"Profit","children":[
+   {"label":"Revenue","value":"Rs 120cr","children":[{"label":"Volume"},{"label":"Price"}]},
+   {"label":"Cost","value":"Rs 70cr"}]}}
+   -> driver trees / MECE decompositions. Max 3 levels, 5 children each.
+
+{"kind":"funnel","title":"...","points":[{"label":"Visitors","value":100000},{"label":"Buyers","value":2400}]}
+   -> conversion, adoption, top-down sizing. Largest step first.
+
+{"kind":"bar","title":"...","unit":"%","points":[{"label":"Segment A","value":42}]}
+   -> comparison across segments or options.
+
+{"kind":"line","title":"...","points":[{"label":"FY22","value":80},{"label":"FY23","value":95}]}
+   -> a trend, only when the case actually supplies a series.
 
 APPROACHES RULES (be SPECIFIC and framework-rich — generic interview advice is a failure here):
 - approaches.your_line.exchanges MUST use the candidate's ACTUAL beats from the transcript (2-4 of the most important). Never invent a weakness they didn't show; if a beat was strong, stronger_version is a small sharpening, not a fabricated flaw. If the transcript has too few real exchanges, reconstruct 1-2 representative ones and mark them in you_asked as "(reconstructed from your attempt)".
@@ -382,7 +422,8 @@ APPROACHES RULES (be SPECIFIC and framework-rich — generic interview advice is
 
 CRITICAL: integers only; breakdown sums to score; each dimension_feedback.score equals its breakdown \
 value; strengths/improvements reference what the candidate actually did; score thin/lazy/off-target \
-sessions honestly low; ethical compromise caps presence at 3 with a red_flag.
+sessions honestly low; ethical compromise caps presence at 3 with a red_flag; visuals describe the CASE \
+(never the candidate's performance) and contain no invented figures.
 """
 
 

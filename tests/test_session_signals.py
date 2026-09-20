@@ -9,6 +9,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# The deterministic layer now reaches services/ai_providers.py, which imports
+# the OpenAI SDK at module scope. Stub what is missing BEFORE those imports so
+# this suite keeps its stdlib-only promise; no-op when the SDK is installed.
+# See tests/_sdk_stubs.py for why the fix is here and not in the service.
+from tests._sdk_stubs import install as _install_sdk_stubs  # noqa: E402
+_install_sdk_stubs()
+
+
 from services.session_signals import (  # noqa: E402
     detect_intent, compute_signals, build_signal_block, _looks_garbage,
 )

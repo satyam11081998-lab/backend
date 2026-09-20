@@ -192,6 +192,11 @@ def _enforce_case(feedback: Dict[str, Any], validity: Dict[str, Any]) -> Dict[st
         "model_answer": str(feedback.get("model_answer", "") or "")[:3000],
         "summary": str(feedback.get("summary", "") or "")[:1200],
         "approaches": feedback.get("approaches") if isinstance(feedback.get("approaches"), dict) else None,
+        # Optional case-specific figures. Sanitised, never trusted raw — see
+        # sanitize_visuals. An empty list is the normal outcome for a case with
+        # no quantitative spine, and the results page simply shows no figures
+        # panel in that case.
+        "visuals": sanitize_visuals(feedback.get("visuals")),
         "rubric": "case",
         "validity": validity,
     }
@@ -275,6 +280,9 @@ def score_guesstimate_answer(
         "model_answer": str(parsed.get("model_answer", "") or "")[:3000],
         "summary": str(parsed.get("summary", "") or "")[:1200],
         "approaches": parsed.get("approaches") if isinstance(parsed.get("approaches"), dict) else None,
+        # Same optional figures on the guesstimate rubric — a market-sizing case
+        # is exactly where a funnel or driver tree earns its place.
+        "visuals": sanitize_visuals(parsed.get("visuals")),
         "rubric": "guesstimate",
         "validity": validity,
         "backstop": {
@@ -468,6 +476,162 @@ def _clamp_int(v: Any, lo: int, hi: int) -> int:
     except (TypeError, ValueError):
         n = lo
     return max(lo, min(hi, n))
+
+
+VISUAL_KINDS = {"quadrant", "waterfall", "bar", "line", "funnel", "tree"}
+
+
+# Largest magnitude a figure value may carry. Rupee market sizes reach ~1e14
+# (lakh crore in rupees); past 1e15 it is not a business figure any more, and it
+# renders as exponent notation in a chart captioned "Rs crore". Mirrors
+# MAX_MAGNITUDE in the frontend's lib/results/visuals.ts.
+_VIS_MAX_MAGNITUDE = 1e15
+
+
+def _vis_num(v: Any) -> Optional[float]:
+    # bool is a subclass of int in Python, so float(True) == 1.0 and a JSON
+    # `true` would otherwise be accepted as a data point worth 1.
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f if abs(f) <= _VIS_MAX_MAGNITUDE else None
+
+
+def _vis_str(v: Any, limit: int = 120) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    t = v.strip()
+    return t[:limit] if t else None
+
+
+def _vis_tree(node: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    if not isinstance(node, dict) or depth > 3:
+        return None
+    label = _vis_str(node.get("label") or node.get("name"), 60)
+    if not label:
+        return None
+    kids = []
+    raw_kids = node.get("children")
+    if isinstance(raw_kids, list):
+        for c in raw_kids[:5]:
+            parsed = _vis_tree(c, depth + 1)
+            if parsed:
+                kids.append(parsed)
+    out: Dict[str, Any] = {"label": label}
+    value = _vis_str(node.get("value"), 30)
+    if value:
+        out["value"] = value
+    if kids:
+        out["children"] = kids
+    return out
+
+
+def sanitize_visuals(raw: Any) -> list:
+    """
+    Normalise the scorer's optional `visuals` array into figures the frontend is
+    willing to draw (see lib/results/visuals.ts for the mirrored contract).
+
+    This is a TRUST BOUNDARY, not a convenience. The payload is model output
+    that gets stored in feedback_json and rendered to users, so anything
+    unrecognised, unbounded or malformed is DROPPED here rather than
+    persisted — every string is length-capped, every array is count-capped,
+    quadrant coordinates are clamped to 0..1, and unknown `kind` values are
+    discarded. The frontend re-validates independently; neither side assumes
+    the other did it.
+
+    Never raises: a bad figure must not be able to fail a real score.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:6]:
+        try:
+            if not isinstance(item, dict):
+                continue
+            kind = _vis_str(item.get("kind"), 20)
+            title = _vis_str(item.get("title"), 90)
+            if kind not in VISUAL_KINDS or not title:
+                continue
+            fig: Dict[str, Any] = {"kind": kind, "title": title}
+            caption = _vis_str(item.get("caption"), 200)
+            unit = _vis_str(item.get("unit"), 20)
+            if caption:
+                fig["caption"] = caption
+            if unit:
+                fig["unit"] = unit
+
+            if kind == "quadrant":
+                x_label = _vis_str(item.get("xLabel") or item.get("x_label"), 40)
+                y_label = _vis_str(item.get("yLabel") or item.get("y_label"), 40)
+                pts = []
+                for p in (item.get("points") or [])[:8]:
+                    if not isinstance(p, dict):
+                        continue
+                    label = _vis_str(p.get("label"), 40)
+                    x, y = _vis_num(p.get("x")), _vis_num(p.get("y"))
+                    if label is None or x is None or y is None:
+                        continue
+                    point = {"label": label, "x": min(1.0, max(0.0, x)), "y": min(1.0, max(0.0, y))}
+                    if p.get("recommended") is True:
+                        point["recommended"] = True
+                    note = _vis_str(p.get("note"), 90)
+                    if note:
+                        point["note"] = note
+                    pts.append(point)
+                if len(pts) < 2 or not x_label or not y_label:
+                    continue
+                fig.update({"xLabel": x_label, "yLabel": y_label, "points": pts})
+                ql = item.get("quadrantLabels") or item.get("quadrant_labels")
+                if isinstance(ql, list) and len(ql) == 4:
+                    labels = [_vis_str(q, 28) or "" for q in ql]
+                    fig["quadrantLabels"] = labels
+
+            elif kind == "waterfall":
+                steps = []
+                for st in (item.get("steps") or [])[:10]:
+                    if not isinstance(st, dict):
+                        continue
+                    label = _vis_str(st.get("label"), 30)
+                    value = _vis_num(st.get("value"))
+                    if label is None or value is None:
+                        continue
+                    step = {"label": label, "value": value}
+                    if st.get("total") is True:
+                        step["total"] = True
+                    steps.append(step)
+                if len(steps) < 2:
+                    continue
+                fig["steps"] = steps
+
+            elif kind in ("bar", "line", "funnel"):
+                points = []
+                for pt in (item.get("points") or item.get("data") or [])[:12]:
+                    if not isinstance(pt, dict):
+                        continue
+                    label = _vis_str(pt.get("label") or pt.get("name"), 40)
+                    value = _vis_num(pt.get("value"))
+                    if label is None or value is None:
+                        continue
+                    points.append({"label": label, "value": value})
+                if len(points) < 2:
+                    continue
+                fig["points"] = points
+
+            elif kind == "tree":
+                root = _vis_tree(item.get("root") or item.get("tree"))
+                if not root or not root.get("children"):
+                    continue
+                fig["root"] = root
+
+            out.append(fig)
+        except Exception:  # noqa: BLE001 - one bad figure never costs a real score
+            continue
+    return out
 
 
 def _str_list(v: Any, limit: int = 6) -> list:

@@ -88,8 +88,32 @@ OUTPUT: return ONLY a valid JSON object, no markdown, exactly:
       "body": "<5-8 short lines: the OPPOSITE build (if they went top-down, show bottom-up; if demand-side, show supply-side) and the ONE cross-check it gives — a strong sizer triangulates two independent builds and sees where they disagree.>",
       "insight": "<one line: what triangulating the two builds reveals>"
     }
-  }
+  },
+  "visuals": [ <0-2 figures — see VISUALS below. Use [] if the estimate has no usable decomposition.> ]
 }
+
+VISUALS — the ESTIMATE drawn, not the score drawn.
+A sizing question is the clearest case there is for a figure: the whole answer
+IS a decomposition. Return DATA only — no markdown, image links, ASCII art or
+chart code — and use only numbers from the prompt or from the model estimate
+you just described in top_candidate.walkthrough, so the figure and the
+walkthrough can never contradict each other.
+
+Prefer, in this order:
+
+{"kind":"tree","title":"The build","caption":"<one sentence>","root":{"label":"Total market","value":"~Rs 4,200cr","children":[
+   {"label":"Urban households","value":"90mn","children":[{"label":"Penetration 35%"},{"label":"Rs 1,300/yr"}]},
+   {"label":"Rural households","value":"190mn"}]}}
+   -> the MECE decomposition. Max 3 levels, 5 children each. Best default.
+
+{"kind":"funnel","title":"Top-down funnel","points":[{"label":"Population","value":1400000000},{"label":"Urban","value":500000000},{"label":"Buyers","value":42000000}]}
+   -> a top-down narrowing. Largest step first.
+
+{"kind":"bar","title":"Segment contribution","unit":"Rs crore","points":[{"label":"Metro","value":2100}]}
+   -> where the total actually comes from, once segments are multiplied out.
+
+Do NOT invent precision the estimate does not have — round figures are correct
+here, and a chart implying three significant figures on a guess is a lie.
 
 APPROACHES RULES (be SPECIFIC and technique-rich — generic sizing advice is a failure here):
 - approaches IS MANDATORY on EVERY response — include it even when the candidate's answer is weak, incomplete, or scores 0. A candidate who bombs the estimate needs the teaching MOST, so top_candidate (with a full flow + non-empty frameworks) and third_angle must ALWAYS be present and fully filled. Never omit the approaches object, never return empty frameworks, never return an empty flow. If the candidate gave almost nothing, reconstruct your_line from whatever they attempted (mark it "(reconstructed from your attempt)") and still give the complete top_candidate and third_angle.

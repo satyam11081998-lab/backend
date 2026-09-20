@@ -88,14 +88,55 @@ OUTPUT — return ONLY valid JSON (no markdown, no prose) in EXACTLY this shape:
   "improvements": ["<specific, actionable fix tied to what they wrote>", "..."],
   "red_flags": ["<gaming/ethics/logic problem if any — omit or [] if none>"],
   "model_answer": "<5-8 short lines: how a strong candidate would actually approach THIS case — the clarifying questions, the MECE structure, the key calculation or driver, the sanity check, and the top-down recommendation. Concrete to this case, not generic.>",
-  "summary": "<3-5 sentence honest debrief, motivating without sugarcoating - this is what brings them back. Open with the one thing they genuinely did well, say where they stand and the SINGLE biggest lever, and end with the one concrete thing to practise next, framed so they want another attempt. Never crush a weak answer, never inflate a lazy one.>"
+  "summary": "<3-5 sentence honest debrief, motivating without sugarcoating - this is what brings them back. Open with the one thing they genuinely did well, say where they stand and the SINGLE biggest lever, and end with the one concrete thing to practise next, framed so they want another attempt. Never crush a weak answer, never inflate a lazy one.>",
+  "visuals": [ <0-3 figures — see VISUALS below. Omit entirely or use [] when the case has no quantitative spine.> ]
 }
+
+VISUALS — the case drawn, not the score drawn.
+The results page already charts the SCORE from the rubric. These are about the
+CASE: the structure or economics a strong answer would have built. Emit DATA
+only; the app owns every pixel, so never return markdown, image links, ASCII art
+or chart code.
+
+Rules that matter more than coverage:
+- Use ONLY numbers stated in or directly derivable from the case prompt. If the
+  case gives no figures, DO NOT invent them — return [] instead. A fabricated
+  chart is far worse than no chart, because it looks authoritative.
+- 0-3 figures. Pick the one or two that carry the case's actual logic.
+- Every label under ~40 characters; keep them readable at a glance.
+
+Pick the shape that matches the case's spine:
+
+{"kind":"waterfall","title":"...","caption":"<one sentence>","unit":"<e.g. Rs crore>",
+ "steps":[{"label":"Revenue","value":120},{"label":"COGS","value":-70},{"label":"Profit","value":50,"total":true}]}
+   -> profitability / profit-bridge cases. Signed values; "total":true draws from zero.
+
+{"kind":"quadrant","title":"...","xLabel":"Market attractiveness","yLabel":"Right to win",
+ "quadrantLabels":["Invest","Win big","Hold","Avoid"],
+ "points":[{"label":"Tier-1 metros","x":0.8,"y":0.7,"recommended":true,"note":"<why>"}]}
+   -> market entry, prioritisation, make-vs-buy. x and y are 0..1. Mark exactly
+      one point "recommended":true when the case supports a clear answer.
+
+{"kind":"tree","title":"...","root":{"label":"Profit","children":[
+   {"label":"Revenue","value":"Rs 120cr","children":[{"label":"Volume"},{"label":"Price"}]},
+   {"label":"Cost","value":"Rs 70cr"}]}}
+   -> driver trees and MECE decompositions. Max 3 levels deep, 5 children each.
+
+{"kind":"funnel","title":"...","points":[{"label":"Visitors","value":100000},{"label":"Buyers","value":2400}]}
+   -> conversion, adoption, market sizing top-down. Order the steps largest first.
+
+{"kind":"bar","title":"...","unit":"%","points":[{"label":"Segment A","value":42}]}
+   -> comparison across segments or options.
+
+{"kind":"line","title":"...","points":[{"label":"FY22","value":80},{"label":"FY23","value":95}]}
+   -> a trend over time, only when the case actually supplies a series.
 
 CRITICAL:
 - Integers only. breakdown sums to score. Each dimension_feedback.score equals its breakdown value.
 - strengths/improvements reference what the candidate actually wrote — never generic advice.
 - If the answer is thin, lazy, contradictory or off-target, score it honestly low. Do NOT inflate.
 - Ethical compromise (data manipulation, dishonest recommendation): cap presence at 3 and add a red_flag.
+- visuals describe the CASE, never the candidate's performance, and never contain invented figures.
 """
 
 

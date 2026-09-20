@@ -35,6 +35,7 @@ from services.interview_engine import (
 from services.session_signals import compute_signals
 from services.interviewer_decision import update_session_state, detect_violations
 from services.badge_awarder import award_badges_for_submission
+from services.case_figures import pop_figures, bank_figures
 from services.ai_usage import assert_daily_budget, log_realtime_usage
 from services.realtime_credits import deduct as deduct_realtime_credit
 
@@ -805,20 +806,49 @@ async def submit_attempt(
     flat_lines.append(f"[FINAL RECOMMENDATION] {body.final_recommendation}")
     answer_text = "\n".join(flat_lines)
 
-    sub_res = (
-        supabase.table("submissions")
-        .insert(
-            {
-                "user_id": user_id,
-                "case_id": attempt["case_id"],
-                "answer_text": answer_text,
-                "score": feedback["score"],
-                "feedback_json": feedback,
-            }
-        )
-        .execute()
-    )
+    # ── Split the PAYWALLED figures out of the submission ────────────────
+    # `visuals` (the worked profit bridge / 2x2 / driver tree) are a Pro
+    # feature. They must NOT live in feedback_json, because that row belongs to
+    # the user: submissions_select_own (0006) lets them read their own row
+    # straight from PostgREST with their browser JWT, and three server pages
+    # already pass whole feedback_json blobs into client components. Anything
+    # left in here is effectively public to its owner.
+    #
+    # So they are popped BEFORE the insert and written to case_figures
+    # (migration 0069), which has RLS on and no policy — service role only.
+    _figures = pop_figures(feedback)
+
+    # The back-link to the conversation this score came from (migration 0068).
+    # Without it nothing can get from a scored submission to its transcript,
+    # which is why admin analytics reported "conversation not found": the
+    # forward link attempts.submission_id is set further down, but every
+    # consumer starts from the submission, not the attempt.
+    _sub_row = {
+        "user_id": user_id,
+        "case_id": attempt["case_id"],
+        "attempt_id": attempt_id,
+        "answer_text": answer_text,
+        "score": feedback["score"],
+        "feedback_json": feedback,
+    }
+    try:
+        sub_res = supabase.table("submissions").insert(_sub_row).execute()
+    except Exception as _e:  # noqa: BLE001
+        # Pre-0068 database: the column does not exist yet. Scoring a real
+        # attempt must never fail because a migration is outstanding, so drop
+        # the new column and insert exactly as before. attempts.submission_id
+        # below still records the forward link, and 0068's backfill recovers
+        # this row's attempt_id the moment the migration is run.
+        if "attempt_id" not in str(_e):
+            raise
+        print(f"WARN: submissions.attempt_id not present (run migration 0068): {_e}")
+        _sub_row.pop("attempt_id", None)
+        sub_res = supabase.table("submissions").insert(_sub_row).execute()
     submission_id = sub_res.data[0]["id"]
+
+    # Bank the case's figures — one row per CASE, best-scoring answer wins.
+    # Best-effort inside the helper; never fails a scored submit.
+    bank_figures(supabase, attempt["case_id"], _figures, submission_id, feedback["score"])
 
     # Silent self-improvement: if this scored session clears the bar, bank an
     # anonymised exemplar for THIS case so future scoring calibrates against real

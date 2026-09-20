@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 from services.supabase_client import get_supabase_client
+from services.case_figures import pop_figures, bank_figures
 from services.ai_scorer import score_case_answer, score_guesstimate_answer, AIScoringError
 from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
@@ -127,7 +128,14 @@ async def submit_answer(
             detail=f"AI scoring failed: {str(e)}"
         )
 
-    # Step 3: Save submission to Supabase
+    # Step 3: Save submission to Supabase.
+    #
+    # The PAYWALLED case figures are split out first — see
+    # services/case_figures.py for why they can never live in feedback_json.
+    # This legacy path inserts the same column as routes/attempts.py and was
+    # missed when the split was first written; both go through the helper now.
+    figures = pop_figures(feedback)
+
     try:
         result = supabase.table("submissions").insert({
             "user_id": submission.user_id,
@@ -147,6 +155,14 @@ async def submit_answer(
             status_code=500,
             detail="Supabase returned empty result"
         )
+
+    bank_figures(
+        supabase,
+        submission.case_id,
+        figures,
+        result.data[0].get("id"),
+        feedback["score"],
+    )
 
     saved_submission = result.data[0]
 
