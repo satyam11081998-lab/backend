@@ -19,6 +19,7 @@ from openai import OpenAI
 
 from services.ai_usage import log_ai_usage
 from services.ai_providers import chat_with_fallback
+from services.model_json import parse_model_json
 
 
 class GeneratedAbstractBrief(TypedDict):
@@ -92,9 +93,12 @@ OUTPUT: a valid JSON object with EXACTLY these keys:
 
 
 def generate_abstract_brief(topic: str) -> GeneratedAbstractBrief:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise AbstractBriefError("OPENAI_API_KEY not set")
+    # A provider-agnostic gate. Gating on OPENAI_API_KEY specifically would break
+    # this the moment that key is removed to stop OpenAI spend — even though the
+    # chain would have served the call on Gemini. chat_with_fallback() decides
+    # which key is actually needed.
+    if not any(os.environ.get(k, "").strip() for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY")):
+        raise AbstractBriefError("No AI provider key is configured")
     topic = (topic or "").strip()
     if not topic:
         raise AbstractBriefError("Empty topic")
@@ -130,9 +134,9 @@ def generate_abstract_brief(topic: str) -> GeneratedAbstractBrief:
     if not raw:
         raise AbstractBriefError("OpenAI returned empty response")
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise AbstractBriefError(f"OpenAI returned invalid JSON: {e}")
+        parsed = parse_model_json(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise AbstractBriefError(f"Model returned invalid JSON: {e}")
 
     def _list(key: str, cap: int) -> List[str]:
         vals = parsed.get(key, [])

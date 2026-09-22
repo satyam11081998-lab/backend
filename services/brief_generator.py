@@ -25,6 +25,7 @@ from openai import OpenAI
 
 from services.ai_usage import log_ai_usage
 from services.ai_providers import chat_with_fallback
+from services.model_json import parse_model_json
 
 
 class GeneratedBrief(TypedDict):
@@ -124,9 +125,12 @@ def generate_brief(
     
     Raises BriefGenerationError on any failure. Caller should handle gracefully.
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise BriefGenerationError("OPENAI_API_KEY not set")
+    # A provider-agnostic gate. Gating on OPENAI_API_KEY specifically would break
+    # this the moment that key is removed to stop OpenAI spend — even though the
+    # chain would have served the call on Gemini. chat_with_fallback() decides
+    # which key is actually needed.
+    if not any(os.environ.get(k, "").strip() for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY")):
+        raise BriefGenerationError("No AI provider key is configured")
     
     if not headline_title or not headline_title.strip():
         raise BriefGenerationError("Empty headline title")
@@ -176,9 +180,10 @@ def generate_brief(
         raise BriefGenerationError("OpenAI returned empty response")
     
     try:
-        parsed = json.loads(raw_content)
-    except json.JSONDecodeError as e:
-        raise BriefGenerationError(f"OpenAI returned invalid JSON: {e}")
+        # Tolerant parse: Gemini may fence or wrap the object (see model_json).
+        parsed = parse_model_json(raw_content)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise BriefGenerationError(f"Model returned invalid JSON: {e}")
     
     # Validate required fields and provide defensive fallbacks
     required_keys = [

@@ -18,6 +18,7 @@ from openai import OpenAI
 
 from services.ai_usage import log_ai_usage
 from services.ai_providers import chat_with_fallback
+from services.model_json import parse_model_json
 
 
 class ClassifiedHeadline(TypedDict):
@@ -95,7 +96,7 @@ Example output structure:
 CHUNK_SIZE = 20  # keep each OpenAI call small so it finishes well under the timeout
 
 
-def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[ClassifiedHeadline]:
+def _classify_batch(raw_headlines: List[dict], client: Optional[OpenAI]) -> List[ClassifiedHeadline]:
     """Classify ONE small batch in a single OpenAI call. Raises ClassificationError on failure."""
     headlines_for_ai = [
         {
@@ -138,9 +139,9 @@ def _classify_batch(raw_headlines: List[dict], client: OpenAI) -> List[Classifie
         raise ClassificationError("OpenAI returned empty response")
 
     try:
-        parsed = json.loads(raw_content)
-    except json.JSONDecodeError as e:
-        raise ClassificationError(f"OpenAI returned invalid JSON: {e}")
+        parsed = parse_model_json(raw_content)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ClassificationError(f"Model returned invalid JSON: {e}")
 
     classified_array = parsed.get("classified", [])
     if not isinstance(classified_array, list) or len(classified_array) == 0:
@@ -206,12 +207,18 @@ def classify_headlines(raw_headlines: List[dict]) -> List[ClassifiedHeadline]:
     if not raw_headlines:
         return []
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ClassificationError("OPENAI_API_KEY not set")
+    # A provider-agnostic gate. Gating on OPENAI_API_KEY specifically would break
+    # this the moment that key is removed to stop OpenAI spend — even though the
+    # chain would have served the call on Gemini. chat_with_fallback() decides
+    # which key is actually needed.
+    if not any(os.environ.get(k, "").strip() for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY")):
+        raise ClassificationError("No AI provider key is configured")
 
-    # Small chunks -> 60s + 1 retry is ample headroom per call.
-    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
+    # Vestigial: _classify_batch routes through chat_with_fallback and never
+    # touches this client. Kept so the helper signature is unchanged; None when
+    # there is no OpenAI key, which is now a supported state.
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    client = OpenAI(api_key=openai_key, timeout=60.0, max_retries=1) if openai_key else None
 
     results: List[ClassifiedHeadline] = []
     errors: List[str] = []

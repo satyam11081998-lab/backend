@@ -34,6 +34,15 @@ PRICES = {  # (input $/1M, output $/1M)
     # fast; kept here so its turns aren't mispriced against the gpt-4o default.
     "llama-3.3-70b-versatile": (0.59, 0.79),
 }
+# Gemini text models. WITHOUT an entry here _est_cost() falls through to its
+# gpt-4o default of (2.50, 10.00) and books roughly $0.02 for a call that cost
+# nothing — and since spend_today_usd() feeds assert_daily_budget(), a day of
+# free-tier briefs would cross AI_DAILY_BUDGET_USD and 503 *every* AI feature in
+# the product. Priced at zero for the free tier; override via env if you move to
+# a paid Gemini tier so the kill switch keeps seeing real money.
+GEMINI_TEXT_IN_PER_1M = float(os.getenv("GEMINI_TEXT_IN_PER_1M", "0.0"))
+GEMINI_TEXT_OUT_PER_1M = float(os.getenv("GEMINI_TEXT_OUT_PER_1M", "0.0"))
+
 WHISPER_PER_MIN = 0.006
 # Groq's whisper-large-v3-turbo is ~$0.04/hr ≈ $0.000667/min — ~9x cheaper than
 # OpenAI Whisper, same underlying model. Used when transcribe routes to Groq.
@@ -116,7 +125,15 @@ def _ist_day_start_utc_iso() -> str:
 
 
 def _est_cost(model: str, pt: Optional[int], ct: Optional[int]) -> float:
-    i, o = PRICES.get(model, (2.50, 10.00))
+    name = (model or "").lower()
+    # Gemini text models are matched by PREFIX, not by exact name: Google retires
+    # and renames them (2.0-flash -> 3.x-flash) and an unrecognised name would
+    # otherwise be billed at the gpt-4o fallback rate. "live" is excluded — those
+    # rows are audio-priced in log_ai_usage() above and never reach here.
+    if name.startswith("gemini") and "live" not in name:
+        i, o = GEMINI_TEXT_IN_PER_1M, GEMINI_TEXT_OUT_PER_1M
+    else:
+        i, o = PRICES.get(model, (2.50, 10.00))
     return (pt or 0) * i / 1e6 + (ct or 0) * o / 1e6
 
 
