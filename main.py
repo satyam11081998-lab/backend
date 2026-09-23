@@ -72,6 +72,10 @@ from routes import agentic as _agentic
 app.include_router(_agentic.router)
 from routes import coach as _coach
 app.include_router(_coach.router)
+# Prep Copilot v2 (role/company-aware, isolated). Self-gates on COPILOT_V2_ENABLED;
+# heavy pieces import lazily inside handlers so this can never affect app startup.
+from routes import copilot as _copilot
+app.include_router(_copilot.router)
 from routes import seo as _seo
 app.include_router(_seo.router)
 from routes import broadcast as _broadcast

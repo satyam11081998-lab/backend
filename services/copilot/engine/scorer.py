@@ -1,0 +1,653 @@
+# ============================================================================
+# MECE PREP COPILOT - ISOLATED COPY. Do NOT sync with the original.
+# Copied services/ai_scorer.py on 2026-09-23 for the role/company-aware Prep Copilot (v2).
+# Tweak freely here; the LIVE cases/guesstimates engine is the ORIGINAL and is
+# never imported from this package. See .brain/handoffs/ANTIGRAVITY_HANDOFF_prep-copilot-v2.md
+# ============================================================================
+"""
+AI Scorer - calls OpenAI to evaluate case interview answers.
+
+Pipeline (2026-09-01):
+  1. answer_validity.screen_answer() decides if this is a genuine attempt.
+     - gibberish / off_topic  -> score 0 with an explanation, NO expensive call.
+     - thin                   -> full scoring, but the scorer is told not to inflate.
+     - valid                  -> full scoring.
+  2. The model scores against an evidence-based rubric and returns richer feedback.
+  3. Code ENFORCES the marking deterministically: clamp each dimension to its max
+     and recompute the total from the breakdown (never trust the model's own sum).
+
+The model and prompt logic are isolated here so we can swap providers without
+touching the rest of the codebase. All new feedback fields are ADDITIVE — the
+C2 return contract (score/breakdown/strengths/improvements/summary + guesstimate
+total/dimensions/backstop) is preserved.
+"""
+
+import os
+import json
+import time
+from typing import Dict, Any, Optional
+from openai import OpenAI
+from dotenv import load_dotenv
+
+from services.ai_usage import log_ai_usage
+from services.answer_validity import screen_answer
+
+from services.copilot.engine.prompts_scoring import SCORING_SYSTEM_PROMPT, build_scoring_user_prompt
+from services.copilot.engine.prompts_guess_scoring import (
+    GUESSTIMATE_SCORING_SYSTEM_PROMPT,
+    build_guesstimate_user_prompt,
+)
+from services.guesstimate_backstop import apply_backstop, DIMENSIONS as GUESSTIMATE_DIMS
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OPENAI_API_KEY in .env file")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Model selection - GPT-4o is reliable for structured output
+SCORING_MODEL = "gpt-4o"
+# Guesstimates are arithmetic-driven and the deterministic backstop catches the math.
+GUESSTIMATE_SCORING_MODEL = "gpt-4o-mini"
+
+# Dimension ceilings for the 6-dim case rubric (must total 100).
+CASE_DIM_MAX = {
+    "structure": 25,
+    "quantitative": 20,
+    "synthesis": 20,
+    "business_judgment": 15,
+    "creativity": 10,
+    "presence": 10,
+}
+
+
+class AIScoringError(Exception):
+    """Raised when AI scoring fails for any reason."""
+    pass
+
+
+# Off-topic false positives are the one way this gate could hurt a real user, so
+# only HARD-reject (score 0) when relevance is genuinely near zero. Gibberish is
+# unambiguous and always gates; a borderline off_topic call with real relevance is
+# scored instead, just flagged 'thin' so the scorer does not inflate it.
+_OFF_TOPIC_RELEVANCE_FLOOR = 25
+
+
+def _is_hard_reject(validity: Dict[str, Any]) -> bool:
+    verdict = validity.get("verdict")
+    if verdict == "gibberish":
+        return True
+    if verdict == "off_topic":
+        try:
+            relevance = int(validity.get("relevance", 0))
+        except (TypeError, ValueError):
+            relevance = 0
+        return relevance < _OFF_TOPIC_RELEVANCE_FLOOR
+    return False
+
+
+# ---------------------------------------------------------------------------
+# CASE SCORING
+# ---------------------------------------------------------------------------
+
+def score_case_answer(
+    case_content: str,
+    case_type: str,
+    user_answer: str,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Screen the answer, then (if it is a genuine attempt) score it against the
+    evidence-based rubric. Gibberish/off-topic returns a 0 with an explanation and
+    never reaches the expensive model call.
+
+    Returns a feedback dict: score, breakdown(6 dims), strengths, improvements,
+    summary, rubric='case', plus additive dimension_feedback / red_flags /
+    model_answer / validity.
+    """
+    validity = screen_answer(case_content, case_type, user_answer, user_id)
+    if _is_hard_reject(validity):
+        return _rejection_case(case_type, validity)
+
+    user_prompt = build_scoring_user_prompt(
+        case_content=case_content,
+        case_type=case_type,
+        user_answer=user_answer,
+        # A genuine-but-thin answer, or a borderline off_topic we chose to score,
+        # must not be inflated.
+        thin=validity["verdict"] in ("thin", "off_topic"),
+    )
+
+    try:
+        t0 = time.time()
+        response = client.chat.completions.create(
+            model=SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=8000,  # richer output (per-dimension feedback + model answer + approaches); was 4000
+            response_format={"type": "json_object"},
+        )
+        log_ai_usage(user_id=user_id, endpoint="/submit", model=SCORING_MODEL,
+                     response=response, latency_ms=int((time.time() - t0) * 1000))
+    except Exception as e:
+        raise AIScoringError(f"OpenAI API call failed: {str(e)}")
+
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        raise AIScoringError("OpenAI returned empty response")
+
+    try:
+        feedback = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        raise AIScoringError(
+            f"OpenAI returned invalid JSON: {str(e)}. Raw: {raw_content[:200]}"
+        )
+
+    required_keys = {"score", "breakdown", "strengths", "improvements", "summary"}
+    missing = required_keys - set(feedback.keys())
+    if missing:
+        raise AIScoringError(f"OpenAI response missing keys: {missing}")
+
+    if not isinstance(feedback.get("breakdown"), dict):
+        raise AIScoringError("OpenAI response 'breakdown' is not an object")
+    missing_breakdown = set(CASE_DIM_MAX) - set(feedback["breakdown"].keys())
+    if missing_breakdown:
+        raise AIScoringError(f"OpenAI breakdown missing keys: {missing_breakdown}")
+
+    return _enforce_case(feedback, validity)
+
+
+def _enforce_case(feedback: Dict[str, Any], validity: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Never trust the model's own arithmetic: clamp each dimension to its ceiling and
+    recompute the total from the clamped breakdown, so the number and the bars can
+    never disagree. Normalise the additive fields and attach the validity verdict.
+    """
+    breakdown = {
+        dim: _clamp_int(feedback["breakdown"].get(dim, 0), 0, CASE_DIM_MAX[dim])
+        for dim in CASE_DIM_MAX
+    }
+    score = sum(breakdown.values())  # authoritative — sums to <= 100 by construction
+
+    # Per-dimension feedback, defaulted and kept consistent with the final scores.
+    raw_df = feedback.get("dimension_feedback")
+    dimension_feedback: Dict[str, Any] = {}
+    for dim in CASE_DIM_MAX:
+        entry = raw_df.get(dim) if isinstance(raw_df, dict) else None
+        if not isinstance(entry, dict):
+            entry = {}
+        dimension_feedback[dim] = {
+            "score": breakdown[dim],
+            "evidence": str(entry.get("evidence", "") or "")[:600],
+            "gap": str(entry.get("gap", "") or "")[:600],
+            "to_improve": str(entry.get("to_improve", "") or "")[:600],
+        }
+
+    return {
+        "score": score,
+        "breakdown": breakdown,
+        "dimension_feedback": dimension_feedback,
+        "strengths": _str_list(feedback.get("strengths"), limit=6),
+        "improvements": _str_list(feedback.get("improvements"), limit=6),
+        "red_flags": _str_list(feedback.get("red_flags"), limit=6),
+        "model_answer": str(feedback.get("model_answer", "") or "")[:3000],
+        "summary": str(feedback.get("summary", "") or "")[:1200],
+        "approaches": feedback.get("approaches") if isinstance(feedback.get("approaches"), dict) else None,
+        # Optional case-specific figures. Sanitised, never trusted raw — see
+        # sanitize_visuals. An empty list is the normal outcome for a case with
+        # no quantitative spine, and the results page simply shows no figures
+        # panel in that case.
+        "visuals": sanitize_visuals(feedback.get("visuals")),
+        "rubric": "case",
+        "validity": validity,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GUESSTIMATE SCORING
+# ---------------------------------------------------------------------------
+
+def score_guesstimate_answer(
+    case_content: str,
+    user_answer: str,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Score a GUESSTIMATE answer. Same validity gate as cases; then one gpt-4o-mini
+    call returns the 5 rubric dims + a transcribed calc-chain, and the deterministic
+    backstop recomputes the math, OVERRIDES the arithmetic dimension, and caps the
+    total. We never trust the LLM's own arithmetic.
+
+    Returns (C2-stable): score, breakdown(5 dims), strengths, improvements, summary,
+    rubric='guesstimate', backstop{...}; plus additive red_flags / model_answer /
+    validity.
+    """
+    validity = screen_answer(case_content, "guesstimate", user_answer, user_id)
+    if _is_hard_reject(validity):
+        return _rejection_guesstimate(validity)
+
+    user_prompt = build_guesstimate_user_prompt(
+        case_content=case_content,
+        user_answer=user_answer,
+    )
+
+    try:
+        t0 = time.time()
+        response = client.chat.completions.create(
+            model=GUESSTIMATE_SCORING_MODEL,
+            messages=[
+                {"role": "system", "content": GUESSTIMATE_SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=4000,  # was 2500; room for the 3-approach block
+            response_format={"type": "json_object"},
+        )
+        log_ai_usage(user_id=user_id, endpoint="/submit", model=GUESSTIMATE_SCORING_MODEL,
+                     response=response, latency_ms=int((time.time() - t0) * 1000))
+    except Exception as e:
+        raise AIScoringError(f"OpenAI API call failed (guesstimate): {str(e)}")
+
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        raise AIScoringError("OpenAI returned empty response (guesstimate)")
+
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        raise AIScoringError(
+            f"OpenAI returned invalid JSON (guesstimate): {str(e)}. Raw: {raw_content[:200]}"
+        )
+
+    dims = parsed.get("dimensions")
+    chain = parsed.get("calc_chain") or {"steps": [], "finalValue": 0}
+    if not isinstance(dims, dict):
+        raise AIScoringError("Guesstimate response missing 'dimensions'")
+
+    # Each guesstimate dimension is now scored 0-100 (was 1-5); the backstop still
+    # overrides arithmetic and caps the total, all on the 0-100 scale.
+    llm_dims = {d: _clamp_int(dims.get(d, 60), 0, 100) for d in GUESSTIMATE_DIMS}
+
+    # Deterministic backstop: recompute the chain, override arithmetic, cap total.
+    final = apply_backstop(llm_dims, chain, band=None)
+
+    result = {
+        "score": int(final["total"]),
+        "breakdown": final["dimensions"],
+        "scale": 100,  # guesstimate dimensions are on a 0-100 scale
+        "strengths": _str_list(parsed.get("strengths"), limit=6),
+        "improvements": _str_list(parsed.get("improvements"), limit=6),
+        "red_flags": _str_list(parsed.get("red_flags"), limit=6),
+        "model_answer": str(parsed.get("model_answer", "") or "")[:3000],
+        "summary": str(parsed.get("summary", "") or "")[:1200],
+        "approaches": parsed.get("approaches") if isinstance(parsed.get("approaches"), dict) else None,
+        # Same optional figures on the guesstimate rubric — a market-sizing case
+        # is exactly where a funnel or driver tree earns its place.
+        "visuals": sanitize_visuals(parsed.get("visuals")),
+        "rubric": "guesstimate",
+        "validity": validity,
+        "backstop": {
+            "findings": final["backstop"]["findings"],
+            "summary": final["backstop"]["summary"],
+            "notChecked": final["backstop"]["notChecked"],
+            "arithmeticOverridden": final["arithmeticOverridden"],
+            "rawTotal": final["rawTotal"],
+            "totalCapFactor": final["backstop"]["totalCapFactor"],
+        },
+    }
+    # GUARANTEE the 3-approach block. gpt-4o-mini occasionally drops it despite the
+    # prompt, so if it's missing/empty we re-ask once for JUST the approaches, and if
+    # that still misses, fill a deterministic fallback — the teaching ALWAYS renders.
+    return _ensure_guess_approaches(case_content, user_answer, result, user_id)
+
+
+def _guess_approaches_valid(ap: Any) -> bool:
+    """Matches the results-page render + eval check: all three keys present and
+    top_candidate.frameworks non-empty."""
+    if not isinstance(ap, dict):
+        return False
+    if not all(k in ap for k in ("your_line", "top_candidate", "third_angle")):
+        return False
+    tc = ap.get("top_candidate")
+    return isinstance(tc, dict) and bool(tc.get("frameworks"))
+
+
+def _fallback_guess_approaches(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic safety net so approaches is never missing. Uses the model_answer
+    we already have (case-specific) as the top_candidate walkthrough; frameworks name
+    the techniques that walkthrough applies, so they are not empty name-drops."""
+    ma = (result.get("model_answer") or "").strip() or (
+        "Decompose top-down: start from the population, filter to the relevant segment, "
+        "apply a per-unit rate, multiply through, then sanity-check against a known anchor."
+    )
+    return {
+        "your_line": {"title": "Your line — tightened", "exchanges": [
+            {"you_asked": "(reconstructed from your attempt)", "interviewer_said": "—",
+             "stronger_version": "State each assumption as a number and justify it, then cross-check the final figure against a per-capita anchor.",
+             "why": "Turns a vague estimate into a defensible one."}
+        ]},
+        "top_candidate": {"title": "How a top-firm candidate sizes this",
+            "walkthrough": ma,
+            "frameworks": ["Top-down population funnel", "Segmentation of the addressable base", "Per-capita sanity anchor"]},
+        "third_angle": {"title": "The other road — the build you didn't use",
+            "body": "Cross-check with the opposite build: if you sized this top-down from the population, rebuild it bottom-up from supply (outlets or units × throughput). Where the two builds disagree tells you which assumption is doing the work.",
+            "insight": "Triangulating two independent builds beats one build you can't check."},
+    }
+
+
+_GUESS_APPROACHES_SYS = (
+    "You output ONLY the `approaches` JSON for a guesstimate debrief — nothing else. Return a JSON "
+    "object shaped exactly: {\"approaches\": {\"your_line\": {\"title\": str, \"exchanges\": "
+    "[{\"you_asked\": str, \"interviewer_said\": str, \"stronger_version\": str, \"why\": str}]}, "
+    "\"top_candidate\": {\"title\": str, \"flow\": [{\"step\": str, \"move\": str, \"framework\": str}], "
+    "\"walkthrough\": str, \"frameworks\": [str, ...]}, \"third_angle\": {\"title\": str, \"body\": str, "
+    "\"insight\": str}}}. frameworks MUST be non-empty and name real techniques actually applied to THIS "
+    "estimate (e.g. 'Top-down population funnel', 'Bottom-up unit economics', 'Per-capita sanity anchor'). "
+    "third_angle is the OPPOSITE build (top-down vs bottom-up). Be concrete with the numbers."
+)
+
+
+def _ensure_guess_approaches(case_content: str, user_answer: str,
+                             result: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
+    if _guess_approaches_valid(result.get("approaches")):
+        return result
+    # (1) re-ask once for just the approaches block — cheap, focused, high success.
+    try:
+        u = (f"GUESSTIMATE PROMPT:\n{case_content}\n\nCANDIDATE ANSWER:\n{user_answer}\n\n"
+             f"REFERENCE MODEL ANSWER (for the top-candidate walkthrough):\n"
+             f"{result.get('model_answer','')}\n\nProduce ONLY the approaches JSON.")
+        resp = client.chat.completions.create(
+            model=GUESSTIMATE_SCORING_MODEL,
+            messages=[{"role": "system", "content": _GUESS_APPROACHES_SYS},
+                      {"role": "user", "content": u}],
+            temperature=0.3, max_tokens=1500, response_format={"type": "json_object"},
+        )
+        log_ai_usage(user_id=user_id, endpoint="/submit", model=GUESSTIMATE_SCORING_MODEL, response=resp, latency_ms=0)
+        data = json.loads(resp.choices[0].message.content or "{}")
+        ap = data.get("approaches") if isinstance(data.get("approaches"), dict) else data
+        if _guess_approaches_valid(ap):
+            result["approaches"] = ap
+            return result
+    except Exception:
+        pass
+    # (2) deterministic fallback — approaches is never missing.
+    result["approaches"] = _fallback_guess_approaches(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# HARD-GATE (score 0) FEEDBACK — genuine, educational, but no credit.
+# ---------------------------------------------------------------------------
+
+_REJECT_STEPS_DEFAULT = [
+    "Start with 1-2 clarifying questions (scope, geography, timeframe) before solving.",
+    "Lay out a MECE structure — the distinct, non-overlapping buckets you'll analyse.",
+    "Quantify the key driver and show the calculation, then sanity-check the number.",
+    "State a top-down recommendation first, then the 2-3 reasons that support it.",
+]
+_REJECT_STEPS_GUESSTIMATE = [
+    "Restate what you're estimating and the units (per year? India only? new vs replacement?).",
+    "Build a top-down or bottom-up tree from a sensible driver, split into MECE segments.",
+    "Assume defensible per-segment numbers and show the multiplication step by step.",
+    "Sanity-check the final figure against a known anchor (per-capita, a comparable market).",
+]
+
+_REJECT_MODEL_CASE = (
+    "A real attempt would: (1) ask a clarifying question to bound the problem; "
+    "(2) lay out a MECE framework tailored to this case; (3) prioritise the biggest driver "
+    "(Pareto) and work the numbers with a sanity check; (4) generate a hypothesis or two; "
+    "(5) close top-down — recommendation first, then the supporting reasons and key risk."
+)
+_REJECT_MODEL_GUESSTIMATE = (
+    "A real attempt would: state the estimate and units; pick a driver and decompose it into "
+    "MECE segments; assign defensible per-segment assumptions; multiply through, showing each "
+    "step; then sanity-check the total against a known anchor."
+)
+
+
+def _rejection_case(case_type: str, validity: Dict[str, Any]) -> Dict[str, Any]:
+    reason = validity.get("reason") or "It did not read as a genuine attempt to solve this case."
+    label = "off-topic" if validity["verdict"] == "off_topic" else "not a genuine attempt"
+    zero_df = {
+        dim: {
+            "score": 0,
+            "evidence": "none",
+            "gap": "No genuine attempt at this dimension was detected.",
+            "to_improve": step,
+        }
+        for dim, step in zip(CASE_DIM_MAX.keys(), _REJECT_STEPS_DEFAULT + _REJECT_STEPS_DEFAULT)
+    }
+    return {
+        "score": 0,
+        "breakdown": {dim: 0 for dim in CASE_DIM_MAX},
+        "dimension_feedback": zero_df,
+        "strengths": [],
+        "improvements": _REJECT_STEPS_DEFAULT,
+        "red_flags": [f"Scored 0 — {label}. {reason}"],
+        "model_answer": _REJECT_MODEL_CASE,
+        "summary": (
+            f"This wasn't scored as a case answer — {reason} "
+            "A genuine attempt needs a clarifying question, a MECE structure, some quantification, "
+            "and a top-down recommendation. Give it a real try and you'll get a full breakdown."
+        ),
+        "approaches": None,
+        "rubric": "case",
+        "validity": validity,
+    }
+
+
+def _rejection_guesstimate(validity: Dict[str, Any]) -> Dict[str, Any]:
+    reason = validity.get("reason") or "It did not read as a genuine estimation attempt."
+    label = "off-topic" if validity["verdict"] == "off_topic" else "not a genuine attempt"
+    return {
+        "score": 0,
+        "breakdown": {d: 0 for d in GUESSTIMATE_DIMS},  # 0 on the 0-100 scale
+        "scale": 100,
+        "strengths": [],
+        "improvements": _REJECT_STEPS_GUESSTIMATE,
+        "red_flags": [f"Scored 0 — {label}. {reason}"],
+        "model_answer": _REJECT_MODEL_GUESSTIMATE,
+        "summary": (
+            f"This wasn't scored as an estimation — {reason} "
+            "Lay out the units, a MECE decomposition, defensible assumptions with the math shown, "
+            "and a sanity check, and you'll get a full breakdown."
+        ),
+        # Even a rejected/off-topic attempt gets the TEACHING — the most teachable moment.
+        "approaches": _fallback_guess_approaches({"model_answer": _REJECT_MODEL_GUESSTIMATE}),
+        "rubric": "guesstimate",
+        "validity": validity,
+        "backstop": {
+            "findings": [],
+            "summary": "Not scored — no genuine estimation attempt was detected.",
+            "notChecked": True,
+            "arithmeticOverridden": False,
+            "rawTotal": 0,
+            "totalCapFactor": 0,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _clamp_int(v: Any, lo: int, hi: int) -> int:
+    try:
+        n = int(round(float(v)))
+    except (TypeError, ValueError):
+        n = lo
+    return max(lo, min(hi, n))
+
+
+VISUAL_KINDS = {"quadrant", "waterfall", "bar", "line", "funnel", "tree"}
+
+
+# Largest magnitude a figure value may carry. Rupee market sizes reach ~1e14
+# (lakh crore in rupees); past 1e15 it is not a business figure any more, and it
+# renders as exponent notation in a chart captioned "Rs crore". Mirrors
+# MAX_MAGNITUDE in the frontend's lib/results/visuals.ts.
+_VIS_MAX_MAGNITUDE = 1e15
+
+
+def _vis_num(v: Any) -> Optional[float]:
+    # bool is a subclass of int in Python, so float(True) == 1.0 and a JSON
+    # `true` would otherwise be accepted as a data point worth 1.
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f if abs(f) <= _VIS_MAX_MAGNITUDE else None
+
+
+def _vis_str(v: Any, limit: int = 120) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    t = v.strip()
+    return t[:limit] if t else None
+
+
+def _vis_tree(node: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    if not isinstance(node, dict) or depth > 3:
+        return None
+    label = _vis_str(node.get("label") or node.get("name"), 60)
+    if not label:
+        return None
+    kids = []
+    raw_kids = node.get("children")
+    if isinstance(raw_kids, list):
+        for c in raw_kids[:5]:
+            parsed = _vis_tree(c, depth + 1)
+            if parsed:
+                kids.append(parsed)
+    out: Dict[str, Any] = {"label": label}
+    value = _vis_str(node.get("value"), 30)
+    if value:
+        out["value"] = value
+    if kids:
+        out["children"] = kids
+    return out
+
+
+def sanitize_visuals(raw: Any) -> list:
+    """
+    Normalise the scorer's optional `visuals` array into figures the frontend is
+    willing to draw (see lib/results/visuals.ts for the mirrored contract).
+
+    This is a TRUST BOUNDARY, not a convenience. The payload is model output
+    that gets stored in feedback_json and rendered to users, so anything
+    unrecognised, unbounded or malformed is DROPPED here rather than
+    persisted — every string is length-capped, every array is count-capped,
+    quadrant coordinates are clamped to 0..1, and unknown `kind` values are
+    discarded. The frontend re-validates independently; neither side assumes
+    the other did it.
+
+    Never raises: a bad figure must not be able to fail a real score.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:6]:
+        try:
+            if not isinstance(item, dict):
+                continue
+            kind = _vis_str(item.get("kind"), 20)
+            title = _vis_str(item.get("title"), 90)
+            if kind not in VISUAL_KINDS or not title:
+                continue
+            fig: Dict[str, Any] = {"kind": kind, "title": title}
+            caption = _vis_str(item.get("caption"), 200)
+            unit = _vis_str(item.get("unit"), 20)
+            if caption:
+                fig["caption"] = caption
+            if unit:
+                fig["unit"] = unit
+
+            if kind == "quadrant":
+                x_label = _vis_str(item.get("xLabel") or item.get("x_label"), 40)
+                y_label = _vis_str(item.get("yLabel") or item.get("y_label"), 40)
+                pts = []
+                for p in (item.get("points") or [])[:8]:
+                    if not isinstance(p, dict):
+                        continue
+                    label = _vis_str(p.get("label"), 40)
+                    x, y = _vis_num(p.get("x")), _vis_num(p.get("y"))
+                    if label is None or x is None or y is None:
+                        continue
+                    point = {"label": label, "x": min(1.0, max(0.0, x)), "y": min(1.0, max(0.0, y))}
+                    if p.get("recommended") is True:
+                        point["recommended"] = True
+                    note = _vis_str(p.get("note"), 90)
+                    if note:
+                        point["note"] = note
+                    pts.append(point)
+                if len(pts) < 2 or not x_label or not y_label:
+                    continue
+                fig.update({"xLabel": x_label, "yLabel": y_label, "points": pts})
+                ql = item.get("quadrantLabels") or item.get("quadrant_labels")
+                if isinstance(ql, list) and len(ql) == 4:
+                    labels = [_vis_str(q, 28) or "" for q in ql]
+                    fig["quadrantLabels"] = labels
+
+            elif kind == "waterfall":
+                steps = []
+                for st in (item.get("steps") or [])[:10]:
+                    if not isinstance(st, dict):
+                        continue
+                    label = _vis_str(st.get("label"), 30)
+                    value = _vis_num(st.get("value"))
+                    if label is None or value is None:
+                        continue
+                    step = {"label": label, "value": value}
+                    if st.get("total") is True:
+                        step["total"] = True
+                    steps.append(step)
+                if len(steps) < 2:
+                    continue
+                fig["steps"] = steps
+
+            elif kind in ("bar", "line", "funnel"):
+                points = []
+                for pt in (item.get("points") or item.get("data") or [])[:12]:
+                    if not isinstance(pt, dict):
+                        continue
+                    label = _vis_str(pt.get("label") or pt.get("name"), 40)
+                    value = _vis_num(pt.get("value"))
+                    if label is None or value is None:
+                        continue
+                    points.append({"label": label, "value": value})
+                if len(points) < 2:
+                    continue
+                fig["points"] = points
+
+            elif kind == "tree":
+                root = _vis_tree(item.get("root") or item.get("tree"))
+                if not root or not root.get("children"):
+                    continue
+                fig["root"] = root
+
+            out.append(fig)
+        except Exception:  # noqa: BLE001 - one bad figure never costs a real score
+            continue
+    return out
+
+
+def _str_list(v: Any, limit: int = 6) -> list:
+    if not isinstance(v, list):
+        return []
+    out = []
+    for item in v:
+        s = str(item).strip()
+        if s:
+            out.append(s[:400])
+        if len(out) >= limit:
+            break
+    return out
