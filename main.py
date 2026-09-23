@@ -10,6 +10,13 @@ load_dotenv()
 
 app = FastAPI(title="MECE Backend", version="0.2.0")
 
+# Vercel PREVIEW deployments get a fresh hashed hostname each build
+# (e.g. hirespring-<hash>-consilioo.vercel.app) so they can't be listed
+# statically. Allow this team's vercel.app previews via a regex (override with
+# CORS_ALLOW_ORIGIN_REGEX if the team slug changes); production stays explicit.
+# allow_origin_regex is required because allow_credentials=True forbids a "*"
+# origin — the regex reflects the specific matched origin instead.
+_CORS_PREVIEW_REGEX = os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https://[a-z0-9-]+-consilioo\.vercel\.app")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -17,6 +24,7 @@ app.add_middleware(
         "https://mece.in",
         "https://www.mece.in",
     ],
+    allow_origin_regex=_CORS_PREVIEW_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
