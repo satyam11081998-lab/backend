@@ -40,6 +40,56 @@ def _enabled() -> bool:
     return os.getenv("COPILOT_V2_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+# UNDER-DEVELOPMENT PREVIEW. Allowlisted emails (COPILOT_V2_ALLOWLIST, default the
+# owner) can use the copilot BEFORE it is launched — they bypass the launch flag
+# AND the Pro gate so the owner can dogfood it in production while everyone else
+# sees the "under development" state. Once COPILOT_V2_ENABLED is on, it is live
+# for every Pro user as normal.
+_ALLOWLIST = {
+    e.strip().lower()
+    for e in (os.getenv("COPILOT_V2_ALLOWLIST", "satyam.11081998@gmail.com") or "").split(",")
+    if e.strip()
+}
+
+
+def _email_of(supabase, uid: str, user_obj) -> str:
+    email = getattr(user_obj, "email", None)
+    if not email and isinstance(user_obj, dict):
+        email = user_obj.get("email")
+    if not email:
+        try:
+            r = supabase.table("users").select("email").eq("id", uid).maybe_single().execute()
+            email = (r.data or {}).get("email")
+        except Exception:
+            email = None
+    return (email or "").strip().lower()
+
+
+def _allowlisted(email: str) -> bool:
+    return bool(email) and email in _ALLOWLIST
+
+
+def _require_access(authorization: Optional[str]):
+    """Access rule. Returns (supabase, uid, preview).
+
+    - Allowlisted (owner/tester) -> always in; bypasses the launch flag AND Pro.
+      preview=True while the launch flag is still off.
+    - Otherwise -> the feature must be launched (COPILOT_V2_ENABLED) and the user
+      a non-guest Pro. Else 404 (under development) / 403 (guest/upgrade).
+    """
+    supabase = get_supabase_client()
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if _allowlisted(_email_of(supabase, uid, user_obj)):
+        return supabase, uid, (not _enabled())
+    if not _enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403,
+                            detail="Create a free account, then upgrade to Pro to use the Prep Copilot.")
+    assert_tier_at_least(supabase, uid, "pro")
+    return supabase, uid, False
+
+
 def _require_enabled() -> None:
     if not _enabled():
         raise HTTPException(status_code=404, detail="Not found")
@@ -92,21 +142,31 @@ def _pack_public(pack) -> Dict[str, Any]:
 
 @router.get("/status")
 async def copilot_status(authorization: Optional[str] = Header(default=None)):
-    enabled = _enabled()
+    launched = _enabled()
+    allow = False
+    try:
+        supabase = get_supabase_client()
+        uid, user_obj = get_verified_user(supabase, authorization)
+        allow = _allowlisted(_email_of(supabase, uid, user_obj))
+    except Exception:
+        allow = False
+    available = allow or launched
+    preview = allow and not launched
     research = False
-    if enabled:
+    if available:
         try:
             from services.copilot.research import research_available
             research = research_available()
         except Exception:
             research = False
-    return {"enabled": enabled, "research_available": research}
+    # `enabled` kept = `available` for the frontend; preview => owner sees it pre-launch
+    return {"enabled": available, "available": available, "preview": preview,
+            "launched": launched, "research_available": research}
 
 
 @router.post("/pack")
 async def copilot_pack(body: PackRequest, authorization: Optional[str] = Header(default=None)):
-    _require_enabled()
-    supabase, uid = _require_pro(authorization)
+    supabase, uid, _preview = _require_access(authorization)
     role = (body.role or "").strip()
     company = (body.company or "").strip()
     if not role and not company:
@@ -120,8 +180,7 @@ async def copilot_pack(body: PackRequest, authorization: Optional[str] = Header(
 
 @router.post("/practice/start")
 async def copilot_start(body: StartRequest, authorization: Optional[str] = Header(default=None)):
-    _require_enabled()
-    supabase, uid = _require_pro(authorization)
+    supabase, uid, _preview = _require_access(authorization)
     role = (body.role or "").strip()
     company = (body.company or "").strip()
     if not role and not company:
@@ -162,8 +221,7 @@ async def copilot_start(body: StartRequest, authorization: Optional[str] = Heade
 
 @router.post("/practice/message")
 async def copilot_message(body: MessageRequest, authorization: Optional[str] = Header(default=None)):
-    _require_enabled()
-    supabase, uid = _require_pro(authorization)
+    supabase, uid, _preview = _require_access(authorization)
     content = (body.content or "").strip()
     if not content:
         raise HTTPException(status_code=422, detail="Say something to the interviewer first.")
@@ -212,8 +270,7 @@ async def copilot_message(body: MessageRequest, authorization: Optional[str] = H
 
 @router.post("/practice/submit")
 async def copilot_submit(body: SubmitRequest, authorization: Optional[str] = Header(default=None)):
-    _require_enabled()
-    supabase, uid = _require_pro(authorization)
+    supabase, uid, _preview = _require_access(authorization)
     check_rate_limit(f"copilot:submit:{uid}", max_calls=10, window_seconds=120)
     assert_daily_budget()
 
