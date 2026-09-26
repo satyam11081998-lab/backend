@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
 from services.supabase_client import get_supabase_client
-from services.daily_scheduler import fill_daily_schedule
+from services.daily_scheduler import fill_daily_schedule, fill_market_daily_schedule
 from services.news_pipeline import run_news_refresh
 
 
@@ -152,5 +152,33 @@ async def cron_schedule_daily(x_cron_secret: Optional[str] = Header(default=None
     return CronResponse(
         status=result.get("status", "ok"),
         message=result.get("message", "Daily schedule updated"),
+        details=result,
+    )
+
+
+
+# ============================================================
+# Endpoint: International daily (US + Europe) — 2026-09-25
+#
+# Fills market_daily_schedule for the current US Eastern day. Called by
+# .github/workflows/daily-cases-us.yml shortly after US Eastern midnight and
+# by the Vercel cron (/api/cron/refresh?market=US). Idempotent.
+# Separate endpoint on purpose: the India job above is unchanged, and a US
+# failure can never block or delay India's daily.
+# ============================================================
+
+@router.post("/schedule-daily-us", response_model=CronResponse)
+async def cron_schedule_daily_us(x_cron_secret: Optional[str] = Header(default=None)) -> CronResponse:
+    verify_cron_secret(x_cron_secret)
+    try:
+        result = fill_market_daily_schedule("US")
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"US schedule fill failed: {type(e).__name__}: {e}"
+        )
+    return CronResponse(
+        status=result.get("status", "ok"),
+        message=result.get("message", "US daily schedule updated"),
         details=result,
     )

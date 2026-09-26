@@ -17,6 +17,13 @@ This is the AUTHORITATIVE gate — the frontend mirror (lib/access.ts) is UX onl
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 
+from services.markets import (
+    assert_market_access,
+    intl_daily_ids,
+    market_today,
+    market_day_start_iso,
+)
+
 IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
 LITE_DAILY_EXTRA = {"case": 2, "guesstimate": 2}
 _TIER_RANK = {"free": 0, "lite": 1, "pro": 2}
@@ -142,6 +149,14 @@ def assert_tier_at_least(supabase, user_id: str, minimum: str) -> None:
 
 def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
     """Raise HTTPException(403) if this user may NOT attempt this case right now."""
+    # MARKETS (0070, 2026-09-25). An account practises only its own market's
+    # bank — checked FIRST, before unlisted and before Pro, so no tier and no
+    # direct link can cross it. India accounts on India cases pass straight
+    # through to the unchanged rules below.
+    content = assert_market_access(supabase, user_id, case)
+    if content == "US":
+        _assert_can_attempt_intl(supabase, user_id, case)
+        return
     # UNLISTED broadcast cases are attemptable by ANY tier via direct link. They never
     # enter the daily rotation, practice lists, search, or leaderboard (is_active=false),
     # so no tier/bank accounting applies. The SUBMIT wall (assert_can_submit) still requires
@@ -262,3 +277,90 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
                    f"Upgrade to Pro for unlimited practice.",
         )
     return
+
+
+def _assert_can_attempt_intl(supabase, user_id: str, case: dict) -> None:
+    """The international twin of the India rules above.
+
+    Identical tiers and quotas (free: daily pair + one lifetime extra of each,
+    +1 with the LinkedIn perk; lite: +2 per day; pro: unlimited). Two things
+    differ: the daily pair comes from market_daily_schedule, and the day rolls
+    over at US Eastern midnight. Mirrors getIntlAttemptAccess in lib/access.ts.
+    Kept separate so the India function stays byte-for-byte what it was.
+    """
+    if case.get("unlisted"):
+        return
+    case_id = case["id"]
+    bucket = "guesstimate" if case.get("type", "") == "guesstimate" else "case"
+    today = market_today("US")
+
+    tier, is_guest = effective_tier_and_guest(supabase, user_id)
+    if tier == "pro":
+        return
+
+    # Most recent pair on/before today — same fallback the frontend shows.
+    daily_ids = intl_daily_ids(supabase, "US", today, exact=False)
+    is_daily = case_id in daily_ids
+
+    prior = supabase.table("case_attempts").select("id").eq(
+        "user_id", user_id
+    ).eq("case_id", case_id).limit(1).execute()
+    is_first_attempt = not (prior and prior.data)
+
+    if not is_daily and is_guest:
+        raise HTTPException(
+            status_code=403,
+            detail="Sign up free to practice beyond today's case and guesstimate.",
+        )
+    if is_daily:
+        if is_guest:
+            return
+        if tier == "free" and not is_first_attempt:
+            raise HTTPException(
+                status_code=403,
+                detail="The free plan allows one attempt per case. Upgrade to Lite for unlimited re-attempts.",
+            )
+        return
+
+    if tier == "free":
+        rows = supabase.table("case_attempts").select(
+            "case_id, counted_for_daily"
+        ).eq("user_id", user_id).eq("is_first_attempt", True).execute()
+        candidate_ids = [
+            r["case_id"] for r in ((rows.data or []) if rows else [])
+            if not r.get("counted_for_daily") and r.get("case_id") not in daily_ids
+        ]
+        used = _count_bank_used(supabase, candidate_ids, bucket)
+        perk = supabase.table("users").select(
+            "linkedin_follow_claimed_at"
+        ).eq("id", user_id).maybe_single().execute()
+        claimed = bool((((perk.data or {}) if perk else {})).get("linkedin_follow_claimed_at"))
+        cap = 1 + (1 if claimed else 0)
+        if used >= cap:
+            label = "guesstimate" if bucket == "guesstimate" else "case"
+            raise HTTPException(
+                status_code=403,
+                detail=f"You've used your free bank {label}s. Upgrade to Lite to practice the full bank.",
+            )
+        return
+
+    # tier == "lite"
+    if not is_first_attempt:
+        return
+    rows = supabase.table("case_attempts").select(
+        "case_id, counted_for_daily, created_at"
+    ).eq("user_id", user_id).eq("is_first_attempt", True).gte(
+        "created_at", market_day_start_iso("US", today)
+    ).execute()
+    candidate_ids = [
+        r["case_id"] for r in ((rows.data or []) if rows else [])
+        if not r.get("counted_for_daily") and r.get("case_id") not in daily_ids
+    ]
+    used = _count_bank_used(supabase, candidate_ids, bucket)
+    if used >= LITE_DAILY_EXTRA[bucket]:
+        label = "guesstimates" if bucket == "guesstimate" else "cases"
+        raise HTTPException(
+            status_code=403,
+            detail=f"Lite includes 2 extra {label} per day beyond the daily ones. "
+                   f"Upgrade to Pro for unlimited practice.",
+        )

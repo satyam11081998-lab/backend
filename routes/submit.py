@@ -12,6 +12,7 @@ from services.ai_scorer import score_case_answer, score_guesstimate_answer, AISc
 from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
 from services.access_guard import assert_can_attempt, assert_can_submit
+from services.markets import case_market, intl_daily_ids, market_today, llm_case_content
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget
 from services.limits import ANSWER_MAX_CHARS
@@ -91,7 +92,9 @@ async def submit_answer(
         # is how a whole college practises a campaign case from a broadcast email. Deploy-
         # safe: .get("unlisted") is falsy before migration 0065, so behaviour is unchanged.
         raise HTTPException(status_code=404, detail="This case is no longer available.")
-    case_content = case["content"]
+    # Models see the market-aware text (US cases carry a US-register note);
+    # India cases are byte-identical to case["content"]. See services/markets.py.
+    case_content = llm_case_content(case)
     case_type = case["type"]
 
     # TIER / QUOTA GATE — runs BEFORE any OpenAI spend.
@@ -194,7 +197,12 @@ async def submit_answer(
     # Check if today's daily case matches this case
     counted_for_daily = False
     daily_date_val = None
-    if is_first_attempt:
+    if is_first_attempt and case_market(case) == "US":
+        us_today = market_today("US")
+        if submission.case_id in intl_daily_ids(supabase, "US", us_today, exact=False):
+            counted_for_daily = True
+            daily_date_val = us_today
+    elif is_first_attempt:
         try:
             sched_res = supabase.table("daily_schedule") \
                 .select("case_id") \

@@ -93,7 +93,43 @@ OUTPUT FORMAT — return ONLY a valid JSON object, no markdown, exactly this sha
 """
 
 
-def generate_daily_content(recent_themes: List[str]) -> dict:
+# International (US + Europe) daily content — 2026-09-25. Same JSON contract
+# and the same downstream path as India; only the flavour changes. Kept as a
+# separate prompt so the India prompt above is untouched.
+US_SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    "material for Indian MBA placement aspirants.",
+    "material for candidates recruiting for US consulting, finance and strategy roles "
+    "(MBB, Tier-2 firms, corporate strategy; MBA summer internships and full-time offers).",
+).replace(
+    "Everything must be freshly invented, India-flavoured (₹ figures, Indian sectors/companies/cities), "
+    "realistic, and self-contained.",
+    "Everything must be freshly invented, US-flavoured (US dollar figures with thousand / million / "
+    "billion, US sectors, US-style fictional companies, US cities and states), realistic, and self-contained.",
+)
+for _in, _us in (
+    ("₹50 cr and variable cost is ₹120/unit", "$50 million and variable cost is $12/unit"),
+    ("concrete ₹ numbers", "concrete dollar numbers"),
+    ("with the ₹ numbers", "with the dollar numbers"),
+    ("final ₹/unit figure", "final $/unit figure"),
+    ("EV two-wheelers sold in \\\nPune in a year", "EV charging ports installed in Texas in a year"),
+    ("EV two-wheelers sold in Pune in a year", "EV charging ports installed in Texas in a year"),
+    ("Start from Pune's population, funnel to households, two-wheeler ownership, EV share, replacement rate",
+     "Start from Texas's EV fleet, split home vs public charging, ports per public site, utilization"),
+):
+    US_SYSTEM_PROMPT = US_SYSTEM_PROMPT.replace(_in, _us)
+# The replace above targets the exact India sentence; if the India prompt is
+# ever reworded the US prompt must still be US-flavoured, so append an explicit
+# override that holds either way.
+US_SYSTEM_PROMPT += (
+    "\n\nMARKET OVERRIDE — UNITED STATES: every figure is in US dollars ($, thousand / million / "
+    "billion; NEVER ₹, Rs, lakh or crore). Settings are American (US cities, states, US consumer "
+    "habits, US regulations). Use US data anchors: ~335 million people, ~130 million households. "
+    "Use American English spelling. Titles read like a US case interview (e.g. \"A Midwest grocery "
+    "chain's margins are shrinking\", \"Estimate the number of EV charging ports in Texas\")."
+)
+
+
+def generate_daily_content(recent_themes: List[str], market: str = "IN") -> dict:
     """Call GPT-4o to produce one case + one guesstimate as a JSON object."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -115,7 +151,7 @@ def generate_daily_content(recent_themes: List[str]) -> dict:
         response, used_model, _prov = chat_with_fallback(
             "daily_content",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": US_SYSTEM_PROMPT if market == "US" else SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
@@ -176,29 +212,50 @@ def _compose_guesstimate_row(guess: dict) -> dict:
     }
 
 
-def save_generated_content() -> dict:
+def _recent_titles(supabase, market: str) -> List[str]:
+    """Anti-repeat signal: the market's 10 newest titles. Best-effort."""
+    try:
+        recent = (
+            supabase.table("cases")
+            .select("title")
+            .eq("market", market)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+    except Exception:
+        # Pre-0070 (no market column): the old unfiltered read — every row is India.
+        if market != "IN":
+            return []
+        try:
+            recent = (
+                supabase.table("cases")
+                .select("title")
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute()
+            )
+        except Exception:
+            return []
+    return [row["title"] for row in (recent.data or []) if row.get("title")]
+
+
+def save_generated_content(market: str = "IN") -> dict:
     """
     End-to-end: generate one case + one guesstimate, insert BOTH as `cases` rows,
     return their ids.
+
+    `market` (2026-09-25): "IN" (default — every existing caller) or "US".
+    US rows are written with market='US' so they join the US bank only.
 
     Returns: {"case_id": <uuid>, "guesstimate_id": <uuid>}
     """
     supabase = get_supabase_client()
 
     # Recent titles → anti-repeat signal for the prompt.
-    try:
-        recent = (
-            supabase.table("cases")
-            .select("title")
-            .order("created_at", desc=True)
-            .limit(10)
-            .execute()
-        )
-        recent_themes = [row["title"] for row in (recent.data or []) if row.get("title")]
-    except Exception:
-        recent_themes = []  # anti-repeat is best-effort, never block generation on it
+    recent_themes = _recent_titles(supabase, market)
 
-    content = generate_daily_content(recent_themes)
+    content = generate_daily_content(recent_themes, market=market)
     case_data = content.get("case")
     guess_data = content.get("guesstimate")
     if not case_data or not guess_data:
@@ -206,6 +263,11 @@ def save_generated_content() -> dict:
 
     case_row = _compose_case_row(case_data)
     guess_row = _compose_guesstimate_row(guess_data)
+    if market == "US":
+        # Only non-India rows name a market; India inserts stay byte-identical
+        # (and still work before migration 0070, via the column default).
+        case_row["market"] = "US"
+        guess_row["market"] = "US"
 
     # Insert the case
     case_res = supabase.table("cases").insert(case_row).execute()

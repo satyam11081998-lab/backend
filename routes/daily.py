@@ -6,12 +6,15 @@ GET /daily/leaderboard     — top scorers on today's daily case
 """
 
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from services.supabase_client import get_supabase_client
 
 router = APIRouter(prefix="/daily", tags=["daily"])
+
+import re as _re
+_UUID_RE = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", _re.I)
 
 IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
 
@@ -66,12 +69,46 @@ class DailyLeaderboardResponse(BaseModel):
     total_attempts: int
 
 
+def _intl_today(supabase, market: str) -> TodayResponse:
+    """International daily pair (0070): market_daily_schedule on the US Eastern
+    day, most recent on/before today. No GD brief (GD is India-only). Never raises."""
+    from services.markets import market_today
+    today = market_today("US")
+    empty = TodayResponse(date=today, case=None, guesstimate=None, guesstimate_code=None,
+                          guesstimate_title=None, brief=None)
+    try:
+        res = supabase.table("market_daily_schedule").select("case_id, guesstimate_id") \
+            .eq("market", market).lte("scheduled_date", today) \
+            .order("scheduled_date", desc=True).limit(1).execute()
+        row = (res.data or [None])[0] if res and res.data else None
+        if not row:
+            return empty
+        ids = [i for i in (row.get("case_id"), row.get("guesstimate_id")) if i]
+        cases = supabase.table("cases").select("id, title, type, difficulty").in_("id", ids).execute()
+        by_id = {c["id"]: c for c in (cases.data or [])}
+        c = by_id.get(row.get("case_id"))
+        g = by_id.get(row.get("guesstimate_id"))
+        return TodayResponse(
+            date=today,
+            case=TodayCaseInfo(**c) if c else None,
+            guesstimate=TodayCaseInfo(**g) if g else None,
+            guesstimate_code=g["id"] if g else None,
+            guesstimate_title=g.get("title") if g else None,
+            brief=None,
+        )
+    except Exception:
+        return empty
+
+
 @router.get("/today", response_model=TodayResponse)
-async def get_today() -> TodayResponse:
+async def get_today(market: Optional[str] = Query(default=None)) -> TodayResponse:
     """
     Return today's daily content. NEVER 404s — if no schedule, returns empty fields.
+    `?market=US` (or EU) returns the international pair; absent = India, unchanged.
     """
     supabase = get_supabase_client()
+    if (market or "").upper() in ("US", "EU"):
+        return _intl_today(supabase, "US")
     today = today_ist_date()
     
     # Fetch today's schedule
@@ -144,23 +181,39 @@ async def get_today() -> TodayResponse:
 
 
 @router.get("/leaderboard", response_model=DailyLeaderboardResponse)
-async def get_daily_leaderboard() -> DailyLeaderboardResponse:
+async def get_daily_leaderboard(market: Optional[str] = Query(default=None)) -> DailyLeaderboardResponse:
     """
     Return top scorers on today's daily case.
     Only first attempts (counted_for_daily=true) are included.
+    `?market=US` (or EU) → the international daily (US Eastern day); absent = India.
     """
     supabase = get_supabase_client()
-    today = today_ist_date()
-    
+    intl = (market or "").upper() in ("US", "EU")
+    if intl:
+        from services.markets import market_today
+        today = market_today("US")
+        try:
+            sched_res = supabase.table("market_daily_schedule") \
+                .select("case_id, guesstimate_id") \
+                .eq("market", "US") \
+                .eq("scheduled_date", today) \
+                .limit(1) \
+                .execute()
+        except Exception:
+            sched_res = None  # pre-0070: no table → empty board, never a 500
+    else:
+        today = today_ist_date()
+
     # Fetch today's scheduled case
-    try:
-        sched_res = supabase.table("daily_schedule") \
-            .select("case_id") \
-            .eq("scheduled_date", today) \
-            .limit(1) \
-            .execute()
-    except Exception as e:
-        raise HTTPException(500, f"Schedule fetch failed: {e}")
+    if not intl:
+        try:
+            sched_res = supabase.table("daily_schedule") \
+                .select("case_id, guesstimate_code") \
+                .eq("scheduled_date", today) \
+                .limit(1) \
+                .execute()
+        except Exception as e:
+            raise HTTPException(500, f"Schedule fetch failed: {e}")
     
     sched_row = (sched_res.data or [None])[0] if sched_res and sched_res.data else None
     
@@ -170,6 +223,16 @@ async def get_daily_leaderboard() -> DailyLeaderboardResponse:
         )
     
     case_id = sched_row["case_id"]
+    # The board is scoped to THIS market's daily pair. Both markets stamp
+    # daily_date on their daily attempts, and the India and US calendar days
+    # overlap, so a date-only filter would mix the two boards. For India this
+    # is exactly the prior result set: submit only ever sets counted_for_daily
+    # on today's schedule ids. Non-UUID refs (legacy short codes) are dropped —
+    # they can never match a uuid case_id and would make the IN() filter error.
+    board_ids = [
+        str(i) for i in {case_id, sched_row.get("guesstimate_code") or sched_row.get("guesstimate_id")}
+        if i and _UUID_RE.match(str(i))
+    ]
     
     # Fetch case title
     case_res = supabase.table("cases") \
@@ -188,6 +251,7 @@ async def get_daily_leaderboard() -> DailyLeaderboardResponse:
             .select("user_id, submission_id, created_at, submissions(score), users(name, avatar_url)") \
             .eq("daily_date", today) \
             .eq("counted_for_daily", True) \
+            .in_("case_id", board_ids) \
             .execute()
     except Exception as e:
         # Foreign-table syntax can fail in some Supabase setups. Fallback to manual join.
@@ -195,6 +259,7 @@ async def get_daily_leaderboard() -> DailyLeaderboardResponse:
             .select("user_id, submission_id, created_at") \
             .eq("daily_date", today) \
             .eq("counted_for_daily", True) \
+            .in_("case_id", board_ids) \
             .execute()
     
     rows = attempts_res.data or []

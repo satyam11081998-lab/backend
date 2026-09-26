@@ -69,3 +69,8 @@ google-cloud-texttospeech==2.16.3
 
 # New Google GenAI SDK — mints Gemini Live ephemeral tokens for real-time voice.
 google-genai>=1.0.0
+
+# IANA timezone database for zoneinfo (services/markets.py — the US daily
+# rolls over at America/New_York midnight). Pure Python; a no-op where the OS
+# already ships /usr/share/zoneinfo, a guarantee where it does not.
+tzdata==2025.2

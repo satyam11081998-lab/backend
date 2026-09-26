@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user_id, get_verified_user, is_guest_user
 from services.access_guard import assert_can_attempt, effective_tier
+from services.markets import case_market, intl_daily_ids, market_today, llm_case_content
 from services.rate_limit import check_rate_limit
 from services.limits import MESSAGE_MAX_CHARS, RECOMMENDATION_MAX_CHARS
 from services.interview_engine import (
@@ -475,7 +476,7 @@ async def post_message(
                 f"}}\n\n"
             )
             for token in stream_interviewer_reply(
-                case_content=case["content"],
+                case_content=llm_case_content(case),
                 case_type=case["type"],
                 transcript=transcript,
                 new_user_message=body.content,
@@ -765,7 +766,7 @@ async def submit_attempt(
     # Score.
     try:
         feedback = score_conversation(
-            case_content=case["content"],
+            case_content=llm_case_content(case),
             case_type=case["type"],
             transcript=transcript,
             final_recommendation=body.final_recommendation,
@@ -858,7 +859,7 @@ async def submit_attempt(
         maybe_capture_exemplar(
             case_id=attempt["case_id"],
             submission_id=submission_id,
-            case_content=case["content"],
+            case_content=llm_case_content(case),
             case_type=case["type"],
             feedback=feedback,
             user_id=user_id,
@@ -896,7 +897,15 @@ async def submit_attempt(
 
     counted_for_daily = False
     daily_date_val = None
-    if is_first_attempt:
+    if is_first_attempt and case_market(case) == "US":
+        # International daily pair (0070): its own table and US Eastern day.
+        # The most recent pair on/before today, matching the access gate — so a
+        # daily attempt never burns a free user's one-time bank credit.
+        us_today = market_today("US")
+        if attempt["case_id"] in intl_daily_ids(supabase, "US", us_today, exact=False):
+            counted_for_daily = True
+            daily_date_val = us_today
+    elif is_first_attempt:
         try:
             sched = (
                 supabase.table("daily_schedule")
