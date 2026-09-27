@@ -1,34 +1,42 @@
 """
-Interview Engine — runs one interviewer turn against OpenAI.
+Interview Engine — one interviewer turn against the configured LLM.
 
-Implements the MECE Transcript-Grounded Control Layer (v0.51).
-Pipeline: Signals -> Contextual Assessor (if needed) -> Gate -> Modality -> Generate -> Safely Emit.
-HARD RULE APPLIED: Zero blank responses. All turns yield conversational presence.
+V11:
+- deterministic Gate A / Gate B routing
+- true silence via no yielded content
+- typed presence events for voice
+- ordinary text remains backward-compatible as plain text
+- adaptive deep-lane output is sanitized before emission
+- voice partials never call the assessor or generator
 """
 
-import os
 import json
+import os
+import re
 import time
-from typing import Iterable, Dict, List, Generator, Any, Optional
-from openai import OpenAI
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+
 from dotenv import load_dotenv
+from openai import OpenAI
 
+from services.ai_providers import openai_client, resolve_llm
 from services.ai_usage import log_ai_usage
-from services.ai_providers import resolve_llm, openai_client
-
 from prompts.interview_prompts import (
-    build_interviewer_messages,
     CONVERSATION_SCORING_SYSTEM_PROMPT,
     build_conversation_scoring_user_prompt,
+    build_interviewer_messages,
 )
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
-from services.session_signals import compute_signals, needs_contextual_assessment, build_signal_block
-from services.interviewer_mode import get_modality_instruction, ALLOW_QUESTIONS, build_mode_block
 from services.interviewer_decision import (
-    StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode, 
-    assess_context_with_llm, evaluate_intervention_gate
+    assess_context_with_llm,
+    enforce_mode,
+    evaluate_intervention_gate,
+    get_fast_lane_event,
+    parse_control_tag,
 )
-from services.learning_model import evaluate_intervention_outcome, build_learning_block
+from services.interviewer_mode import ALLOW_QUESTIONS, build_mode_block, get_modality_instruction
+from services.learning_model import build_learning_block, evaluate_intervention_outcome
+from services.session_signals import build_signal_block, compute_signals, needs_contextual_assessment
 
 load_dotenv()
 
@@ -51,26 +59,40 @@ class InterviewEngineError(Exception):
 
 
 def _adaptive_enabled() -> bool:
-    return os.getenv("ADAPTIVE_INTERVIEWER", "").strip().lower() in ("1", "true", "yes", "on")
+    return os.getenv("ADAPTIVE_INTERVIEWER", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _teaching_policy(explicit=None) -> str:
     p = (explicit or os.getenv("INTERVIEWER_TEACHING_POLICY", "coached") or "").strip().lower()
-    return p if p in ("exam", "coached") else "coached"
+    return p if p in {"exam", "coached"} else "coached"
 
 
 def _resolve_adaptive_llm():
-    model = (os.getenv("INTERVIEWER_ADAPTIVE_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+    model = (os.getenv("INTERVIEWER_ADAPTIVE_MODEL", INTERVIEWER_MODEL) or INTERVIEWER_MODEL).strip()
     return openai_client() or _client, model, "openai"
 
 
-def _build_adaptive_messages(case_content, case_type, transcript, new_user_message,
-                             clarifications_exhausted, signals, mode, instruction, allow_questions,
-                             policy, prior_state, outcome):
-    block = (build_signal_block(signals)
-             + "\n\n" + build_mode_block(mode, instruction, allow_questions)
-             + "\n\n" + build_learning_block(
-                 (prior_state or {}).get("profile"), signals, outcome))
+def _build_adaptive_messages(
+    case_content,
+    case_type,
+    transcript,
+    new_user_message,
+    clarifications_exhausted,
+    signals,
+    mode,
+    instruction,
+    allow_questions,
+    policy,
+    prior_state,
+    outcome,
+):
+    block = (
+        build_signal_block(signals)
+        + "\n\n"
+        + build_mode_block(mode, instruction, allow_questions)
+        + "\n\n"
+        + build_learning_block((prior_state or {}).get("profile"), signals, outcome)
+    )
     return build_adaptive_interviewer_messages(
         case_content=case_content,
         case_type=case_type,
@@ -82,6 +104,77 @@ def _build_adaptive_messages(case_content, case_type, transcript, new_user_messa
     )
 
 
+def _sentence_stream(text: str) -> Iterable[str]:
+    """Yield complete sentence-ish chunks without splitting decimal numbers."""
+    buf = ""
+    decimal_hold = "\u0002"
+    safe = re.sub(r"(\d)\.(\d)", r"\1" + decimal_hold + r"\2", text or "")
+    for ch in safe:
+        buf += ch
+        if ch in ".!?" and not re.search(r"\d$", buf[:-1]):
+            out = buf.replace(decimal_hold, ".").strip()
+            buf = ""
+            if out:
+                yield out
+    tail = buf.replace(decimal_hold, ".").strip()
+    if tail:
+        yield tail
+
+
+def _safe_adaptive_stream(
+    stream,
+    mode: str,
+    allow_questions: bool,
+    policy: str,
+) -> Tuple[List[str], Dict[str, str], Any]:
+    """Consume an adaptive provider stream completely before exposing content.
+
+    Adaptive output is intentionally buffered so internal control tags and sanitizer
+    decisions are never exposed token-by-token. This trades true token streaming for
+    a strict no-leakage boundary. Usage metadata is preserved for billing/telemetry.
+    """
+    raw_parts: List[str] = []
+    usage = None
+    response_id = None
+
+    for chunk in stream:
+        if getattr(chunk, "usage", None) is not None:
+            usage = chunk.usage
+            response_id = getattr(chunk, "id", response_id)
+        try:
+            delta = chunk.choices[0].delta
+            token = getattr(delta, "content", None)
+        except (AttributeError, IndexError):
+            token = None
+        if token:
+            raw_parts.append(token)
+
+    raw = "".join(raw_parts).strip()
+    tag, clean_text = parse_control_tag(raw)
+
+    # A malformed leading internal tag must never cross the output boundary.
+    if raw.lstrip().startswith("<<") and not _has_valid_control_prefix(raw):
+        clean_text = ""
+        tag = {}
+
+    final = enforce_mode(clean_text, mode, allow_questions, policy)
+
+    class _Usage:
+        pass
+
+    usage_response = _Usage()
+    usage_response.usage = usage
+    usage_response.id = response_id
+    return [final] if final else [], tag, usage_response
+
+
+def _has_valid_control_prefix(text: str) -> bool:
+    stripped = (text or "").lstrip()
+    if not stripped.startswith("<<"):
+        return True
+    return ">>" in stripped.split("\n", 1)[0] or ">>" in stripped
+
+
 # -----------------------------------------------------------------------------
 # Live turn (streaming)
 # -----------------------------------------------------------------------------
@@ -89,44 +182,130 @@ def _build_adaptive_messages(case_content, case_type, transcript, new_user_messa
 def stream_interviewer_reply(
     case_content: str,
     case_type: str,
-    transcript: Iterable[Dict[str, str]],
+    transcript: Iterable[Dict[str, Any]],
     new_user_message: str,
     user_id: Optional[str] = None,
     clarifications_exhausted: bool = False,
     teaching_policy: Optional[str] = None,
     prior_state: Optional[dict] = None,
     control_out: Optional[dict] = None,
+    channel: str = "text",
+    is_voice_partial: bool = False,
 ) -> Generator[str, None, None]:
     adaptive = _adaptive_enabled()
-    
+    channel = channel if channel in {"text", "voice"} else "text"
+
     if adaptive:
         tlist = list(transcript)
         policy = _teaching_policy(teaching_policy)
-        
-        signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state)
-        
-        if needs_contextual_assessment(signals):
+
+        # 1. Deterministic state
+        signals = compute_signals(
+            tlist,
+            new_user_message,
+            policy,
+            prior_state=prior_state,
+            channel=channel,
+            is_voice_partial=is_voice_partial,
+        )
+
+        # 2. Contextual assessor only for conservative hypothesis turns
+        if not is_voice_partial and needs_contextual_assessment(signals):
             context_state = assess_context_with_llm(tlist, new_user_message, case_content)
-            signals.update(context_state)
-            
-        # Intervention gate no longer returns a boolean, it always assigns a mode
-        _, mode, reason = evaluate_intervention_gate(signals)
-            
+            if context_state:
+                # Deterministic intent is the reason the assessor was invoked; let the
+                # assessor refine state/progress/need, but never override that routing key.
+                context_state = dict(context_state)
+                context_state.pop("intent", None)
+                signals.update(context_state)
+
+        # 3. Gate A / Gate B
+        lane, mode, reason = evaluate_intervention_gate(signals)
+
+        # 4. True silence: do NOT yield an empty string. An empty string is still a wire chunk.
+        if lane == "SILENCE":
+            if control_out is not None:
+                control_out["tag"] = {"mode": "NO_OUTPUT", "intervention": "silence"}
+                control_out["mode"] = "NO_OUTPUT"
+                control_out["reason"] = reason
+            class _FastUsage:
+                usage = None
+                id = None
+            log_ai_usage(
+                user_id=user_id,
+                endpoint="/attempts/messages/fastlane_silence",
+                model="local",
+                response=_FastUsage(),
+                latency_ms=0,
+            )
+            return
+
+        # 5. Fast presence event: no LLM, no TTS generation on the backend.
+        if lane == "PRESENCE":
+            t0 = time.time()
+            event = get_fast_lane_event(mode, signals)
+            if control_out is not None:
+                control_out["tag"] = {
+                    "mode": mode,
+                    "intervention": "fast_lane",
+                    "event_type": event.get("event_type"),
+                    "code": event.get("data", {}).get("code"),
+                }
+                control_out["mode"] = mode
+                control_out["reason"] = reason
+
+            if channel == "text":
+                # Backward-compatible: existing text SSE receives ordinary text.
+                yield event["data"]["text"]
+            else:
+                # Voice client must parse this typed event and use its local cached audio map.
+                yield json.dumps(event, separators=(",", ":"))
+
+            class _FastUsageBeat:
+                usage = None
+                id = None
+            log_ai_usage(
+                user_id=user_id,
+                endpoint="/attempts/messages/fastlane_event",
+                model="local",
+                response=_FastUsageBeat(),
+                latency_ms=max(0, int((time.time() - t0) * 1000)),
+            )
+            return
+
+        # 6. Deep lane
         allow_questions = ALLOW_QUESTIONS.get(mode, False)
         instruction = get_modality_instruction(mode, policy, new_user_message, signals)
         outcome = evaluate_intervention_outcome(prior_state, signals)
-        
+
         messages = _build_adaptive_messages(
-            case_content, case_type, tlist, new_user_message, clarifications_exhausted,
-            signals, mode, instruction, allow_questions, policy, prior_state, outcome
+            case_content,
+            case_type,
+            tlist,
+            new_user_message,
+            clarifications_exhausted,
+            signals,
+            mode,
+            instruction,
+            allow_questions,
+            policy,
+            prior_state,
+            outcome,
         )
         cli, model, provider = _resolve_adaptive_llm()
     else:
         messages = build_interviewer_messages(
-            case_content=case_content, case_type=case_type, transcript=transcript,
-            new_user_message=new_user_message, clarifications_exhausted=clarifications_exhausted
+            case_content=case_content,
+            case_type=case_type,
+            transcript=transcript,
+            new_user_message=new_user_message,
+            clarifications_exhausted=clarifications_exhausted,
         )
         cli, model, provider = resolve_llm("interviewer")
+        mode = "LEGACY"
+        allow_questions = True
+        policy = _teaching_policy(teaching_policy)
+        reason = "legacy"
 
     def _complete(c, m):
         return c.chat.completions.create(
@@ -151,38 +330,62 @@ def stream_interviewer_reply(
         )
 
     t0 = time.time()
-    
-    # PRE-EMISSION SAFETY: Synchronously generate & validate zero-question modes
-    if adaptive and not allow_questions:
+
+    # Adaptive deep lane is validated before emission. This is deliberately true for
+    # question-allowed modes too; it closes the old streaming bypass around enforce_mode().
+    if adaptive:
         try:
-            resp = _complete(cli, model)
+            stream = _open_stream(cli, model)
         except Exception as e:
             if provider != "openai":
-                cli, model = openai_client(), INTERVIEWER_MODEL
-                resp = _complete(cli, model)
+                fallback = openai_client()
+                if not fallback:
+                    raise InterviewEngineError(f"LLM streaming call failed and OpenAI fallback is unavailable: {e}")
+                cli, model = fallback, INTERVIEWER_MODEL
+                stream = _open_stream(cli, model)
             else:
-                raise InterviewEngineError(f"OpenAI call failed: {e}")
-        
-        raw_text = (resp.choices[0].message.content or "").strip()
-        tag, clean_text = parse_control_tag(raw_text)
-        final_text = enforce_mode(clean_text, mode, allow_questions, policy)
-        
-        if control_out is not None:
-            control_out["tag"] = tag or {}
-            control_out["mode"] = mode
-            control_out["reason"] = reason if 'reason' in locals() else ""
-            
-        yield final_text
-        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
-                     response=resp, latency_ms=int((time.time() - t0) * 1000))
+                raise InterviewEngineError(f"OpenAI streaming call failed: {e}")
+
+        try:
+            safe_parts, tag, safe_response = _safe_adaptive_stream(
+                stream, mode, allow_questions, policy
+            )
+            if control_out is not None:
+                control_out["tag"] = tag or {}
+                control_out["mode"] = mode
+                control_out["reason"] = reason
+            for part in safe_parts:
+                yield part
+        except Exception as e:
+            raise InterviewEngineError(f"Adaptive stream interrupted: {e}")
+        finally:
+            # _safe_adaptive_stream buffers the full provider response so that
+            # sanitization cannot leak unsafe partial tokens. It still preserves usage.
+            if "safe_response" in locals():
+                response_for_log = safe_response
+            else:
+                class _SafeUsage:
+                    usage = None
+                    id = None
+                response_for_log = _SafeUsage()
+            log_ai_usage(
+                user_id=user_id,
+                endpoint="/attempts/messages",
+                model=model,
+                response=response_for_log,
+                latency_ms=int((time.time() - t0) * 1000),
+            )
         return
 
-    # STANDARD STREAMING (for probing modes or non-adaptive fallbacks)
+    # Legacy path: preserve existing raw streaming behavior exactly.
     try:
         stream = _open_stream(cli, model)
     except Exception as e:
         if provider != "openai":
-            cli, model = openai_client(), INTERVIEWER_MODEL
+            fallback = openai_client()
+            if not fallback:
+                raise InterviewEngineError(f"LLM streaming call failed and OpenAI fallback is unavailable: {e}")
+            cli, model = fallback, INTERVIEWER_MODEL
             try:
                 stream = _open_stream(cli, model)
             except Exception as e2:
@@ -195,7 +398,6 @@ def stream_interviewer_reply(
         id = None
 
     final = _U()
-    stripper = StreamTagStripper() if adaptive else None
     try:
         for chunk in stream:
             if getattr(chunk, "usage", None):
@@ -207,84 +409,137 @@ def stream_interviewer_reply(
             except (AttributeError, IndexError):
                 token = None
             if token:
-                if stripper is not None:
-                    for _out in stripper.feed(token):
-                        yield _out
-                else:
-                    yield token
-        if stripper is not None:
-            for _out in stripper.flush():
-                yield _out
-            if control_out is not None:
-                control_out["tag"] = getattr(stripper, "tag", {}) or {}
-                control_out["mode"] = mode
+                yield token
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
-        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
-                     response=final, latency_ms=int((time.time() - t0) * 1000))
+        log_ai_usage(
+            user_id=user_id,
+            endpoint="/attempts/messages",
+            model=model,
+            response=final,
+            latency_ms=int((time.time() - t0) * 1000),
+        )
 
 
 def complete_interviewer_reply(
     case_content: str,
     case_type: str,
-    transcript: Iterable[Dict[str, str]],
+    transcript: Iterable[Dict[str, Any]],
     new_user_message: str,
     clarifications_exhausted: bool = False,
     teaching_policy: Optional[str] = None,
     prior_state: Optional[dict] = None,
     control_out: Optional[dict] = None,
+    channel: str = "text",
+    is_voice_partial: bool = False,
 ) -> str:
     adaptive = _adaptive_enabled()
     transcript = list(transcript)
-    
+    channel = channel if channel in {"text", "voice"} else "text"
+
     if adaptive:
         policy = _teaching_policy(teaching_policy)
-        signals = compute_signals(transcript, new_user_message, policy, prior_state=prior_state)
-        
-        if needs_contextual_assessment(signals):
+        signals = compute_signals(
+            transcript,
+            new_user_message,
+            policy,
+            prior_state=prior_state,
+            channel=channel,
+            is_voice_partial=is_voice_partial,
+        )
+
+        if not is_voice_partial and needs_contextual_assessment(signals):
             context_state = assess_context_with_llm(transcript, new_user_message, case_content)
-            signals.update(context_state)
-            
-        _, mode, reason = evaluate_intervention_gate(signals)
-            
+            if context_state:
+                context_state = dict(context_state)
+                context_state.pop("intent", None)
+                signals.update(context_state)
+
+        lane, mode, reason = evaluate_intervention_gate(signals)
+
+        if lane == "SILENCE":
+            if control_out is not None:
+                control_out["tag"] = {"mode": "NO_OUTPUT", "intervention": "silence"}
+                control_out["mode"] = "NO_OUTPUT"
+                control_out["reason"] = reason
+            return ""
+
+        if lane == "PRESENCE":
+            event = get_fast_lane_event(mode, signals)
+            if control_out is not None:
+                control_out["tag"] = {
+                    "mode": mode,
+                    "intervention": "fast_lane",
+                    "event_type": event.get("event_type"),
+                    "code": event.get("data", {}).get("code"),
+                }
+                control_out["mode"] = mode
+                control_out["reason"] = reason
+            return event["data"]["text"] if channel == "text" else json.dumps(event, separators=(",", ":"))
+
         allow_questions = ALLOW_QUESTIONS.get(mode, False)
         instruction = get_modality_instruction(mode, policy, new_user_message, signals)
         outcome = evaluate_intervention_outcome(prior_state, signals)
-        
         messages = _build_adaptive_messages(
-            case_content, case_type, transcript, new_user_message, clarifications_exhausted,
-            signals, mode, instruction, allow_questions, policy, prior_state, outcome
+            case_content,
+            case_type,
+            transcript,
+            new_user_message,
+            clarifications_exhausted,
+            signals,
+            mode,
+            instruction,
+            allow_questions,
+            policy,
+            prior_state,
+            outcome,
         )
         cli, model, provider = _resolve_adaptive_llm()
     else:
         messages = build_interviewer_messages(
-            case_content=case_content, case_type=case_type, transcript=transcript,
-            new_user_message=new_user_message, clarifications_exhausted=clarifications_exhausted
+            case_content=case_content,
+            case_type=case_type,
+            transcript=transcript,
+            new_user_message=new_user_message,
+            clarifications_exhausted=clarifications_exhausted,
         )
         cli, model, provider = resolve_llm("interviewer")
+        mode = "LEGACY"
+        allow_questions = True
+        policy = _teaching_policy(teaching_policy)
+        reason = "legacy"
 
-    def _complete(c, m):
-        return c.chat.completions.create(
-            model=m,
+    resp = None
+    try:
+        resp = cli.chat.completions.create(
+            model=model,
             messages=messages,
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
             presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
             max_tokens=180,
         )
-
-    try:
-        resp = _complete(cli, model)
     except Exception as e:
         if provider != "openai":
+            fallback = openai_client()
+            if not fallback:
+                raise InterviewEngineError(f"LLM call failed and OpenAI fallback is unavailable: {e}")
             try:
-                resp = _complete(openai_client(), INTERVIEWER_MODEL)
+                resp = fallback.chat.completions.create(
+                    model=INTERVIEWER_MODEL,
+                    messages=messages,
+                    temperature=INTERVIEWER_TEMPERATURE,
+                    frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
+                    presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
+                    max_tokens=180,
+                )
+                model = INTERVIEWER_MODEL
             except Exception as e2:
                 raise InterviewEngineError(f"OpenAI call failed: {e2}")
         else:
             raise InterviewEngineError(f"OpenAI call failed: {e}")
-            
+
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
@@ -297,16 +552,23 @@ def complete_interviewer_reply(
 
 
 # -----------------------------------------------------------------------------
-# Final scoring (at submit)
+# Final scoring (unchanged contract)
 # -----------------------------------------------------------------------------
 
 def _flatten_for_legacy_scorer(
     transcript: Iterable[Dict[str, str]],
     final_recommendation: str,
 ) -> str:
+    from services.session_signals import _assistant_was_presence
+
     lines: List[str] = []
     for t in transcript:
-        role = (t.get("role") or "user").upper()
+        role_raw = t.get("role") or "user"
+        role = role_raw.upper()
+        # Semantic presence events are UI/control signals, not candidate reasoning.
+        # Do not contaminate the legacy guesstimate scorer with their JSON payloads.
+        if role_raw == "assistant" and _assistant_was_presence(t):
+            continue
         kind = t.get("kind") or "text"
         content = (t.get("content") or "").strip()
         if not content:
@@ -387,6 +649,7 @@ def _score_case_conversation(
 
     feedback = None
     last_err = None
+    raw = ""
     for _attempt in range(2):
         try:
             t0 = time.time()
@@ -400,8 +663,13 @@ def _score_case_conversation(
                 max_tokens=8000,
                 response_format={"type": "json_object"},
             )
-            log_ai_usage(user_id=user_id, endpoint="/attempts/submit", model=SCORING_MODEL,
-                         response=resp, latency_ms=int((time.time() - t0) * 1000))
+            log_ai_usage(
+                user_id=user_id,
+                endpoint="/attempts/submit",
+                model=SCORING_MODEL,
+                response=resp,
+                latency_ms=int((time.time() - t0) * 1000),
+            )
         except Exception as e:
             raise InterviewEngineError(f"Scoring call failed: {e}")
 
@@ -411,7 +679,7 @@ def _score_case_conversation(
             break
         except json.JSONDecodeError as e:
             last_err = e
-            
+
     if feedback is None:
         raise InterviewEngineError(f"Scorer returned invalid JSON after retry: {last_err}. Raw: {raw[:200]}")
 
