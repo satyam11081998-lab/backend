@@ -213,3 +213,12 @@ async def speak(
 # NOTE: setup — to enable the cheaper WaveNet path, `pip install google-cloud-texttospeech`,
 # set GOOGLE_APPLICATION_CREDENTIALS to the service-account JSON path, then toggle
 # "Interviewer voice (TTS)" to Google in the admin AI-providers panel.
+
+
+# Warm the Google TTS client at import (app startup) instead of lazily on the first
+# spoken turn, so the first voice reply of a session is not slow. Guarded:
+# _get_google_tts never raises, and a missing SDK/creds just degrades to OpenAI.
+try:
+    _get_google_tts()
+except Exception:
+    pass
