@@ -12,7 +12,7 @@ from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance
-from prompts.interview_prompts import build_interviewer_messages, VOICE_INTERVIEWER_ADDENDUM
+from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS
 
 load_dotenv()
 
@@ -74,12 +74,17 @@ def build_turn_detection() -> dict:
     Default is semantic_vad (words-based end-of-turn); server_vad (fixed silence)
     is the env-selectable fallback. Both keep barge-in — the candidate can always
     cut the interviewer off mid-sentence.
+
+    create_response is OFF in both: the realtime model never answers a candidate
+    turn on its own. The browser sends the final transcript to V11
+    (/attempts/{id}/voice-decision) and only then issues response.create with the
+    line V11 approved — or nothing at all, for V11 SILENCE.
     """
     if REALTIME_TURN_MODE == "semantic_vad":
         return {
             "type": "semantic_vad",
             "eagerness": REALTIME_SEMANTIC_EAGERNESS,
-            "create_response": True,
+            "create_response": False,
             "interrupt_response": True,
         }
     return {
@@ -87,6 +92,8 @@ def build_turn_detection() -> dict:
         "threshold": 0.5,
         "prefix_padding_ms": 300,
         "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
+        "create_response": False,
+        "interrupt_response": True,
     }
 
 
@@ -110,13 +117,13 @@ async def create_realtime_session(
     two network hops (browser -> Render -> OpenAI) on BOTH the transcribe and
     the speak call. Realtime removes them. What we keep is everything that
     matters — the real API key never leaves this process, the tier gate is
-    enforced here, and the interviewer's instructions are built here rather
-    than accepted from the client.
+    enforced here, and the session's instructions are set here rather than
+    accepted from the client.
 
-    The instructions are the product: the prompt, the behavioural guardrails and
-    the case content. A browser-supplied `instructions` field would let anyone
-    rewrite the interviewer, or read the case's hidden framing. So it is built
-    server-side from the same prompt builder the typed path uses.
+    The realtime model is only the interviewer's VOICE. MECE Interviewer V11
+    decides every turn (/attempts/{id}/voice-decision), exactly as on the typed
+    path, so the session carries the voice-renderer instructions and no
+    interviewer prompt, rules or case content of its own.
     """
     if not REALTIME_ENABLED:
         raise HTTPException(status_code=503, detail="Voice interview is temporarily unavailable.")
@@ -180,37 +187,11 @@ async def create_realtime_session(
     )
     if not case.data:
         raise HTTPException(status_code=404, detail="Case not found")
-    case_row = case.data[0]
 
-    # Reuse the SAME prompt builder as the typed path so the interviewer sounds
-    # identical across transports. build_interviewer_messages returns a chat
-    # messages array; realtime wants a single instructions string, so take the
-    # system turn — that is where every behavioural rule lives.
-    messages = build_interviewer_messages(
-        case_content=case_row["content"],
-        case_type=case_row["type"],
-        transcript=[],
-        new_user_message="",
-        clarifications_exhausted=False,
-    )
-    # JOIN every system turn, not just the first. build_interviewer_messages
-    # emits TWO: the behavioural rules AND the case context. Taking only the
-    # first would hand the realtime model an interviewer with perfect manners
-    # and no idea what case it is running.
-    system_turns = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
-    instructions = "\n\n".join(system_turns).strip()
-    # Voice-only softening: gpt-realtime over-applies the written probe/pressure-test
-    # rules, and voice is turn-dense, so the spoken interviewer grills every
-    # assumption and feels harsh. Append the voice register to soften the TONE for
-    # voice only — the typed chat path is untouched (it already feels right).
-    if instructions:
-        instructions = f"{instructions}\n\n{VOICE_INTERVIEWER_ADDENDUM}"
-    if len(system_turns) < 2:
-        # Loud, because a silently case-less interviewer is very hard to spot
-        # from the outside — it just sounds vague.
-        print(f"[realtime] WARNING: expected >=2 system turns, got {len(system_turns)}")
-    if not instructions:
-        raise HTTPException(status_code=500, detail="Could not build interviewer instructions.")
+    # The realtime model is a voice only: V11 decides every interviewer turn via
+    # /attempts/{id}/voice-decision, so no interviewer prompt or case content
+    # goes into this session (see prompts/voice_renderer.py).
+    instructions = VOICE_RENDERER_INSTRUCTIONS
 
     payload = {
         "session": {

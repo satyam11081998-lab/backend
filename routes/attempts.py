@@ -7,6 +7,7 @@ workspace. Endpoints:
   POST   /attempts                     -> start a session (gates by tier/quota)
   GET    /attempts/{id}                -> fetch case + messages
   POST   /attempts/{id}/messages       -> append user msg, stream AI reply (SSE)
+  POST   /attempts/{id}/voice-decision -> V11 decides one realtime voice turn (JSON)
   POST   /attempts/{id}/uploads        -> attach an image / document to the thread
   POST   /attempts/{id}/submit         -> finalize, score the transcript, save
 
@@ -14,6 +15,7 @@ All endpoints derive user_id from the verified Supabase JWT — never trust
 client-supplied ids. The service-role Supabase client bypasses RLS.
 """
 
+import json
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Form
@@ -125,6 +127,21 @@ class PostMessageRequest(BaseModel):
     kind: str = Field("text", description="text | voice | image | file")
 
 
+class VoiceDecisionRequest(BaseModel):
+    """One FINAL candidate turn from a realtime voice session, for V11 to decide.
+
+    The realtime transports (OpenAI Realtime, Gemini Live) carry audio only; they
+    do not decide what the interviewer says. The browser sends each final
+    candidate transcript here, the frozen V11 engine decides, and the browser has
+    the speech model say exactly `say` (or nothing, for SILENCE). Persistence and
+    credit metering stay on /realtime-turn, unchanged.
+    """
+    content: str = Field(..., min_length=1, max_length=MESSAGE_MAX_CHARS)
+    # A still-being-spoken transcript. V11 answers SILENCE for it without calling
+    # any model; accepted so a client can never trigger speech mid-utterance.
+    is_partial: bool = False
+
+
 class RealtimeTurnRequest(BaseModel):
     """One turn reported by a realtime (WebRTC) voice session.
 
@@ -218,6 +235,44 @@ def _fetch_transcript(supabase, attempt_id: str) -> List[Dict[str, str]]:
         for r in (rows.data or [])
         if r.get("content")
     ]
+
+
+def _is_v11_silence(ctl: Dict[str, Any], chunks: List[str]) -> bool:
+    """True only for V11's deliberate SILENCE lane.
+
+    The frozen engine marks it in control_out as mode NO_OUTPUT with a
+    `silence` intervention and yields nothing. Anything else that comes back
+    empty is NOT silence and must not be swallowed as if it were.
+    """
+    tag = ctl.get("tag") or {}
+    return (
+        ctl.get("mode") == "NO_OUTPUT"
+        and tag.get("intervention") == "silence"
+        and not any((c or "").strip() for c in chunks)
+    )
+
+
+def _fold_session_state(
+    supabase, attempt_id: str, transcript, user_text: str,
+    teaching_policy, session_state, ctl: Dict[str, Any], reply_text: str,
+) -> None:
+    """Phase 2: fold V11's control tag into persisted session_state, and record
+    any deterministic guardrail violation for evals/metrics. Wrapped: a
+    pre-migration DB (no session_state column) degrades to no-op, never a 500.
+    Shared by /messages and /voice-decision so both paths keep ONE learner state.
+    """
+    tag = ctl.get("tag") or {}
+    if not tag:
+        return
+    try:
+        _sig = compute_signals(transcript, user_text, teaching_policy or "coached", session_state)
+        _new_state = update_session_state(session_state, tag, _sig)
+        supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
+        _viol = detect_violations(reply_text, teaching_policy or "coached", tag)
+        if _viol:
+            print(f"[interviewer] guardrail_violation {_viol} attempt={attempt_id} tag={tag}")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[interviewer] session_state update skipped: {type(_e).__name__}: {_e}")
 
 
 # =============================================================================
@@ -491,42 +546,160 @@ async def post_message(
                 safe = token.replace("\\", "\\\\").replace("\n", "\\n")
                 yield f"event: token\ndata: {safe}\n\n"
             final_text = "".join(chunks).strip()
-            # Persist the assistant turn.
-            saved = (
-                supabase.table("attempt_messages")
-                .insert(
-                    {
-                        "attempt_id": attempt_id,
-                        "role": "assistant",
-                        "kind": "text",
-                        "content": final_text,
-                        "is_clarification": False,
-                    }
+            # V11 SILENCE is an internal control decision, not a reply: no assistant
+            # row, no bubble, nothing for TTS. Recognised explicitly from V11's own
+            # control output -- an unexpected empty reply still takes the old path.
+            silent = _is_v11_silence(ctl, chunks)
+            msg_id = None
+            if not silent:
+                # Persist the assistant turn.
+                saved = (
+                    supabase.table("attempt_messages")
+                    .insert(
+                        {
+                            "attempt_id": attempt_id,
+                            "role": "assistant",
+                            "kind": "text",
+                            "content": final_text,
+                            "is_clarification": False,
+                        }
+                    )
+                    .execute()
                 )
-                .execute()
+                msg_id = saved.data[0]["id"] if saved.data else None
+            _fold_session_state(
+                supabase, attempt_id, transcript, body.content,
+                teaching_policy, session_state, ctl, final_text,
             )
-            msg_id = saved.data[0]["id"] if saved.data else None
-            # Phase 2: fold the model's control tag into persisted session_state, and
-            # record any deterministic guardrail violation for evals/metrics. Wrapped:
-            # a pre-migration DB (no session_state column) degrades to no-op, never a 500.
-            tag = ctl.get("tag") or {}
-            if tag:
-                try:
-                    _sig = compute_signals(transcript, body.content, teaching_policy or "coached", session_state)
-                    _new_state = update_session_state(session_state, tag, _sig)
-                    supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
-                    _viol = detect_violations(final_text, teaching_policy or "coached", tag)
-                    if _viol:
-                        print(f"[interviewer] guardrail_violation {_viol} attempt={attempt_id} tag={tag}")
-                except Exception as _e:  # noqa: BLE001
-                    print(f"[interviewer] session_state update skipped: {type(_e).__name__}: {_e}")
-            yield f"event: done\ndata: {{\"message_id\": \"{msg_id}\"}}\n\n"
+            if silent:
+                yield "event: done\ndata: {\"message_id\": null}\n\n"
+            else:
+                yield f"event: done\ndata: {{\"message_id\": \"{msg_id}\"}}\n\n"
         except InterviewEngineError as e:
             yield f"event: error\ndata: {str(e)[:200]}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"event: error\ndata: {type(e).__name__}: {str(e)[:200]}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# =============================================================================
+# POST /attempts/{id}/voice-decision  — V11 decides a realtime voice turn
+# =============================================================================
+
+@router.post("/{attempt_id}/voice-decision")
+async def voice_decision(
+    attempt_id: str,
+    body: VoiceDecisionRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Run the frozen V11 interviewer on one final candidate transcript from a
+    realtime voice session and return its decision:
+
+        {"lane": "SILENCE" | "PRESENCE" | "SUBSTANTIVE",
+         "mode": <V11 mode>, "reason": <V11 reason>,
+         "say": <exact line to speak, or null>,
+         "event": <V11 interviewer_presence event, or null>}
+
+    Same engine call as /messages (stream_interviewer_reply), so typed, standard
+    voice and realtime voice share ONE interviewer brain and ONE learner state.
+    Only the channel differs ("voice"), which changes how V11 renders a presence
+    beat, not what it decides. Nothing is written to attempt_messages here: the
+    client lands the turns through /realtime-turn exactly as before, and for
+    SILENCE there is no assistant turn to land.
+    """
+    supabase = get_supabase_client()
+    user_id, user_obj = get_verified_user(supabase, authorization)
+    is_guest = is_guest_user(user_obj)
+    check_rate_limit(
+        f"attempts:vd:{user_id}",
+        max_calls=20 if is_guest else 60,
+        window_seconds=60,
+    )
+
+    attempt = _load_attempt(supabase, attempt_id, user_id)
+    if attempt["status"] != "active":
+        raise HTTPException(status_code=400, detail="Attempt already submitted")
+
+    assert_daily_budget()  # same global spend backstop as /messages
+
+    count_res = (
+        supabase.table("attempt_messages")
+        .select("id", count="exact")
+        .eq("attempt_id", attempt_id)
+        .execute()
+    )
+    total = getattr(count_res, "count", None) or len(count_res.data or [])
+    cap = GUEST_MAX_MESSAGES_PER_ATTEMPT if is_guest else MAX_MESSAGES_PER_ATTEMPT
+    if total >= cap:
+        raise HTTPException(status_code=400, detail="Message limit reached for this attempt")
+
+    case = _load_case(supabase, attempt["case_id"], user_id)
+    transcript = _fetch_transcript(supabase, attempt_id)
+    session_state = attempt.get("session_state") or {}
+    teaching_policy = case.get("teaching_policy") or None
+
+    # Read-only mirror of /messages: tell V11 when this turn's clarification
+    # cannot be answered. Consumption is still recorded by /realtime-turn when
+    # the client lands the user turn, exactly as before.
+    clar_count = count_clarifications(body.content, "voice")
+    remaining = attempt["clarification_quota"] - attempt["clarification_used"]
+    clarifications_spent = clar_count > 0 and remaining <= 0
+
+    ctl: Dict[str, Any] = {}
+    try:
+        parts = list(stream_interviewer_reply(
+            case_content=llm_case_content(case),
+            case_type=case["type"],
+            transcript=transcript,
+            new_user_message=body.content,
+            user_id=user_id,
+            clarifications_exhausted=clarifications_spent,
+            teaching_policy=teaching_policy,
+            prior_state=session_state,
+            control_out=ctl,
+            channel="voice",
+            is_voice_partial=body.is_partial,
+        ))
+    except InterviewEngineError as e:
+        raise HTTPException(status_code=502, detail=str(e)[:200])
+
+    tag = ctl.get("tag") or {}
+    event = None
+    if _is_v11_silence(ctl, parts):
+        lane, say = "SILENCE", None
+    elif tag.get("intervention") == "fast_lane":
+        lane = "PRESENCE"
+        raw = "".join(parts).strip()
+        try:
+            event = json.loads(raw)
+            say = str(((event or {}).get("data") or {}).get("text") or "").strip() or None
+        except (TypeError, ValueError):
+            event, say = None, raw or None
+        if not say:
+            raise HTTPException(status_code=502, detail="The interviewer presence event had no line.")
+    else:
+        lane = "SUBSTANTIVE"
+        say = "".join(parts).strip()
+        if not say:
+            # Not V11 silence (checked above) -- an empty substantive reply is an
+            # error, never something to quietly treat as "say nothing".
+            raise HTTPException(status_code=502, detail="The interviewer produced no content for this turn.")
+
+    if not body.is_partial:
+        _fold_session_state(
+            supabase, attempt_id, transcript, body.content,
+            teaching_policy, session_state, ctl, say or "",
+        )
+
+    return {
+        "lane": lane,
+        "mode": ctl.get("mode"),
+        "reason": ctl.get("reason"),
+        "say": say,
+        "event": event,
+    }
 
 
 # =============================================================================

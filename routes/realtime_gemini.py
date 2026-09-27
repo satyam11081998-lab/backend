@@ -3,7 +3,7 @@ Gemini Live real-time voice — the cheap, low-latency speech-to-speech intervie
 
 Same shape as routes/realtime.py (the OpenAI one) but for Google's Gemini Live:
 mints a short-lived EPHEMERAL token server-side (the real GEMINI_API_KEY never
-reaches the browser), pins the model + interviewer instructions into the token's
+reaches the browser), pins the model + voice-renderer instructions into the token's
 constraints, and hands the browser a constrained WebSocket URL to stream audio
 directly to Google (lowest latency).
 
@@ -30,7 +30,7 @@ from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance, deduct as deduct_credit
-from prompts.interview_prompts import build_interviewer_messages
+from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS
 
 load_dotenv()
 
@@ -128,22 +128,18 @@ async def create_gemini_session(
     case = supabase.table("cases").select("id, title, type, content").eq("id", body.case_id).limit(1).execute()
     if not case.data:
         raise HTTPException(status_code=404, detail="Case not found")
-    case_row = case.data[0]
 
-    messages = build_interviewer_messages(
-        case_content=case_row["content"], case_type=case_row["type"],
-        transcript=[], new_user_message="", clarifications_exhausted=False,
-    )
-    system_turns = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
-    instructions = "\n\n".join(system_turns).strip()
-    if not instructions:
-        raise HTTPException(status_code=500, detail="Could not build interviewer instructions.")
+    # Gemini Live is only the interviewer's VOICE: V11 decides every turn via
+    # /attempts/{id}/voice-decision and the browser sends the approved line as
+    # "SAY: ...". No interviewer prompt or case content goes into this session
+    # (see prompts/voice_renderer.py).
+    instructions = VOICE_RENDERER_INSTRUCTIONS
 
     now = datetime.datetime.now(tz=datetime.timezone.utc)
     # Ephemeral token WITH constraints, minted via the google-genai SDK. Ephemeral
     # tokens are only accepted on the CONSTRAINED endpoint, and the raw-REST field
     # names differ from the SDK's — so the SDK is the reliable path. Constraints pin
-    # the model, voice, modality, interviewer instructions and transcription, so the
+    # the model, voice, modality, voice-renderer instructions and transcription, so the
     # browser sends only a minimal setup and none of it is client-tamperable.
     model_id = _resolve_live_model()
     constraints_config = {

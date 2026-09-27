@@ -8,6 +8,14 @@ import os
 
 load_dotenv()
 
+# MECE Interviewer V11 is the only interviewer, on every path. The frozen
+# engine's non-adaptive branch used the static prompt that has been removed
+# (prompts/interview_prompts.py), so the adaptive switch is pinned on here
+# instead of being left as a fallback that would now fail at the first turn.
+if os.getenv("ADAPTIVE_INTERVIEWER", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    print("[interviewer] ADAPTIVE_INTERVIEWER pinned to 'true': V11 is the only interviewer")
+os.environ["ADAPTIVE_INTERVIEWER"] = "true"
+
 app = FastAPI(title="MECE Backend", version="0.2.0")
 
 # Vercel PREVIEW deployments get a fresh hashed hostname each build
