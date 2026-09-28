@@ -10,9 +10,13 @@ Creating a new client per call meant a new TCP+TLS handshake (~2 extra round
 trips) on almost every query, plus the CPU cost of building a client, which is
 large on Render's 0.1-CPU instance. One interview turn made 4-5 new clients.
 
-The shared client keeps a warm HTTP/2 connection (keep-alive
+The shared client keeps a pool of warm HTTP/1.1 connections (keep-alive
 SUPABASE_KEEPALIVE_SECONDS, default 60, instead of httpx's 5 s) that PostgREST,
-auth and storage all ride. Safe to share: the client only ever carries the
+auth and storage all use. HTTP/1.1, NOT HTTP/2: requests arrive from many
+threads, and httpx's sync HTTP/2 cannot share one connection between threads
+(production 2026-09-28: "ReadError: [Errno 11] Resource temporarily
+unavailable" on a session_state write). HTTP/1.1 gives each in-flight request
+its own pooled connection, so nothing is shared mid-request. Safe to share: the client only ever carries the
 service-role key -- nothing in this backend signs a user in on it -- and
 supabase-py builds fresh headers per request. Verified to send byte-identical
 URLs and auth headers to a default client.
@@ -85,12 +89,12 @@ def _build_shared_client() -> Client:
         from supabase.lib.client_options import SyncClientOptions
 
         http = httpx.Client(
-            http2=True,
+            http2=False,
             follow_redirects=True,
             # >= every supabase-py default (PostgREST 120 s, storage 20 s).
             timeout=httpx.Timeout(120.0, connect=10.0),
             transport=_RetryStaleConnection(httpx.HTTPTransport(
-                http2=True,
+                http2=False,
                 limits=httpx.Limits(
                     max_connections=100,
                     max_keepalive_connections=20,
