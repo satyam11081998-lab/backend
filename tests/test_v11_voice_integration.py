@@ -1,5 +1,8 @@
 """
-V11 everywhere: integration tests for the one-interviewer wiring.
+One interviewer everywhere: integration tests for the wiring around the frozen
+interviewer engine (services/{session_signals,interviewer_decision,
+interviewer_mode,interview_engine}.py). Engine-version agnostic: route
+behaviour is tested with the engine's own control output, not its wording.
 
 Proves, with fake providers and a fake database (no network, no keys):
   * /attempts/{id}/messages   -- V11 SILENCE saves no assistant row, emits no
@@ -190,11 +193,19 @@ LIVE = [
 ]
 
 
+def settled():
+    """The session_state fold runs just after the response (the next turn waits
+    for it); let it land before inspecting the fake DB."""
+    if hasattr(att, "_await_after_turn"):
+        att._await_after_turn("a1")
+
+
 def decide(text, history=LIVE, reply="Here is a nudge: split buyers by age first. What next?", partial=False, **dbkw):
     global DB
     DB = FakeDB(history, **dbkw)
     LLM.reply, LLM.calls, LLM.raise_exc = reply, [], None
     r = client.post("/attempts/a1/voice-decision", json={"content": text, "is_partial": partial}, headers=H)
+    settled()
     return r, DB, list(LLM.calls)
 
 
@@ -235,7 +246,9 @@ for text, mode in [("Show me the correct approach.", "DELIVER_SOLUTION"),
     d = r.json()
     check(f"{text[:34]!r} -> {mode} with V11 line", d.get("mode") == mode and d.get("lane") == "SUBSTANTIVE" and d.get("say"), d)
 
-r, db, calls = decide("Urban households are roughly 60 percent of the total")
+QUIET = [{"role": "assistant", "kind": "voice", "content": "Let's begin."},
+         {"role": "user", "kind": "voice", "content": "okay sure"}]
+r, db, calls = decide("the market is big", history=QUIET)
 d = r.json()
 check("SILENCE: lane SILENCE, say null, event null", (d.get("lane"), d.get("say"), d.get("event")) == ("SILENCE", None, None), d)
 check("SILENCE: zero LLM calls", calls == [])
@@ -291,6 +304,7 @@ def post_msg(text, history=LIVE, reply="Line."):
     DB = FakeDB(history)
     LLM.reply, LLM.calls = reply, []
     r = client.post("/attempts/a1/messages", json={"content": text, "kind": "text"}, headers=H)
+    settled()
     ev = []
     for raw in r.text.split("\n\n"):
         if raw.strip():
@@ -300,8 +314,21 @@ def post_msg(text, history=LIVE, reply="Line."):
     return ev, DB
 
 
-ev, db = post_msg("Urban households are roughly 60 percent of the total")
-check("SILENCE: SSE is meta -> done (no token event)", [e for e, _ in ev] == ["meta", "done"], ev)
+# Route handling of the engine's SILENCE lane, driven by the engine's own control
+# output (the engine may never choose silence on text; the route must still be right).
+_real_stream_s = att.stream_interviewer_reply
+
+
+def _engine_silence(**kw):
+    kw["control_out"].update({"tag": {"mode": "NO_OUTPUT", "intervention": "silence"},
+                              "mode": "NO_OUTPUT", "reason": "no_presence_needed"})
+    yield ""   # some engine versions emit an empty chunk for silence
+
+
+att.stream_interviewer_reply = _engine_silence
+ev, db = post_msg("anything at all")
+att.stream_interviewer_reply = _real_stream_s
+check("SILENCE: SSE is meta -> (empty token) -> done", [e for e, _ in ev if e != "token"] == ["meta", "done"] and all(d == "" for e, d in ev if e == "token"), ev)
 check("SILENCE: done carries message_id null", ev[-1] == ("done", '{"message_id": null}'), ev[-1:])
 check("SILENCE: no assistant row persisted", db.assistant_rows() == [])
 check("SILENCE: user row still persisted", any(w[2].get("role") == "user" for w in db.writes if w[0] == "insert"))
@@ -400,12 +427,129 @@ rtg.has_credit = lambda *a, **k: True
 rtg.get_balance = lambda *a, **k: {"total_remaining": 10}
 rtg.log_ai_usage = lambda **k: None
 rtg._resolve_live_model = lambda: "fake-live"
-out = asyncio.run(rtg.create_gemini_session(rtg.GeminiSessionRequest(case_id="c1", attempt_id="a1"), authorization="Bearer t"))
+_res = rtg.create_gemini_session(rtg.GeminiSessionRequest(case_id="c1", attempt_id="a1"), authorization="Bearer t")
+out = asyncio.run(_res) if asyncio.iscoroutine(_res) else _res  # sync handler since the speed pass
 cfg = ((captured.get("config") or {}).get("live_connect_constraints") or {}).get("config") or {}
 check("Gemini session minted", out.get("token") == "auth_tokens/test")
 check("Gemini system_instruction == voice renderer only", cfg.get("system_instruction") == VOICE_RENDERER_INSTRUCTIONS)
 check("Gemini instructions carry no old interviewer text", not any(p in str(cfg) for p in OLD_PHRASES))
 check("Gemini still transcribes input + output", "input_audio_transcription" in cfg and "output_audio_transcription" in cfg)
+
+print()
+print("=" * 72)
+print("5. Speed: early voice decisions change nothing unless confirmed; one turn at a time")
+print("=" * 72)
+if hasattr(att, "_resolve_fold"):
+    import threading  # noqa: E402
+
+    TAGGED = "<<mode=coach; intervention=micro_hint; hint=2>>\n\nSplit buyers by age first."
+
+    def vd(text, reply=TAGGED, **extra):
+        LLM.reply, LLM.raise_exc = reply, None
+        r = client.post("/attempts/a1/voice-decision", json=dict({"content": text}, **extra), headers=H)
+        settled()
+        return r
+
+    def fold(turn_id, commit):
+        r = client.post("/attempts/a1/voice-fold", json={"turn_id": turn_id, "commit": commit}, headers=H)
+        settled()
+        return r
+
+    DB = FakeDB(LIVE)
+    r = vd("Can you help me here?", turn_id="T1", defer_fold=True)
+    check("early decision answers normally", r.status_code == 200 and r.json().get("mode") == "HINT", r.text[:200])
+    check("early decision: NO learner-state fold yet", DB.state_writes() == [])
+    r = fold("T1", True)
+    check("confirm -> the fold lands (hint_level 2)", r.status_code == 200 and r.json().get("found") is True
+          and len(DB.state_writes()) == 1 and DB.state_writes()[0].get("hint_level") == 2, (r.text, DB.state_writes()))
+    check("confirming twice changes nothing", fold("T1", True).json().get("found") is False and len(DB.state_writes()) == 1)
+
+    DB = FakeDB(LIVE)
+    vd("Can you help", turn_id="T2", defer_fold=True)
+    fold("T2", False)
+    check("voided early decision: never folded", DB.state_writes() == [])
+    vd("Can you help me here?")
+    check("...the next decision folds only itself", len(DB.state_writes()) == 1)
+
+    DB = FakeDB(LIVE)
+    vd("Can you help", turn_id="T3", defer_fold=True)
+    seen = []
+    _real = att.stream_interviewer_reply
+
+    def _spy(**kw):
+        seen.append(dict(kw.get("prior_state") or {}))
+        return _real(**kw)
+
+    att.stream_interviewer_reply = _spy
+    vd("Can you help me here?", discard_turn_ids=["T3"])
+    check("discard_turn_ids on the next decision drops the early fold first",
+          seen and seen[-1] == {} and len(DB.state_writes()) == 1, (seen, DB.state_writes()))
+
+    DB = FakeDB(LIVE)
+    vd("Can you help me here?", turn_id="T4", defer_fold=True)   # client never says
+    seen.clear()
+    vd("No, I want a hint.")
+    check("an unconfirmed, undiscarded early fold is applied before the next turn reads state",
+          seen and seen[-1].get("hint_level") == 2 and len(DB.state_writes()) == 2, (seen, DB.state_writes()))
+
+    DB = FakeDB(LIVE)
+    fold("T5", False)                                               # void arrives BEFORE the decision
+    vd("Can you help", turn_id="T5", defer_fold=True)
+    vd("Can you help me here?")
+    check("a void that overtakes its decision still wins", len(DB.state_writes()) == 1)
+
+    r = client.post("/attempts/a1/voice-fold", json={"turn_id": "x", "commit": True})
+    check("voice-fold requires auth", r.status_code == 401)
+
+    # A typed turn (or submit) after an UNFINISHED early voice decision: those words
+    # were never saved, so their fold must not land.
+    DB = FakeDB(LIVE)
+    vd("Can you help", turn_id="T6", defer_fold=True)
+    LLM.reply = "Line."
+    client.post("/attempts/a1/messages", json={"content": "typing now", "kind": "text"}, headers=H)
+    settled()
+    check("typed turn drops an unfinished early voice fold", all(w.get("hint_level") != 2 for w in DB.state_writes()), DB.state_writes())
+    check("...and a late confirm for it changes nothing", fold("T6", True).json().get("found") is False)
+
+    # Two overlapping turns for one attempt: the second waits for the first's fold,
+    # exactly as when requests ran one at a time.
+    DB = FakeDB(LIVE)
+    seen.clear()
+    import time as _t  # noqa: E402
+
+    def _slow_first(messages):
+        if any("SLOW" in (m.get("content") or "") for m in messages if m["role"] == "user"):
+            _t.sleep(0.6)
+        return TAGGED
+
+    LLM.reply = _slow_first
+    th = threading.Thread(target=lambda: client.post("/attempts/a1/voice-decision",
+                                                     json={"content": "SLOW can you help me here?"}, headers=H))
+    th.start()
+    _t.sleep(0.15)
+    client.post("/attempts/a1/voice-decision", json={"content": "No, I want a hint."}, headers=H)
+    th.join()
+    settled()
+    check("overlapping turn N+1 read turn N's folded state (serialised per attempt)",
+          len(seen) == 2 and seen[0] == {} and seen[1].get("hint_level") == 2, seen)
+    check("...and the folds landed in order (N, then N+1)", len(DB.state_writes()) == 2)
+
+    # The full turn after a voided early look does not wait for that look's model call.
+    DB = FakeDB(LIVE)
+    th = threading.Thread(target=lambda: client.post("/attempts/a1/voice-decision",
+                                                     json={"content": "SLOW can you", "turn_id": "T7", "defer_fold": True}, headers=H))
+    th.start()
+    _t.sleep(0.15)
+    t0 = _t.monotonic()
+    r = client.post("/attempts/a1/voice-decision", json={"content": "Can you help me here?", "discard_turn_ids": ["T7"]}, headers=H)
+    waited = _t.monotonic() - t0
+    th.join()
+    settled()
+    check(f"full turn not held behind the voided early look ({waited * 1000:.0f} ms < 400 ms)", r.status_code == 200 and waited < 0.4)
+    check("...and only the full turn folded", len(DB.state_writes()) == 1)
+    att.stream_interviewer_reply = _real
+else:
+    print("(skipped: this backend has no early-decision support)")
 
 print()
 print("=" * 72)

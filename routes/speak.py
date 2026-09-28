@@ -14,6 +14,7 @@ from services.rate_limit import check_rate_limit
 from services.ai_usage import (
     assert_daily_budget,
     get_ai_input_quota,
+    get_ai_input_quota_cached,
     log_ai_usage,
     TTS_CHARS_PER_MIN,
 )
@@ -116,7 +117,7 @@ class SpeakRequest(BaseModel):
 
 
 @router.post("")
-async def speak(
+def speak(
     body: SpeakRequest,
     authorization: Optional[str] = Header(default=None),
 ):
@@ -147,7 +148,7 @@ async def speak(
     # round-trips per sentence, and an interviewer reply is 1-3 sentences. That
     # is 20-30 round-trips per turn on the one path where latency is the whole
     # product. This is four.
-    quota = get_ai_input_quota(supabase, uid)
+    quota = get_ai_input_quota_cached(supabase, uid)
     if quota["tier"] != "pro":
         raise HTTPException(
             status_code=403,

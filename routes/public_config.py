@@ -16,5 +16,5 @@ router = APIRouter(prefix="/public-config", tags=["config"])
 
 
 @router.get("")
-async def public_config():
+def public_config():
     return {"voice_mode": current_provider("voice_mode")}

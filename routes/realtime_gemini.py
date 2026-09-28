@@ -103,7 +103,7 @@ class GeminiSessionRequest(BaseModel):
 
 
 @router.post("/session")
-async def create_gemini_session(
+def create_gemini_session(
     body: GeminiSessionRequest,
     authorization: Optional[str] = Header(default=None),
 ):
@@ -205,7 +205,7 @@ class GeminiUsageRequest(BaseModel):
 
 
 @router.post("/usage")
-async def gemini_usage(
+def gemini_usage(
     body: GeminiUsageRequest,
     authorization: Optional[str] = Header(default=None),
 ):

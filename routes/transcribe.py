@@ -9,8 +9,11 @@ from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_providers import current_provider
+from fastapi.concurrency import run_in_threadpool
 from services.ai_usage import (
     assert_voice_quota,
+    check_voice_quota,
+    quota_after_voice,
     assert_daily_budget,
     get_ai_input_quota,
     log_ai_usage,
@@ -76,16 +79,32 @@ async def transcribe_audio(
     caller's per-tier daily voice-minute quota, and is size-capped. Every call is
     logged to ai_usage_log with its billed minutes.
     """
+    # The upload is already received; only this read is async. Everything else
+    # (auth, quota reads, the STT call) is blocking I/O, so it runs in the thread
+    # pool instead of on the event loop, where it stalled every other request on
+    # the single worker -- streamed replies and TTS included -- for its duration.
+    try:
+        file_bytes, read_error = await file.read(), None
+    except Exception as e:  # noqa: BLE001 -- surfaced after the auth checks, as before
+        file_bytes, read_error = b"", e
+    return await run_in_threadpool(_transcribe, file.filename, file_bytes, read_error, authorization)
+
+
+def _transcribe(filename_in, file_bytes: bytes, read_error, authorization: Optional[str]):
     supabase = get_supabase_client()
     uid, user_obj = get_verified_user(supabase, authorization)          # 401 if missing/invalid
     if is_guest_user(user_obj):
         raise HTTPException(status_code=403, detail="Create an account to use voice input.")
     check_rate_limit(f"transcribe:{uid}", max_calls=12, window_seconds=60)
     assert_daily_budget()                                        # 503 if global cap hit
-    assert_voice_quota(supabase, uid)                            # 429 if user out of minutes
+    # One snapshot serves the gate AND the figure returned below (it used to be
+    # read twice: four Tokyo round trips each).
+    quota_snapshot = get_ai_input_quota(supabase, uid)
+    check_voice_quota(quota_snapshot)                            # 429 if user out of minutes
 
     try:
-        file_bytes = await file.read()
+        if read_error is not None:
+            raise read_error
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty audio file")
         if len(file_bytes) > MAX_AUDIO_BYTES:
@@ -94,7 +113,7 @@ async def transcribe_audio(
                 detail="Audio too long — please keep voice input under ~5 minutes.",
             )
 
-        filename = file.filename if file.filename else "audio.webm"
+        filename = filename_in if filename_in else "audio.webm"
         if not filename.endswith((".webm", ".mp4", ".mp3", ".wav", ".m4a", ".ogg")):
             filename = "audio.webm"  # default for MediaRecorder
 
@@ -114,7 +133,7 @@ async def transcribe_audio(
             meta={"bytes": len(file_bytes), "provider": "groq" if stt_model != "whisper-1" else "openai"},
         )
 
-        return {"text": text, "quota": get_ai_input_quota(supabase, uid)}
+        return {"text": text, "quota": quota_after_voice(quota_snapshot, minutes)}
 
     except HTTPException:
         raise

@@ -16,9 +16,14 @@ client-supplied ids. The service-role Supabase client bypasses RLS.
 """
 
 import json
+import os
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Form
+from typing import Optional, List, Dict, Any, Callable, Tuple
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Form, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -41,6 +46,7 @@ from services.badge_awarder import award_badges_for_submission
 from services.case_figures import pop_figures, bank_figures
 from services.ai_usage import assert_daily_budget, log_realtime_usage
 from services.realtime_credits import deduct as deduct_realtime_credit
+from services.keyed_lock import keyed_lock
 
 router = APIRouter(prefix="/attempts", tags=["attempts"])
 
@@ -140,6 +146,23 @@ class VoiceDecisionRequest(BaseModel):
     # A still-being-spoken transcript. V11 answers SILENCE for it without calling
     # any model; accepted so a client can never trigger speech mid-utterance.
     is_partial: bool = False
+    # SPEED (optional; older clients send none of these). A client may ask V11
+    # EARLY -- while the speech model is still finishing its own discarded
+    # reply -- and only use the answer if the candidate's words do not change
+    # afterwards. Such a decision is `defer_fold`: its session_state fold waits
+    # for POST /voice-fold {commit: true}, or is dropped by {commit: false} /
+    # `discard_turn_ids`, so a discarded early decision leaves no trace and the
+    # learner state is exactly what one decision on the final words would give.
+    # An uncommitted, undiscarded fold is applied before the attempt's next turn
+    # (the pre-existing behaviour: every decided turn folds).
+    turn_id: Optional[str] = Field(default=None, max_length=64)
+    defer_fold: bool = False
+    discard_turn_ids: List[str] = Field(default_factory=list, max_length=8)
+
+
+class VoiceFoldRequest(BaseModel):
+    turn_id: str = Field(..., min_length=1, max_length=64)
+    commit: bool
 
 
 class RealtimeTurnRequest(BaseModel):
@@ -207,19 +230,58 @@ def _load_attempt(supabase, attempt_id: str, user_id: str) -> dict:
     return row.data
 
 
-def _load_case(supabase, case_id: str, user_id=None) -> dict:
+# Case rows are read on every turn but change only when an admin edits a case.
+# Cached per process for CASE_CACHE_SECONDS (default 120; 0 disables). The
+# availability / owner checks below still run on every call.
+def _secs_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+_CASE_TTL = _secs_env("CASE_CACHE_SECONDS", 120.0)
+_case_cache: Dict[str, Tuple[float, dict]] = {}
+_case_lock = threading.Lock()
+
+
+def _case_row(supabase, case_id: str):
+    if _CASE_TTL > 0:
+        with _case_lock:
+            hit = _case_cache.get(case_id)
+        if hit is not None and time.monotonic() - hit[0] < _CASE_TTL:
+            return dict(hit[1])
     row = supabase.table("cases").select("*").eq("id", case_id).maybe_single().execute()
-    if not row.data:
+    data = row.data
+    if data and _CASE_TTL > 0:
+        with _case_lock:
+            if len(_case_cache) > 2000:
+                _case_cache.clear()
+            _case_cache[case_id] = (time.monotonic(), dict(data))
+    return data
+
+
+def _load_case(supabase, case_id: str, user_id=None) -> dict:
+    data = _case_row(supabase, case_id)
+    if not data:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    if row.data.get("is_active") is False and not row.data.get("unlisted"):
+    if data.get("is_active") is False and not data.get("unlisted"):
         # Copilot-generated PRIVATE cases (is_active=false, owner_id set) are
         # attemptable by their OWNER — that is the whole point of the curated
         # tool. Everyone else still gets a 404 for a retired/private case.
         # UNLISTED broadcast cases (unlisted=true) are attemptable by ANYONE with the
         # link (broadcast recipients); they skip this owner-gate. Deploy-safe via .get().
-        if not (user_id and row.data.get("owner_id") == user_id):
+        if not (user_id and data.get("owner_id") == user_id):
             raise HTTPException(status_code=404, detail="This case is no longer available.")
-    return row.data
+    return data
+
+
+def _transcript_rows(rows) -> List[Dict[str, str]]:
+    return [
+        {"role": r["role"], "kind": r["kind"], "content": r.get("content") or ""}
+        for r in (rows.data or [])
+        if r.get("content")
+    ]
 
 
 def _fetch_transcript(supabase, attempt_id: str) -> List[Dict[str, str]]:
@@ -230,11 +292,234 @@ def _fetch_transcript(supabase, attempt_id: str) -> List[Dict[str, str]]:
         .order("created_at", desc=False)
         .execute()
     )
-    return [
-        {"role": r["role"], "kind": r["kind"], "content": r.get("content") or ""}
-        for r in (rows.data or [])
-        if r.get("content")
-    ]
+    return _transcript_rows(rows)
+
+
+def _fetch_transcript_and_count(supabase, attempt_id: str) -> Tuple[List[Dict[str, str]], int]:
+    """The transcript AND the message-cap count in ONE round trip.
+
+    Same rows and order as _fetch_transcript; the count is PostgREST's exact
+    count of every attempt_messages row for the attempt (Content-Range), i.e.
+    exactly what the separate select("id", count="exact") returned."""
+    rows = (
+        supabase.table("attempt_messages")
+        .select("role, kind, content, created_at", count="exact")
+        .eq("attempt_id", attempt_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    total = getattr(rows, "count", None) or len(rows.data or [])
+    return _transcript_rows(rows), total
+
+
+# -----------------------------------------------------------------------------
+# SPEED (2026-09-28). The interviewer engine is untouched; everything here is
+# about the database work AROUND it. The backend is in Oregon and Supabase in
+# Tokyo (~100 ms per round trip), and a turn used to make 8-11 of them one after
+# another before and after the model call.
+#
+#   * independent reads run concurrently (_gather);
+#   * work whose result the reply does not need -- folding V11's control tag
+#     into session_state -- runs after the response, in a per-attempt queue
+#     (_after_turn); the next request for the same attempt waits for it
+#     (_await_after_turn), so the next turn always reads the updated state.
+#     The queue is in-process: correct for the single uvicorn worker we run.
+# -----------------------------------------------------------------------------
+_IO_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="attempt-io")
+_AFTER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="attempt-after")
+_after_lock = threading.Lock()
+_after_by_attempt: Dict[str, Future] = {}
+_AFTER_WAIT_S = 10.0
+_TIMING_LOG = os.getenv("LOG_TURN_TIMING", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _gather(*fns: Callable[[], Any]) -> List[Tuple[bool, Any]]:
+    """Run independent callables concurrently. Returns [(ok, value_or_exception)]
+    in argument order, so callers can raise errors in the ORIGINAL order."""
+    futs = [_IO_POOL.submit(fn) for fn in fns]
+    out: List[Tuple[bool, Any]] = []
+    for f in futs:
+        try:
+            out.append((True, f.result()))
+        except BaseException as e:  # noqa: BLE001 -- re-raised by _unwrap
+            out.append((False, e))
+    return out
+
+
+def _unwrap(res: Tuple[bool, Any]):
+    ok, val = res
+    if not ok:
+        raise val
+    return val
+
+
+def _after_turn(attempt_id: str, fn: Callable, *args) -> None:
+    """Run fn(*args) after this response, strictly after any earlier after-turn
+    work for the same attempt. Never raises into the request."""
+    def job(prev: Optional[Future]):
+        if prev is not None:
+            try:
+                prev.result(timeout=_AFTER_WAIT_S)
+            except Exception:
+                pass
+        try:
+            fn(*args)
+        except Exception as e:  # noqa: BLE001
+            print(f"[attempts] after-turn work failed: {type(e).__name__}: {e}")
+
+    with _after_lock:
+        prev = _after_by_attempt.get(attempt_id)
+        fut = _AFTER_POOL.submit(job, prev)
+        _after_by_attempt[attempt_id] = fut
+
+    def _drop(f: Future, aid=attempt_id):
+        with _after_lock:
+            if _after_by_attempt.get(aid) is f:
+                _after_by_attempt.pop(aid, None)
+    fut.add_done_callback(_drop)
+
+
+def _await_after_turn(attempt_id: str) -> None:
+    """Block until the previous turn's after-turn work for this attempt is done
+    (normally long finished: it takes ~0.1 s and a candidate takes seconds)."""
+    with _after_lock:
+        fut = _after_by_attempt.get(attempt_id)
+    if fut is not None:
+        try:
+            fut.result(timeout=_AFTER_WAIT_S)
+        except Exception:
+            pass
+
+
+def _ms(t0: float) -> int:
+    return int((time.perf_counter() - t0) * 1000)
+
+
+# Deferred folds of EARLY (speculative) voice decisions -- see VoiceDecisionRequest.
+# Every schedule of a fold happens INSIDE _deferred_lock, so a concurrent
+# _settle_deferred can never miss a fold that was taken out but not yet queued.
+_DEFER_TTL_S = 600.0
+_deferred_lock = threading.Lock()
+_deferred: Dict[str, "OrderedDict[str, Tuple[str, tuple, float]]"] = {}
+_discarded: Dict[str, Dict[str, float]] = {}
+
+
+# One turn at a time per attempt. A decision waits until every earlier decision
+# for the same attempt has finished and handed on its fold -- the order the old
+# one-request-at-a-time event loop gave -- EXCEPT an early decision the client has
+# already voided: its fold is dropped whatever it decides, so nothing waits for
+# its model call. Other attempts never wait on each other.
+class _TurnSlot:
+    __slots__ = ("done", "spec_id", "prev")
+
+    def __init__(self, spec_id: Optional[str], prev: "Optional[_TurnSlot]"):
+        self.done = threading.Event()
+        self.spec_id = spec_id
+        self.prev = prev
+
+
+_turn_lock = threading.Lock()
+_turn_tail: Dict[str, _TurnSlot] = {}
+_TURN_WAIT_S = 30.0
+
+
+def _enter_turn(attempt_id: str, spec_id: Optional[str] = None, voided=()) -> _TurnSlot:
+    voided = set(voided or ())
+    with _deferred_lock:
+        voided |= set(_discarded.get(attempt_id, {}))
+    with _turn_lock:
+        prev = _turn_tail.get(attempt_id)
+        if prev is not None and prev.done.is_set():
+            prev = None
+        slot = _TurnSlot(spec_id, prev)
+        _turn_tail[attempt_id] = slot
+    deadline = time.monotonic() + _TURN_WAIT_S
+    p = prev
+    while p is not None and not p.done.is_set():
+        if p.spec_id is not None and p.spec_id in voided:
+            p = p.prev          # skip the voided early decision, keep order behind it
+            continue
+        if not p.done.wait(max(0.0, deadline - time.monotonic())):
+            print(f"[attempts] turn for {attempt_id} waited {_TURN_WAIT_S}s for the previous one; proceeding")
+        break                   # a finished slot had itself waited for everything before it
+    return slot
+
+
+def _exit_turn(attempt_id: str, slot: _TurnSlot) -> None:
+    slot.prev = None
+    slot.done.set()
+    with _turn_lock:
+        if _turn_tail.get(attempt_id) is slot:
+            _turn_tail.pop(attempt_id, None)
+
+
+def _prune_locked(now: float) -> None:
+    for aid in list(_discarded):
+        d = _discarded[aid]
+        for tid in [t for t, ts in d.items() if now - ts > _DEFER_TTL_S]:
+            d.pop(tid, None)
+        if not d:
+            _discarded.pop(aid, None)
+    # An early decision nobody confirmed for 10 minutes belongs to an abandoned
+    # session: drop it rather than keep its transcript in memory forever.
+    for aid in list(_deferred):
+        entries = _deferred[aid]
+        for tid in [t for t, e in entries.items() if now - e[2] > _DEFER_TTL_S]:
+            entries.pop(tid, None)
+        if not entries:
+            _deferred.pop(aid, None)
+
+
+def _defer_fold(attempt_id: str, user_id: str, turn_id: str, args: tuple) -> None:
+    now = time.monotonic()
+    with _deferred_lock:
+        if turn_id in _discarded.get(attempt_id, {}):
+            return  # the client already dropped this early decision
+        _deferred.setdefault(attempt_id, OrderedDict())[turn_id] = (user_id, args, now)
+        if len(_discarded) + len(_deferred) > 200:
+            _prune_locked(now)
+
+
+def _resolve_fold(attempt_id: str, user_id: str, turn_id: str, commit: bool) -> bool:
+    """Commit or drop one deferred fold. Only its owner can. True if one existed."""
+    with _deferred_lock:
+        entries = _deferred.get(attempt_id)
+        ent = entries.get(turn_id) if entries else None
+        if ent is not None and ent[0] != user_id:
+            return False
+        if ent is not None:
+            entries.pop(turn_id, None)
+            if not entries:
+                _deferred.pop(attempt_id, None)
+        if not commit:
+            _discarded.setdefault(attempt_id, {})[turn_id] = time.monotonic()
+        elif ent is not None:
+            _after_turn(attempt_id, _fold_session_state, *ent[1])
+    return ent is not None
+
+
+def _settle_deferred(attempt_id: str, user_id: str, discard_ids=(), apply_pending: bool = True) -> None:
+    """Before a turn reads session_state: drop the early decisions the client
+    discarded, then either apply every other pending one in order (the next
+    VOICE turn: the client's confirm is normally already here, this is the
+    safety net) or drop them (typed turn / submit: a pending early decision
+    there is a voice turn the candidate never finished -- its words were never
+    saved, so its fold must not land). Then wait for the applied folds."""
+    for tid in discard_ids or ():
+        _resolve_fold(attempt_id, user_id, tid, False)
+    with _deferred_lock:
+        entries = _deferred.get(attempt_id)
+        if entries:
+            # Only the attempt owner's own requests can touch its pending folds.
+            for tid in [t for t, e in entries.items() if e[0] == user_id]:
+                args = entries.pop(tid)[1]
+                if apply_pending:
+                    _after_turn(attempt_id, _fold_session_state, *args)
+                else:
+                    _discarded.setdefault(attempt_id, {})[tid] = time.monotonic()
+            if not entries:
+                _deferred.pop(attempt_id, None)
+    _await_after_turn(attempt_id)
 
 
 def _is_v11_silence(ctl: Dict[str, Any], chunks: List[str]) -> bool:
@@ -280,7 +565,7 @@ def _fold_session_state(
 # =============================================================================
 
 @router.post("", response_model=AttemptSummary)
-async def start_attempt(
+def start_attempt(
     body: StartAttemptRequest,
     authorization: Optional[str] = Header(default=None),
 ) -> AttemptSummary:
@@ -295,6 +580,14 @@ async def start_attempt(
     tier = effective_tier(supabase, user_id)
     quota = CLARIFICATION_QUOTA.get(tier, 5)
 
+    # Check-then-insert: one at a time per user+case (a double click must not
+    # create two active attempts now that requests run concurrently).
+    with keyed_lock(f"start:{user_id}:{body.case_id}"):
+        return _start_or_resume(supabase, user_id, body, case, tier, quota)
+
+
+def _start_or_resume(supabase, user_id: str, body: StartAttemptRequest, case: dict,
+                     tier: str, quota: int) -> AttemptSummary:
     # Resume any active attempt for this user+case rather than spawning a new one,
     # so a refresh doesn't lose state.
     existing = (
@@ -366,22 +659,28 @@ async def start_attempt(
 # =============================================================================
 
 @router.get("/{attempt_id}", response_model=AttemptDetail)
-async def get_attempt(
+def get_attempt(
     attempt_id: str,
     authorization: Optional[str] = Header(default=None),
 ) -> AttemptDetail:
     supabase = get_supabase_client()
     user_id = get_verified_user_id(supabase, authorization)
-    attempt = _load_attempt(supabase, attempt_id, user_id)
-    case = _load_case(supabase, attempt["case_id"], user_id)
-
-    msg_rows = (
-        supabase.table("attempt_messages")
-        .select("*")
-        .eq("attempt_id", attempt_id)
-        .order("created_at", desc=False)
-        .execute()
+    _await_after_turn(attempt_id)
+    # The attempt (ownership check) and its messages are independent reads; the
+    # messages are only used once the ownership check below has passed.
+    r_attempt, r_msgs = _gather(
+        lambda: _load_attempt(supabase, attempt_id, user_id),
+        lambda: (
+            supabase.table("attempt_messages")
+            .select("*")
+            .eq("attempt_id", attempt_id)
+            .order("created_at", desc=False)
+            .execute()
+        ),
     )
+    attempt = _unwrap(r_attempt)
+    case = _load_case(supabase, attempt["case_id"], user_id)
+    msg_rows = _unwrap(r_msgs)
     messages = [
         MessageOut(
             id=m["id"],
@@ -422,11 +721,12 @@ async def get_attempt(
 # =============================================================================
 
 @router.post("/{attempt_id}/messages")
-async def post_message(
+def post_message(
     attempt_id: str,
     body: PostMessageRequest,
     authorization: Optional[str] = Header(default=None),
 ):
+    t_req = time.perf_counter()
     supabase = get_supabase_client()
     # One token read for both the id and the guest flag — get_verified_user_id
     # would repeat this round-trip, and this is the hottest path in the app.
@@ -440,20 +740,29 @@ async def post_message(
         window_seconds=60,
     )
 
-    attempt = _load_attempt(supabase, attempt_id, user_id)
+    # The previous turn's session_state fold must land before this turn reads it
+    # (and an unfinished early voice decision must not).
+    slot = _enter_turn(attempt_id)
+    try:
+        _settle_deferred(attempt_id, user_id, apply_pending=False)
+    finally:
+        _exit_turn(attempt_id, slot)
+
+    # Independent reads, concurrently. Errors are raised below in the ORIGINAL
+    # order (attempt 404/403 -> submitted 400 -> budget 503 -> message cap 400).
+    r_attempt, r_budget, r_transcript = _gather(
+        lambda: _load_attempt(supabase, attempt_id, user_id),
+        assert_daily_budget,  # global spend backstop before any interviewer-turn spend
+        lambda: _fetch_transcript_and_count(supabase, attempt_id),
+    )
+    attempt = _unwrap(r_attempt)
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
-    assert_daily_budget()  # global spend backstop before any interviewer-turn spend
+    _unwrap(r_budget)
 
     # Soft cap on total messages.
-    count_res = (
-        supabase.table("attempt_messages")
-        .select("id", count="exact")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
-    total = getattr(count_res, "count", None) or len(count_res.data or [])
+    transcript, total = _unwrap(r_transcript)
     cap = GUEST_MAX_MESSAGES_PER_ATTEMPT if is_guest else MAX_MESSAGES_PER_ATTEMPT
     if total >= cap:
         # Phrased as an invitation rather than a wall: a guest who genuinely
@@ -469,7 +778,6 @@ async def post_message(
         )
 
     case = _load_case(supabase, attempt["case_id"], user_id)
-    transcript = _fetch_transcript(supabase, attempt_id)
 
     # Adaptive interviewer (Phase 2): persisted learner state + per-case teaching policy.
     # Both are select("*")-safe -- an absent column just yields None, handled below.
@@ -480,23 +788,6 @@ async def post_message(
     clar_count = count_clarifications(body.content, body.kind)
     remaining = attempt["clarification_quota"] - attempt["clarification_used"]
     quota_exhausted = remaining <= 0
-
-    # Insert the user message first so the transcript persists even if the
-    # AI call later fails.
-    user_row = (
-        supabase.table("attempt_messages")
-        .insert(
-            {
-                "attempt_id": attempt_id,
-                "role": "user",
-                "kind": body.kind if body.kind in ("text", "voice", "image", "file") else "text",
-                "content": body.content,
-                "is_clarification": (clar_count > 0) and not quota_exhausted,
-            }
-        )
-        .execute()
-    )
-    user_msg = user_row.data[0]
 
     # Clarifications are exhausted for this turn?  We used to return early here
     # with NO assistant reply at all — the user's message just hung in the
@@ -513,15 +804,33 @@ async def post_message(
     # counts every '?', so a single packed turn could previously push
     # clarification_used past clarification_quota and drive `remaining`
     # negative (masked by max(0, ...) on the way out, but wrong in the DB).
+    new_used = None
     if clar_count > 0 and not quota_exhausted:
         new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
-        supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
         remaining = attempt["clarification_quota"] - new_used
+
+    user_row = {
+        "attempt_id": attempt_id,
+        "role": "user",
+        "kind": body.kind if body.kind in ("text", "voice", "image", "file") else "text",
+        "content": body.content,
+        "is_clarification": (clar_count > 0) and not quota_exhausted,
+    }
+
+    # Insert the user message first so the transcript persists even if the
+    # AI call later fails (and a failed save is still a plain 500, before any
+    # model spend -- unchanged).
+    supabase.table("attempt_messages").insert(user_row).execute()
+    if new_used is not None:
+        supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
+    pre_ms = _ms(t_req)
 
     # ---------- Stream assistant reply ----------
     def event_stream():
         chunks: List[str] = []
         ctl: Dict[str, Any] = {}
+        t_stream = time.perf_counter()
+        first_ms = None
         try:
             yield (
                 f"event: meta\ndata: {{"
@@ -541,6 +850,8 @@ async def post_message(
                 prior_state=session_state,
                 control_out=ctl,
             ):
+                if first_ms is None and token:
+                    first_ms = _ms(t_stream)
                 chunks.append(token)
                 # SSE data lines must not contain literal newlines — escape them.
                 safe = token.replace("\\", "\\\\").replace("\n", "\\n")
@@ -567,7 +878,10 @@ async def post_message(
                     .execute()
                 )
                 msg_id = saved.data[0]["id"] if saved.data else None
-            _fold_session_state(
+            # Folding V11's tag into session_state is for the NEXT turn: done after
+            # this response, ordered before the next request for this attempt.
+            _after_turn(
+                attempt_id, _fold_session_state,
                 supabase, attempt_id, transcript, body.content,
                 teaching_policy, session_state, ctl, final_text,
             )
@@ -575,12 +889,20 @@ async def post_message(
                 yield "event: done\ndata: {\"message_id\": null}\n\n"
             else:
                 yield f"event: done\ndata: {{\"message_id\": \"{msg_id}\"}}\n\n"
+            if _TIMING_LOG:
+                print(f"[timing] /messages attempt={attempt_id} pre_ms={pre_ms} "
+                      f"first_token_ms={first_ms} reply_ms={_ms(t_stream)} total_ms={_ms(t_req)} "
+                      f"mode={ctl.get('mode')} silent={silent}")
         except InterviewEngineError as e:
             yield f"event: error\ndata: {str(e)[:200]}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"event: error\ndata: {type(e).__name__}: {str(e)[:200]}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Server-Timing": f"pre;dur={pre_ms}"},
+    )
 
 
 # =============================================================================
@@ -588,9 +910,10 @@ async def post_message(
 # =============================================================================
 
 @router.post("/{attempt_id}/voice-decision")
-async def voice_decision(
+def voice_decision(
     attempt_id: str,
     body: VoiceDecisionRequest,
+    response: Response,
     authorization: Optional[str] = Header(default=None),
 ):
     """
@@ -609,6 +932,7 @@ async def voice_decision(
     client lands the turns through /realtime-turn exactly as before, and for
     SILENCE there is no assistant turn to land.
     """
+    t_req = time.perf_counter()
     supabase = get_supabase_client()
     user_id, user_obj = get_verified_user(supabase, authorization)
     is_guest = is_guest_user(user_obj)
@@ -618,25 +942,41 @@ async def voice_decision(
         window_seconds=60,
     )
 
-    attempt = _load_attempt(supabase, attempt_id, user_id)
+    # One decision at a time per attempt (see _enter_turn), from reading
+    # session_state to handing its fold on, so an overlapping turn can never read
+    # a stale learner state or overwrite a newer fold.
+    speculative = bool(body.defer_fold and body.turn_id)
+    slot = _enter_turn(attempt_id, body.turn_id if speculative else None, body.discard_turn_ids)
+    try:
+        return _voice_decision(attempt_id, body, response, supabase, user_id, is_guest, t_req)
+    finally:
+        _exit_turn(attempt_id, slot)
+
+
+def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Response,
+                    supabase, user_id: str, is_guest: bool, t_req: float):
+    # Earlier folds must land before this turn reads session_state: drop the early
+    # decisions the client discarded, apply the rest, wait for them.
+    _settle_deferred(attempt_id, user_id, body.discard_turn_ids)
+
+    # Independent reads, concurrently; errors raised in the original order.
+    r_attempt, r_budget, r_transcript = _gather(
+        lambda: _load_attempt(supabase, attempt_id, user_id),
+        assert_daily_budget,  # same global spend backstop as /messages
+        lambda: _fetch_transcript_and_count(supabase, attempt_id),
+    )
+    attempt = _unwrap(r_attempt)
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
-    assert_daily_budget()  # same global spend backstop as /messages
+    _unwrap(r_budget)
 
-    count_res = (
-        supabase.table("attempt_messages")
-        .select("id", count="exact")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
-    total = getattr(count_res, "count", None) or len(count_res.data or [])
+    transcript, total = _unwrap(r_transcript)
     cap = GUEST_MAX_MESSAGES_PER_ATTEMPT if is_guest else MAX_MESSAGES_PER_ATTEMPT
     if total >= cap:
         raise HTTPException(status_code=400, detail="Message limit reached for this attempt")
 
     case = _load_case(supabase, attempt["case_id"], user_id)
-    transcript = _fetch_transcript(supabase, attempt_id)
     session_state = attempt.get("session_state") or {}
     teaching_policy = case.get("teaching_policy") or None
 
@@ -648,6 +988,8 @@ async def voice_decision(
     clarifications_spent = clar_count > 0 and remaining <= 0
 
     ctl: Dict[str, Any] = {}
+    pre_ms = _ms(t_req)
+    t_engine = time.perf_counter()
     try:
         parts = list(stream_interviewer_reply(
             case_content=llm_case_content(case),
@@ -664,6 +1006,7 @@ async def voice_decision(
         ))
     except InterviewEngineError as e:
         raise HTTPException(status_code=502, detail=str(e)[:200])
+    engine_ms = _ms(t_engine)
 
     tag = ctl.get("tag") or {}
     event = None
@@ -688,10 +1031,22 @@ async def voice_decision(
             raise HTTPException(status_code=502, detail="The interviewer produced no content for this turn.")
 
     if not body.is_partial:
-        _fold_session_state(
-            supabase, attempt_id, transcript, body.content,
-            teaching_policy, session_state, ctl, say or "",
-        )
+        fold_args = (supabase, attempt_id, transcript, body.content,
+                     teaching_policy, session_state, ctl, say or "")
+        if body.defer_fold and body.turn_id:
+            # Early decision: folded only once the client confirms the words did
+            # not change (or before the next turn, if it never says).
+            _defer_fold(attempt_id, user_id, body.turn_id, fold_args)
+        else:
+            # For the NEXT turn only: folded after this response is sent, ordered
+            # before the next request for this attempt reads session_state.
+            _after_turn(attempt_id, _fold_session_state, *fold_args)
+
+    total_ms = _ms(t_req)
+    response.headers["Server-Timing"] = f"pre;dur={pre_ms}, engine;dur={engine_ms}, total;dur={total_ms}"
+    if _TIMING_LOG:
+        print(f"[timing] /voice-decision attempt={attempt_id} pre_ms={pre_ms} engine_ms={engine_ms} "
+              f"total_ms={total_ms} lane={lane} mode={ctl.get('mode')}")
 
     return {
         "lane": lane,
@@ -702,12 +1057,29 @@ async def voice_decision(
     }
 
 
+@router.post("/{attempt_id}/voice-fold")
+def voice_fold(
+    attempt_id: str,
+    body: VoiceFoldRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Commit (the candidate's words did not change) or drop (they did) the
+    session_state fold of an EARLY voice decision -- see VoiceDecisionRequest.
+    Off the critical path: the client sends it in the background."""
+    supabase = get_supabase_client()
+    user_id, _ = get_verified_user(supabase, authorization)
+    check_rate_limit(f"attempts:vf:{user_id}", max_calls=120, window_seconds=60)
+    _load_attempt(supabase, attempt_id, user_id)  # 404 / 403 exactly like the other routes
+    found = _resolve_fold(attempt_id, user_id, body.turn_id, body.commit)
+    return {"ok": True, "found": found}
+
+
 # =============================================================================
 # POST /attempts/{id}/uploads  — image/doc attachment
 # =============================================================================
 
 @router.post("/{attempt_id}/realtime-turn")
-async def post_realtime_turn(
+def post_realtime_turn(
     attempt_id: str,
     body: RealtimeTurnRequest,
     authorization: Optional[str] = Header(default=None),
@@ -731,7 +1103,24 @@ async def post_realtime_turn(
     # /messages, still bounded.
     check_rate_limit(f"attempts:rt:{user_id}", max_calls=120, window_seconds=60)
 
-    attempt = _load_attempt(supabase, attempt_id, user_id)
+    # clarification_used is read-modify-written below: one save at a time per
+    # attempt (the old one-at-a-time event loop gave this for free).
+    with keyed_lock(f"attempt-rt:{attempt_id}"):
+        return _realtime_turn(attempt_id, body, supabase, user_id)
+
+
+def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id: str):
+    # The attempt and the message count are independent reads -- run them together.
+    r_attempt, r_count = _gather(
+        lambda: _load_attempt(supabase, attempt_id, user_id),
+        lambda: (
+            supabase.table("attempt_messages")
+            .select("id", count="exact")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        ),
+    )
+    attempt = _unwrap(r_attempt)
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
@@ -747,12 +1136,7 @@ async def post_realtime_turn(
     # transcript while keeping the cost. Spend is metered below instead.
     role = body.role if body.role in ("user", "assistant") else "user"
 
-    count_res = (
-        supabase.table("attempt_messages")
-        .select("id", count="exact")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
+    count_res = _unwrap(r_count)
     total = getattr(count_res, "count", None) or len(count_res.data or [])
     if total >= MAX_MESSAGES_PER_ATTEMPT:
         raise HTTPException(status_code=400, detail="Message limit reached for this attempt")
@@ -904,7 +1288,7 @@ async def upload_file(
 # =============================================================================
 
 @router.post("/{attempt_id}/submit", response_model=SubmitResponse)
-async def submit_attempt(
+def submit_attempt(
     attempt_id: str,
     body: SubmitRequest,
     authorization: Optional[str] = Header(default=None),
@@ -913,6 +1297,13 @@ async def submit_attempt(
     user_id = get_verified_user_id(supabase, authorization)
     check_rate_limit(f"attempts:submit:{user_id}", max_calls=10, window_seconds=60)
 
+    # Scoring reads session_state: let the last turn's fold land first (and drop
+    # an early voice decision for words the candidate never finished).
+    slot = _enter_turn(attempt_id)
+    try:
+        _settle_deferred(attempt_id, user_id, apply_pending=False)
+    finally:
+        _exit_turn(attempt_id, slot)
     attempt = _load_attempt(supabase, attempt_id, user_id)
     if attempt["status"] != "active":
         raise HTTPException(status_code=400, detail="Attempt already submitted")

@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 from services.supabase_client import get_supabase_client
+from services.keyed_lock import keyed_lock
 
 # Pro's monthly included real-time allowance (minutes). Env-tunable, no redeploy.
 INCLUDED_MIN_PRO = float(os.getenv("REALTIME_INCLUDED_MIN_PRO", "60"))
@@ -49,6 +50,13 @@ def _parse_ts(v) -> datetime:
 
 
 def get_balance(supabase, user_id: str, tier: str) -> Dict[str, Any]:
+    # Read-then-write (refill / first grant): one at a time per user now that
+    # handlers run on threads instead of one-by-one on the event loop.
+    with keyed_lock(f"credits:{user_id}"):
+        return _get_balance(supabase, user_id, tier)
+
+
+def _get_balance(supabase, user_id: str, tier: str) -> Dict[str, Any]:
     """Balance for the user, refilling Pro's monthly included allowance if the
     period has elapsed (or the row is new). Fails safe -> zeros on any error."""
     is_pro = tier == "pro"
@@ -90,6 +98,11 @@ def deduct(supabase, user_id: str, minutes: float) -> None:
     """Burn `minutes` from included first, then purchased. Best-effort."""
     if not minutes or minutes <= 0:
         return
+    with keyed_lock(f"credits:{user_id}"):
+        _deduct(supabase, user_id, minutes)
+
+
+def _deduct(supabase, user_id: str, minutes: float) -> None:
     try:
         row = _row(supabase, user_id)
         if row is None:
@@ -112,6 +125,11 @@ def add_purchased(supabase, user_id: str, minutes: float) -> None:
     """Add purchased (top-up) minutes. Best-effort; creates the row if missing."""
     if not minutes or minutes <= 0:
         return
+    with keyed_lock(f"credits:{user_id}"):
+        _add_purchased(supabase, user_id, minutes)
+
+
+def _add_purchased(supabase, user_id: str, minutes: float) -> None:
     try:
         row = _row(supabase, user_id)
         pur = float(row.get("purchased_remaining") or 0) if row else 0.0

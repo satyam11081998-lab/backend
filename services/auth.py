@@ -7,7 +7,13 @@ token (JWT) the frontend forwards in the Authorization header and derive
 the user id from it — never trust a user_id supplied in the request body.
 """
 
+import base64
+import hashlib
+import json
 import os
+import threading
+import time
+from collections import OrderedDict
 from typing import Optional
 from fastapi import HTTPException
 
@@ -106,6 +112,80 @@ def _verify_local(token: str):
     return _ClaimsUser(claims)
 
 
+# --- Verified-token cache ------------------------------------------------------
+# Even with LOCAL_JWT_VERIFY off, a token Supabase has ALREADY verified does not
+# need a second Oregon->Tokyo round trip seconds later: a live interview sends
+# the same token on every turn, TTS sentence and transcript save. A successful
+# get_user() result is remembered for AUTH_CACHE_TTL_SECONDS (default 60), and
+# never past the token's own expiry. Only successes are cached -- a bad token is
+# re-checked (and rejected) every time -- and guest (anonymous) users are never
+# cached, so a guest who signs up counts as a full account at once. Keyed by a
+# hash, so raw tokens are not kept. Trade-off, same kind as LOCAL_JWT_VERIFY but bounded to the TTL: a
+# server-side revocation takes up to that long to bite. AUTH_CACHE_TTL_SECONDS=0
+# turns the cache off.
+def _ttl_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+_AUTH_CACHE_TTL = _ttl_env("AUTH_CACHE_TTL_SECONDS", 60.0)
+_AUTH_CACHE_MAX = 5000
+_auth_cache: "OrderedDict[str, tuple]" = OrderedDict()
+_auth_lock = threading.Lock()
+
+
+def _token_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _token_exp(token: str) -> Optional[float]:
+    """The token's `exp` claim, read WITHOUT verification -- used only to stop a
+    cache entry outliving the token, never to accept anything."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload.encode("ascii"))).get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
+def _cache_get(token: str):
+    if _AUTH_CACHE_TTL <= 0:
+        return None
+    key = _token_key(token)
+    with _auth_lock:
+        hit = _auth_cache.get(key)
+        if hit is None:
+            return None
+        expires_at, uid, user = hit
+        if time.time() >= expires_at:
+            _auth_cache.pop(key, None)
+            return None
+        _auth_cache.move_to_end(key)
+        return uid, user
+
+
+def _cache_put(token: str, uid: str, user) -> None:
+    if _AUTH_CACHE_TTL <= 0:
+        return
+    now = time.time()
+    expires_at = now + _AUTH_CACHE_TTL
+    exp = _token_exp(token)
+    if exp is not None:
+        expires_at = min(expires_at, exp)
+    if expires_at <= now:
+        return
+    key = _token_key(token)
+    with _auth_lock:
+        _auth_cache[key] = (expires_at, uid, user)
+        _auth_cache.move_to_end(key)
+        while len(_auth_cache) > _AUTH_CACHE_MAX:
+            _auth_cache.popitem(last=False)
+
+
 def get_verified_user(supabase, authorization: Optional[str]):
     """Validate the Bearer access token and return (uid, user_object).
 
@@ -120,6 +200,9 @@ def get_verified_user(supabase, authorization: Optional[str]):
     local = _verify_local(token)
     if local is not None and local.id:
         return local.id, local
+    cached = _cache_get(token)
+    if cached is not None:
+        return cached
     try:
         res = supabase.auth.get_user(token)
         user = getattr(res, "user", None)
@@ -128,6 +211,8 @@ def get_verified_user(supabase, authorization: Optional[str]):
         raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
     if not uid:
         raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+    if getattr(user, "is_anonymous", False) is not True:
+        _cache_put(token, uid, user)
     return uid, user
 
 

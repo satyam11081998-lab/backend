@@ -15,7 +15,9 @@ list changes; costs here are ESTIMATES for guardrails, not billing truth.
 """
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
@@ -81,6 +83,13 @@ REALTIME_OUT_TOK_PER_MIN = 1200.0
 #   Voice: Whisper $0.006/min. Free 5 / Lite 20 / Pro 60 min-day.
 #   OCR:   gpt-4o-mini vision. Free 5 / Lite 20 / Pro 100 images-day.
 # ---------------------------------------------------------------------------
+def _nonneg_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -138,6 +147,37 @@ def _est_cost(model: str, pt: Optional[int], ct: Optional[int]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Off-the-hot-path ledger writes (SPEED, 2026-09-28)
+# ---------------------------------------------------------------------------
+# Every interviewer turn, TTS sentence and transcript logs a row here, and the
+# insert used to run INLINE: an Oregon->Tokyo round trip (plus, before the shared
+# client, a fresh TLS handshake) added to the reply the candidate is waiting on.
+# The row is now built inline (cheap, so nothing about its content changes) and
+# written by a small background pool. Still best-effort, exactly as before: a
+# failed write is dropped silently. AI_USAGE_LOG_SYNC=1 restores inline writes.
+_LOG_SYNC = os.getenv("AI_USAGE_LOG_SYNC", "").strip().lower() in ("1", "true", "yes", "on")
+_LOG_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-usage-log")
+
+
+def _insert_usage_row(row: dict) -> None:
+    try:
+        get_supabase_client().table("ai_usage_log").insert(row).execute()
+    except Exception:
+        return  # logging must never break the product
+
+
+def _write_usage_row(row: dict) -> None:
+    _note_spend(row.get("est_cost_usd") or 0.0)
+    if _LOG_SYNC:
+        _insert_usage_row(row)
+        return
+    try:
+        _LOG_POOL.submit(_insert_usage_row, row)
+    except Exception:  # pool shut down (process exiting) -> write inline
+        _insert_usage_row(row)
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 def log_ai_usage(
@@ -180,7 +220,7 @@ def log_ai_usage(
         else:
             cost = _est_cost(model, pt, ct)
 
-        get_supabase_client().table("ai_usage_log").insert({
+        _write_usage_row({
             "user_id": user_id,
             "endpoint": endpoint,
             "model": model,
@@ -193,7 +233,7 @@ def log_ai_usage(
             "success": success,
             "openai_id": openai_id,
             "meta": meta or {},
-        }).execute()
+        })
     except Exception:
         return  # logging must never break the product
 
@@ -247,7 +287,7 @@ def log_realtime_usage(
         input_tokens / REALTIME_IN_TOK_PER_MIN + output_tokens / REALTIME_OUT_TOK_PER_MIN
     )
     try:
-        get_supabase_client().table("ai_usage_log").insert({
+        _write_usage_row({
             "user_id": user_id,
             "endpoint": "/realtime",
             "model": os.getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
@@ -258,7 +298,7 @@ def log_realtime_usage(
             "est_cost_usd": round(cost, 6),
             "success": True,
             "meta": meta or {},
-        }).execute()
+        })
     except Exception:
         pass  # never let metering break a live interview
 
@@ -278,8 +318,19 @@ def speak_minutes_used_today(supabase, user_id: str) -> float:
     return round(sum(float(r.get("audio_minutes") or 0) for r in _rows_today(supabase, user_id, "/speak")), 3)
 
 
+# Pool tasks here only ever READ; none waits on another pool task, so the pool
+# can never deadlock itself however busy it gets.
+_QUOTA_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="quota-read")
+
+
 def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
     """Full quota snapshot for the frontend 'X min / Y images left today' UI."""
+    # SPEED: the tier read and the three meters are independent. Start the
+    # meters (each already fails soft to 0) and read the tier meanwhile: one
+    # round trip instead of four, same values.
+    fv = _QUOTA_POOL.submit(voice_minutes_used_today, supabase, user_id)
+    fo = _QUOTA_POOL.submit(ocr_images_used_today, supabase, user_id)
+    fs = _QUOTA_POOL.submit(speak_minutes_used_today, supabase, user_id)
     tier = effective_tier(supabase, user_id)
     # Pipeline talk mode (Groq STT + Groq LLM + WaveNet TTS) is CHEAP (~Rs 0.4/min),
     # so it is included and unlimited for Pro. Real-time (Gemini/OpenAI) is the
@@ -288,9 +339,7 @@ def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
     v_limit = VOICE_MIN_PER_DAY.get(tier, VOICE_MIN_PER_DAY["free"])
     o_limit = OCR_IMG_PER_DAY.get(tier, OCR_IMG_PER_DAY["free"])
     s_limit = TTS_MIN_PER_DAY.get(tier, TTS_MIN_PER_DAY["free"])
-    v_used = voice_minutes_used_today(supabase, user_id)
-    o_used = ocr_images_used_today(supabase, user_id)
-    s_used = speak_minutes_used_today(supabase, user_id)
+    v_used, o_used, s_used = fv.result(), fo.result(), fs.result()
     return {
         "tier": tier,
         "voice": {
@@ -315,9 +364,36 @@ def get_ai_input_quota(supabase, user_id: str) -> Dict[str, Any]:
     }
 
 
-def assert_voice_quota(supabase, user_id: str) -> float:
-    """Raise 429 if today's voice minutes are used up. Returns remaining minutes."""
-    q = get_ai_input_quota(supabase, user_id)["voice"]
+# Per-sentence TTS gate (SPEED, 2026-09-28). /speak runs once per SENTENCE the
+# interviewer says and only needs "is this user Pro, and is their talk-mode meter
+# open" -- which for Pro is always unlimited. Re-reading the full snapshot every
+# sentence put a Tokyo round trip in front of each sentence's audio. A snapshot
+# is reused for QUOTA_CACHE_SECONDS (default 20; 0 disables); a plan change
+# reaches /speak within that window.
+_QUOTA_TTL = _nonneg_env("QUOTA_CACHE_SECONDS", 20.0)
+_quota_cache: Dict[str, Any] = {}
+_quota_lock = threading.Lock()
+
+
+def get_ai_input_quota_cached(supabase, user_id: str) -> Dict[str, Any]:
+    if _QUOTA_TTL <= 0:
+        return get_ai_input_quota(supabase, user_id)
+    now = time.monotonic()
+    with _quota_lock:
+        hit = _quota_cache.get(user_id)
+    if hit is not None and now - hit[0] < _QUOTA_TTL:
+        return hit[1]
+    snap = get_ai_input_quota(supabase, user_id)
+    with _quota_lock:
+        if len(_quota_cache) > 5000:
+            _quota_cache.clear()
+        _quota_cache[user_id] = (now, snap)
+    return snap
+
+
+def check_voice_quota(snapshot: Dict[str, Any]) -> float:
+    """assert_voice_quota() on a snapshot the caller already holds (no DB read)."""
+    q = snapshot["voice"]
     if not q.get("unlimited") and q["remaining_min"] <= 0:
         raise HTTPException(
             status_code=429,
@@ -325,6 +401,24 @@ def assert_voice_quota(supabase, user_id: str) -> float:
                    f"Resets at midnight IST — you can still type your answer.",
         )
     return q["remaining_min"]
+
+
+def assert_voice_quota(supabase, user_id: str) -> float:
+    """Raise 429 if today's voice minutes are used up. Returns remaining minutes."""
+    return check_voice_quota(get_ai_input_quota(supabase, user_id))
+
+
+def quota_after_voice(snapshot: Dict[str, Any], minutes: float) -> Dict[str, Any]:
+    """The snapshot as it reads once `minutes` more of transcription are booked --
+    what a fresh get_ai_input_quota() would return after this call's log row,
+    computed locally instead of four more database reads."""
+    out = dict(snapshot)
+    v = dict(snapshot["voice"])
+    used = round(float(v.get("used_min") or 0) + float(minutes or 0), 2)
+    v["used_min"] = used
+    v["remaining_min"] = max(0.0, round(float(v["limit_min"]) - used, 2))
+    out["voice"] = v
+    return out
 
 
 def assert_tts_quota(supabase, user_id: str) -> float:
@@ -362,20 +456,104 @@ def assert_ocr_quota(supabase, user_id: str) -> int:
 # ---------------------------------------------------------------------------
 # Global daily-budget kill switch (catastrophe backstop)
 # ---------------------------------------------------------------------------
+def _read_spend_today() -> float:
+    """One fresh read of today's estimated spend. RAISES on a failed read, so the
+    cache below can tell 'spent nothing' from 'could not read'."""
+    rows = (
+        get_supabase_client()
+        .table("ai_usage_log")
+        .select("est_cost_usd")
+        .gte("created_at", _ist_day_start_utc_iso())
+        .execute()
+        .data
+        or []
+    )
+    return round(sum(float(r.get("est_cost_usd") or 0) for r in rows), 4)
+
+
 def spend_today_usd() -> float:
     try:
-        rows = (
-            get_supabase_client()
-            .table("ai_usage_log")
-            .select("est_cost_usd")
-            .gte("created_at", _ist_day_start_utc_iso())
-            .execute()
-            .data
-            or []
-        )
-        return round(sum(float(r.get("est_cost_usd") or 0) for r in rows), 4)
+        return _read_spend_today()
     except Exception:
         return 0.0
+
+
+# --- Cached spend for the per-turn budget check (SPEED, 2026-09-28) -----------
+# assert_daily_budget() runs before EVERY interviewer turn, TTS sentence and
+# transcription, and it summed every ai_usage_log row of the day -- a full scan
+# across the Pacific on the hot path, growing all day. It is a catastrophe
+# backstop, not a meter, so it now reads a cached figure:
+#   * fresh read at most every AI_BUDGET_CACHE_SECONDS (default 30), refreshed
+#     in the BACKGROUND while the last figure is served (stale-while-revalidate);
+#   * every cost this process logs is added to the cached figure immediately,
+#     so our own spend is never stale;
+#   * the figure resets at IST midnight, and one older than 5 minutes is never
+#     served -- the request re-reads inline instead.
+# AI_BUDGET_CACHE_SECONDS=0 restores a fresh read on every check.
+_SPEND_TTL = _nonneg_env("AI_BUDGET_CACHE_SECONDS", 30.0)
+_SPEND_MAX_STALE = 300.0
+_spend_lock = threading.Lock()
+_spend = {"day": None, "value": None, "at": 0.0, "refreshing": False}
+
+
+def _note_spend(cost) -> None:
+    try:
+        c = float(cost or 0.0)
+    except (TypeError, ValueError):
+        return
+    if c <= 0:
+        return
+    with _spend_lock:
+        if _spend["value"] is not None and _spend["day"] == _ist_day_start_utc_iso():
+            _spend["value"] = round(_spend["value"] + c, 6)
+
+
+def _store_spend(day: str, value: float) -> None:
+    with _spend_lock:
+        _spend.update(day=day, value=value, at=time.monotonic())
+
+
+def _refresh_spend_in_background(day: str) -> None:
+    def job():
+        try:
+            _store_spend(day, _read_spend_today())
+        except Exception:
+            pass  # keep serving the last figure; the next check tries again
+        finally:
+            with _spend_lock:
+                _spend["refreshing"] = False
+    try:
+        _LOG_POOL.submit(job)
+    except Exception:
+        with _spend_lock:
+            _spend["refreshing"] = False
+
+
+def _spend_for_budget_check() -> float:
+    if _SPEND_TTL <= 0:
+        return spend_today_usd()
+    day = _ist_day_start_utc_iso()
+    now = time.monotonic()
+    with _spend_lock:
+        value, same_day, age = _spend["value"], _spend["day"] == day, now - _spend["at"]
+        if value is not None and same_day and age < _SPEND_MAX_STALE:
+            if age >= _SPEND_TTL and not _spend["refreshing"]:
+                _spend["refreshing"] = True
+                start_refresh = True
+            else:
+                start_refresh = False
+        else:
+            start_refresh = None  # nothing usable cached: read inline
+    if start_refresh is None:
+        try:
+            fresh = _read_spend_today()
+        except Exception:
+            return 0.0  # same fail-open as spend_today_usd()
+        _store_spend(day, fresh)
+        return fresh
+    if start_refresh:
+        _refresh_spend_in_background(day)
+    return value
 
 
 def assert_daily_budget() -> None:
@@ -385,7 +563,7 @@ def assert_daily_budget() -> None:
     if DAILY_BUDGET_USD <= 0:
         return
     try:
-        if spend_today_usd() >= DAILY_BUDGET_USD:
+        if _spend_for_budget_check() >= DAILY_BUDGET_USD:
             raise HTTPException(
                 status_code=503,
                 detail="AI features are paused for today (daily spend cap reached). "

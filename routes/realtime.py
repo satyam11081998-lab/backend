@@ -64,6 +64,10 @@ REALTIME_FREE_IP_PER_DAY = int(os.getenv("REALTIME_FREE_IP_PER_DAY", "10"))
 # a model rejects semantic_vad; REALTIME_VAD_SILENCE_MS then pads the silence
 # window well above the ~0.5s default so a mid-calc pause isn't read as "done".
 REALTIME_TURN_MODE = os.getenv("REALTIME_TURN_MODE", "semantic_vad")
+# Speed note (2026-09-28): "low" gives the candidate the most time -- and so the
+# longest silence after a hesitant answer. REALTIME_SEMANTIC_EAGERNESS=medium
+# (OpenAI's own default) or =high shortens that wait; it also changes where
+# turns are cut, so it is left as an owner decision rather than a default.
 REALTIME_SEMANTIC_EAGERNESS = os.getenv("REALTIME_SEMANTIC_EAGERNESS", "low")
 REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
 
@@ -265,7 +269,7 @@ async def create_realtime_session(
 
 
 @router.get("/credits")
-async def realtime_credits_balance(authorization: Optional[str] = Header(default=None)):
+def realtime_credits_balance(authorization: Optional[str] = Header(default=None)):
     """Current real-time minute balance for the caller (included + purchased).
     The talk-mode UI reads this to show 'X min left' and to know when to show the
     buy-minutes paywall instead of connecting."""
