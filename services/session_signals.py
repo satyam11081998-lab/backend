@@ -1,6 +1,7 @@
 """
 Deterministic session signals for the adaptive interviewer.
-V10: Semantic presence tracking, causal hypothesis markers, and strict partiality handling.
+V10.1: Added imperative directive parsing to catch direct demands (tell me, give me).
+Added affirmation detection for clean conversational hand-backs.
 """
 from __future__ import annotations
 
@@ -53,6 +54,11 @@ _INTERROGATIVE = (
     "what", "why", "how", "when", "where", "who", "which", "is", "are",
     "do", "does", "did", "can", "could", "should", "would", "may", "might",
     "will",
+)
+_DIRECTIVES = (
+    "tell me", "give me", "explain", "share", "what is", "what's", 
+    "how much", "how many", "can you", "could you", "provide", "clarify",
+    "i need to know", "let me know"
 )
 _GREETING = ("hi", "hii", "hello", "hey", "ok", "okay", "start", "let's start",
              "lets start", "so", "good morning", "good evening", "yo")
@@ -131,20 +137,24 @@ _HEDGE = (
 _KICKOFF = (
     "start", "begin", "let's go", "lets go", "let's do this", "lets do this",
     "ready", "shall we", "kick off", "kickoff", "go ahead",
+    "give me the case", "tell me the problem", "what is the problem", "what's the problem"
 )
 
-# V10: Strictly causal/analytical markers.
 _HYPOTHESIS_MARKERS = (
     "because", "due to", "driven by", "explains", "therefore", 
     "which suggests", "my hypothesis", "if we", "if they", "implies"
 )
 
-# Semantic markers to distinguish fast presence beats from substantive LLM interventions
 _PRESENCE_TEXT_MATCHES = [
     "got it.", "alright.", "okay.", "right.", "understood.",
     "go ahead.", "makes sense. go ahead.", "sure, continue.", 
     "take it from there.", "alright, continue.", "that works.", "that makes sense."
 ]
+
+_AFFIRMATION_WORDS = {
+    "ok", "okay", "got", "right", "understood", "yes", "yeah", "yep", 
+    "sure", "makes", "agreed", "correct", "exactly", "proceed", "continue"
+}
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
@@ -186,6 +196,7 @@ def detect_intent(text: str) -> Dict[str, Any]:
         "is_meta": _has_any(t, _META),
         "looks_garbage": _looks_garbage(text),
         "is_question": ("?" in (text or "")) or (bool(t) and t.split(" ", 1)[0] in _INTERROGATIVE),
+        "is_directive": _has_any(t, _DIRECTIVES),
         "is_greeting_only": t in _GREETING,
         "is_hypothesis": _has_any(t, _HYPOTHESIS_MARKERS)
     }
@@ -199,7 +210,7 @@ def detect_intent(text: str) -> Dict[str, Any]:
         primary = "asking_for_help"
     elif flags["is_greeting_only"]:
         primary = "greeting"
-    elif flags["is_question"]:
+    elif flags["is_question"] or flags["is_directive"]:
         primary = "clarification"
     elif flags["is_hypothesis"]:
         primary = "hypothesis"
@@ -217,7 +228,6 @@ def _assistant_turns(transcript: Iterable[Dict[str, str]]) -> List[str]:
             if t.get("role") == "assistant" and (t.get("content") or "").strip()]
 
 def _stuckish(turn_norm: str, intent_flags: Dict[str, Any]) -> bool:
-    """V10: Protected against short mathematical inputs/affirmations."""
     if intent_flags.get("help_requested") or intent_flags.get("solution_requested") or intent_flags.get("looks_garbage") or intent_flags.get("frustration"):
         return True
     return False
@@ -251,8 +261,10 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
+    
+    words = new_norm.split()
+    is_affirmation_only = len(words) > 0 and len(words) <= 3 and any(w in _AFFIRMATION_WORDS for w in words)
 
-    # V10 Semantic Rhythm Tracking
     recent_assistant_turns = asst[-4:] if len(asst) > 0 else []
     
     last_action_was_presence = False
@@ -294,13 +306,13 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     product_ux_question = _has_any(new_norm, _PRODUCT_UX)
     why_this_question = _has_any(new_norm, _WHY_THIS)
     
-    asks_owned_fact = intent["is_question"] and _has_any(new_norm, _OWNED_FACT) and not intent["help_requested"]
+    asks_owned_fact = (intent["intent"] == "clarification") and _has_any(new_norm, _OWNED_FACT) and not intent["help_requested"]
 
     is_session_open = (
         (intent["intent"] == "greeting")
         or (len(asst) == 0 and len(cand) == 0)
         or (len(cand) == 0 and len(new_norm) <= 24 and _has_any(new_norm, _KICKOFF)
-            and not intent["is_question"] and not intent["solution_requested"]
+            and not intent["solution_requested"]
             and not intent["help_requested"]))
     is_final_recommendation = _has_any(new_norm, _RECOMMEND)
     is_post_close = _has_any(new_norm, _POST_CLOSE)
@@ -332,6 +344,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "is_scope_question": intent["intent"] == "clarification",
         "looks_garbage": intent["looks_garbage"],
         "has_work": has_work,
+        "is_affirmation_only": is_affirmation_only,
         "recent_probes": recent_probes,
         "interviewer_repeating": interviewer_repeating,
         "candidate_repeating": candidate_repeating,
@@ -360,7 +373,6 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     }
 
 def needs_contextual_assessment(sig: Dict[str, Any]) -> bool:
-    """V10: Invokes deep assessor ONLY for explicit hypothesis/clarification intents where deterministic rules fail."""
     if sig.get("help_requested") or sig.get("solution_requested"): return False
     if sig.get("is_meta") or sig.get("looks_garbage") or sig.get("is_session_open") or sig.get("is_session_close"): return False
     if sig.get("error_materiality") == "material": return False
