@@ -1,7 +1,7 @@
 """
 Control-tag parsing, streaming strip, Contextual Assessor, and Intervention Gate.
-Implements V10 TWO-GATE model (Substantive Gate -> Presence Gate -> Silence).
-Yields strict JSON Semantic Events for Presence or text fallbacks.
+Implements V10.1: Safely routing imperatives to Deep Lane and cleanly falling back 
+to contextual PROBEs or HAND_BACKs to keep case momentum natural.
 """
 from __future__ import annotations
 
@@ -142,7 +142,6 @@ def assess_context_with_llm(transcript: list, new_message: str, case_content: st
 # --- INTERVENTION GATE (V10 TWO-GATE SYSTEM) --------------------------------
 
 def _evaluate_substantive_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
-    """GATE A: Does the interviewer need to contribute substantive content?"""
     if signals.get("is_session_open"): return True, "OPEN", "session_start"
     if signals.get("is_session_close"): return True, "CLOSE", "session_end"
     if signals.get("wants_to_advance") or signals.get("intent") == "wants_to_stop":
@@ -174,10 +173,11 @@ def _evaluate_substantive_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]
     return False, "", ""
 
 def _evaluate_presence_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
-    """GATE B: If not substantive, is a conversational presence signal actually useful?"""
-    # If the candidate was just acknowledged, stay quiet to avoid the metronome.
     if signals.get("last_action_was_presence"):
         return False, "", "recently_acknowledged"
+        
+    if signals.get("is_affirmation_only"):
+        return True, "HAND_BACK", "affirmation_received"
         
     if signals.get("hedged_self_estimate") or "?" in signals.get("new_message_norm", ""):
         return True, "HAND_BACK", "return_floor_explicitly"
@@ -194,35 +194,32 @@ def _evaluate_presence_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
     return False, "", ""
 
 def evaluate_intervention_gate(signals: Dict[str, Any]) -> Tuple[str, str, str]:
-    """
-    Returns (lane, mode, reason) where lane is 'SUBSTANTIVE', 'PRESENCE', or 'SILENCE'.
-    Implements strict Channel and Voice Partial rules.
-    """
     if not signals:
         return "SUBSTANTIVE", "PROBE", "no_signals"
 
     channel = signals.get("channel", "text")
     is_voice_partial = signals.get("is_voice_partial", False)
 
-    # 1. Voice Partial -> True Silence
     if is_voice_partial:
         return "SILENCE", "NO_OUTPUT", "voice_partial"
 
-    # 2. Gate A: Substantive
     is_substantive, sub_mode, sub_reason = _evaluate_substantive_gate(signals)
     if is_substantive:
         return "SUBSTANTIVE", sub_mode, sub_reason
 
-    # 3. Gate B: Presence
     is_presence, pres_mode, pres_reason = _evaluate_presence_gate(signals)
     if is_presence:
         return "PRESENCE", pres_mode, pres_reason
 
-    # 4. Fallback Rule: Text Mode CANNOT have blank bubbles for completed turns
+    # Text Fallback: Prevents Blank Bubbles on un-recognized states
     if channel == "text":
-        return "PRESENCE", "ACKNOWLEDGE", "text_fallback_prevent_blank"
+        if signals.get("has_work") or signals.get("candidate_working"):
+            return "PRESENCE", "ACKNOWLEDGE", "text_fallback_prevent_blank"
+        else:
+            # The candidate said something short that wasn't an affirmation or a known directive.
+            # E.g. "I don't know." -> It's best to gently probe instead of saying "Got it".
+            return "SUBSTANTIVE", "PROBE", "text_fallback_no_work"
 
-    # 5. Voice Mode allows true silence if presence isn't useful
     return "SILENCE", "NO_OUTPUT", "no_presence_needed_for_voice"
 
 
@@ -233,8 +230,7 @@ _FAST_PHRASES = {
         {"code": "ACK_01", "text": "Got it."},
         {"code": "ACK_02", "text": "Alright."},
         {"code": "ACK_03", "text": "Okay."},
-        {"code": "ACK_04", "text": "Right."},
-        {"code": "ACK_05", "text": "Understood."}
+        {"code": "ACK_04", "text": "Right."}
     ],
     "HAND_BACK": [
         {"code": "HB_01", "text": "Go ahead."},
@@ -251,13 +247,8 @@ _FAST_PHRASES = {
 }
 
 def get_fast_lane_event(mode: str, signals: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns a JSON-serializable event dictionary representing the fast lane beat.
-    Uses MD5 hash of the candidate string to select deterministically but naturally.
-    """
     options = _FAST_PHRASES.get(mode, _FAST_PHRASES["ACKNOWLEDGE"])
     
-    # Deterministic contextual selection
     msg = signals.get("new_message_norm", "default")
     hash_val = int(hashlib.md5(msg.encode('utf-8')).hexdigest(), 16)
     
