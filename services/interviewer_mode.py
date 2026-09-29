@@ -1,6 +1,6 @@
 """
 Modality Router and Instruction generation.
-LLM Generation is strictly reserved for Deep Lane Substantive actions.
+V10.1: Tightened ANSWER_DIRECT instruction to prevent solution leakage.
 """
 from __future__ import annotations
 from typing import Any, Dict, Tuple
@@ -32,15 +32,12 @@ Q_BUDGET: Dict[str, int] = {k: (1 if v else 0) for k, v in ALLOW_QUESTIONS.items
 
 
 def get_modality_instruction(mode: str, policy: str, new_message: str, signals: Dict[str, Any] = None) -> str:
-    """Returns the explicit generation boundary for Deep Lane LLM modalities."""
     if signals is None:
         signals = {}
 
-    # Fast lane modalities (handled directly in interview_engine.py)
     if mode in ["NO_OUTPUT", "PRESENCE", "HAND_BACK", "ACKNOWLEDGE", "VALIDATE"]:
         return "Generate nothing. Event handled by Fast Lane."
                 
-    # Deep Lane LLM modalities
     if mode == "DATA_REVEAL":
         return ("Provide ONLY the specific case data required to test their hypothesis or answer their fact request. "
                 "Do not explain the implication of the data. Do not add a framework. Stop.")
@@ -73,8 +70,8 @@ def get_modality_instruction(mode: str, policy: str, new_message: str, signals: 
                 "Do not interrogate them further. Stop.")
                 
     if mode == "ANSWER_DIRECT":
-        return ("Answer the clarification or logistics question directly. "
-                "If it's a scope question, give a defensible answer. Stop.")
+        return ("Answer the clarification or logistics question directly and concisely. "
+                "Do not solve the next analytical step for them. Stop.")
                 
     if mode == "DELIVER_SOLUTION":
         return ("Provide the necessary solution, recommendation, or structural spine. "
