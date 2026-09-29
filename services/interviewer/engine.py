@@ -126,6 +126,11 @@ def word_stream(plan: TurnPlan) -> Iterator[str]:
         if plan.text:
             yield plan.text
         return
+    if plan.decision.max_questions > 0:
+        # Moves that may ask a question are generated whole so a repeated or generic question
+        # can be regenerated once (a stream cannot be taken back).
+        yield word_complete(plan)
+        return
     meta = CallMeta()
     plan.metas.append(meta)
     out: Dict[str, Any] = {}

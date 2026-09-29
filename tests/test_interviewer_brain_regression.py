@@ -235,3 +235,11 @@ def test_c9_consumption_is_identical_to_the_baseline_counter(msg):
     S["db"] = FakeDB([], used=0, quota=20)
     say(msg)
     assert S["db"].tables["attempts"][0]["clarification_used"] == min(20, count_clarifications(msg, "text"))
+
+
+def test_a_verbatim_repeat_of_a_hint_is_still_a_hint_not_an_error():
+    """Found by tools/interviewer_load_test: a model repeating its earlier hint word for word
+    used to be dropped as 'repeated_line', leaving nothing -> an error for the candidate."""
+    for msg in ["Can you give me a hint?", "Oh right.", "ok 3 crore households", "fine", "Can you give me a hint?"]:
+        text, names = say(msg)
+    assert "error" not in names and text.strip()

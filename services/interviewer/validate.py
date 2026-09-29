@@ -168,8 +168,10 @@ class SentenceFilter:
             if any(difflib.SequenceMatcher(None, n, q).ratio() >= 0.85 for q in self.recent_questions):
                 return self._drop("repeated_question")
         n = _norm(s)
-        if n and n in self.recent_lines:
-            return self._drop("repeated_line")
+        if n and n in self.recent_lines and "repeated_line" not in self.violations:
+            # Soft: a verbatim repeat of a recent STATEMENT is recorded (telemetry) but kept -
+            # repeating a hint is better than failing the turn. Repeated QUESTIONS are dropped above.
+            self.violations.append("repeated_line")
         self.kept.append(s)
         if is_q:
             self.questions += n_q

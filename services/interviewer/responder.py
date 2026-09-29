@@ -32,7 +32,7 @@ def _filter(decision: Decision, channel: Channel, state: BrainState) -> Sentence
                           recent_lines=state.recent_lines, recent_questions=state.asked_questions)
 
 
-_SERIOUS = {"banned_phrase", "leak", "question_budget", "generic_question", "repeated_question", "repeated_line"}
+_SERIOUS = {"banned_phrase", "leak", "question_budget", "generic_question", "repeated_question"}
 
 
 def generate_complete(llm: LLM, decision: Decision, case: CaseContext, state: BrainState, channel: Channel,
