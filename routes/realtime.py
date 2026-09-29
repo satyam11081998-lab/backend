@@ -71,6 +71,33 @@ REALTIME_TURN_MODE = os.getenv("REALTIME_TURN_MODE", "semantic_vad")
 REALTIME_SEMANTIC_EAGERNESS = os.getenv("REALTIME_SEMANTIC_EAGERNESS", "low")
 REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
 
+# Input transcription model for realtime voice turns. whisper-1 transcribes the
+# committed turn in one batch, which sits directly on the candidate-stops-speaking
+# -> interviewer-speaks path. Env-selectable so gpt-4o-mini-transcribe /
+# gpt-live-transcribe can be A/B-measured with tools/voice_latency_harness without a
+# deploy (unchanged default: measured alternatives must win on accuracy too).
+REALTIME_TRANSCRIBE_MODEL = os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1")
+
+# Where the voice model's spoken line is generated. "none" = an out-of-band
+# response that sees ONLY the approved line (not the session audio): the model
+# cannot react to the candidate on its own, and per-line input cost does not grow
+# with session length. "auto" = the previous in-band behaviour. Sent to the
+# browser so it can be flipped without a frontend deploy.
+REALTIME_RESPONSE_CONVERSATION = os.getenv("REALTIME_RESPONSE_CONVERSATION", "none").strip().lower()
+if REALTIME_RESPONSE_CONVERSATION not in ("none", "auto"):
+    REALTIME_RESPONSE_CONVERSATION = "none"
+
+# STT talk mode over OpenAI realtime TRANSCRIPTION sessions (gpt-live-transcribe).
+# The browser only uses it when built with NEXT_PUBLIC_STT_TRANSPORT=live.
+STT_LIVE_MODEL = os.getenv("STT_LIVE_MODEL", "gpt-live-transcribe")
+STT_LIVE_DELAY = os.getenv("STT_LIVE_DELAY", "low")
+STT_LIVE_LANGUAGES = [x.strip() for x in os.getenv("STT_LIVE_LANGUAGES", "en").split(",") if x.strip()]
+STT_LIVE_KEYWORDS = [x.strip() for x in os.getenv(
+    "STT_LIVE_KEYWORDS",
+    "crore,lakh,EBITDA,CAGR,MECE,guesstimate,profitability,revenue,fixed cost,variable cost,market size,"
+    "penetration,break-even,unit economics,basis points,percentage points",
+).split(",") if x.strip()][:40]
+
 
 def build_turn_detection() -> dict:
     """Turn-detection config for the realtime session, chosen by REALTIME_TURN_MODE.
@@ -210,7 +237,7 @@ async def create_realtime_session(
                     # repeating itself. See build_turn_detection() and the
                     # REALTIME_TURN_MODE note above; barge-in stays on.
                     "turn_detection": build_turn_detection(),
-                    "transcription": {"model": "whisper-1"},
+                    "transcription": {"model": REALTIME_TRANSCRIBE_MODEL},
                 },
                 "output": {"voice": REALTIME_VOICE},
             },
@@ -259,6 +286,10 @@ async def create_realtime_session(
             "voice": REALTIME_VOICE,
             "max_session_seconds": session_cap,
             "credits": get_balance(supabase, uid, tier),
+            # Additive: how the browser should create spoken responses (see
+            # REALTIME_RESPONSE_CONVERSATION) and which transcription model is live.
+            "response_conversation": REALTIME_RESPONSE_CONVERSATION,
+            "transcribe_model": REALTIME_TRANSCRIBE_MODEL,
         }
 
     except HTTPException:
@@ -279,3 +310,98 @@ def realtime_credits_balance(authorization: Optional[str] = Header(default=None)
         return {"total_remaining": 0, "included_remaining": 0, "purchased_remaining": 0, "tier": "guest"}
     tier = get_ai_input_quota(supabase, uid)["tier"]
     return get_balance(supabase, uid, tier)
+
+
+# =============================================================================
+# STT talk mode: realtime TRANSCRIPTION session (gpt-live-transcribe)
+# =============================================================================
+class TranscriptionSessionRequest(BaseModel):
+    case_id: Optional[str] = None
+    attempt_id: Optional[str] = None
+
+
+def build_transcription_session() -> dict:
+    """Session config for a transcription-only realtime session.
+
+    gpt-live-transcribe does not support server_vad / semantic_vad, so
+    turn_detection is null and the browser commits each turn itself (client VAD),
+    per developers.openai.com/api/docs/guides/realtime-transcription (2026-09-29).
+    """
+    transcription = {"model": STT_LIVE_MODEL}
+    if "live-transcribe" in STT_LIVE_MODEL:
+        transcription["delay"] = STT_LIVE_DELAY
+        if STT_LIVE_LANGUAGES:
+            transcription["languages"] = STT_LIVE_LANGUAGES
+        if STT_LIVE_KEYWORDS:
+            transcription["keywords"] = STT_LIVE_KEYWORDS
+    elif STT_LIVE_LANGUAGES:
+        transcription["language"] = STT_LIVE_LANGUAGES[0]
+    return {
+        "type": "transcription",
+        "audio": {"input": {"transcription": transcription, "turn_detection": None}},
+    }
+
+
+@router.post("/transcription-session")
+async def create_transcription_session(
+    body: TranscriptionSessionRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mint a short-lived client secret for a realtime transcription session.
+
+    Same gates as /transcribe (auth, no guests, rate limit, global budget, per-user
+    daily voice minutes). The real API key never reaches the browser.
+    """
+    from services.ai_usage import check_voice_quota
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="Live transcription is not configured on the server.")
+    supabase = get_supabase_client()
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        raise HTTPException(status_code=403, detail="Create an account to use voice input.")
+    check_rate_limit(f"stt-live:{uid}", max_calls=6, window_seconds=60)
+    assert_daily_budget()
+    check_voice_quota(get_ai_input_quota(supabase, uid))
+
+    payload = {"expires_after": {"anchor": "created_at", "seconds": 600}, "session": build_transcription_session()}
+    try:
+        t0 = time.time()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.post(CLIENT_SECRETS_URL, headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json=payload)
+        latency_ms = int((time.time() - t0) * 1000)
+        if res.status_code >= 400:
+            print(f"[stt-live] client_secrets failed {res.status_code}: {res.text[:500]}")
+            raise HTTPException(status_code=502, detail=f"Could not start live transcription ({res.status_code}).")
+        data = res.json()
+        log_ai_usage(user_id=uid, endpoint="/realtime/transcription-session", model=STT_LIVE_MODEL,
+                     audio_minutes=0, latency_ms=latency_ms, success=True,
+                     meta={"case_id": body.case_id, "attempt_id": body.attempt_id})
+        return {"client_secret": data.get("value") or data.get("client_secret"), "expires_at": data.get("expires_at"),
+                "model": STT_LIVE_MODEL, "delay": STT_LIVE_DELAY}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"[stt-live] session error: {e}")
+        raise HTTPException(status_code=500, detail="Could not start live transcription.")
+
+
+class TranscriptionUsageRequest(BaseModel):
+    seconds: float
+
+
+@router.post("/transcription-usage")
+def transcription_usage(body: TranscriptionUsageRequest, authorization: Optional[str] = Header(default=None)):
+    """Meter streamed live-transcription audio under the SAME '/transcribe' endpoint as
+    Whisper, so the existing per-user daily voice-minute quota applies unchanged.
+    The client reports incremental seconds; one report is clamped to 10 minutes."""
+    supabase = get_supabase_client()
+    uid, user_obj = get_verified_user(supabase, authorization)
+    if is_guest_user(user_obj):
+        return {"ok": True}
+    check_rate_limit(f"stt-live-usage:{uid}", max_calls=60, window_seconds=60)
+    secs = max(0.0, min(float(body.seconds or 0), 600.0))
+    if secs > 0:
+        log_ai_usage(user_id=uid, endpoint="/transcribe", model=STT_LIVE_MODEL, audio_minutes=secs / 60.0,
+                     success=True, meta={"provider": "openai", "src": "live-transcribe"})
+    return {"ok": True}

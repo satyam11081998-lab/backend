@@ -7,7 +7,8 @@ workspace. Endpoints:
   POST   /attempts                     -> start a session (gates by tier/quota)
   GET    /attempts/{id}                -> fetch case + messages
   POST   /attempts/{id}/messages       -> append user msg, stream AI reply (SSE)
-  POST   /attempts/{id}/voice-decision -> V11 decides one realtime voice turn (JSON)
+  POST   /attempts/{id}/voice-decision -> the interviewer decides one realtime voice turn (JSON)
+  POST   /attempts/{id}/voice-telemetry -> client-side voice timing report (telemetry only)
   POST   /attempts/{id}/uploads        -> attach an image / document to the thread
   POST   /attempts/{id}/submit         -> finalize, score the transcript, save
 
@@ -131,6 +132,12 @@ class AttemptDetail(BaseModel):
 class PostMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=MESSAGE_MAX_CHARS)
     kind: str = Field("text", description="text | voice | image | file")
+    # Additive (2026-09-29, unified interviewer brain). Older clients send neither.
+    # channel: "text" (typed / dictated chat) | "stt" (spoken talk mode). Only the
+    # rendering differs by channel; the interviewer's decision rules do not.
+    channel: Optional[str] = Field(default=None, max_length=8)
+    # Stable client id of this candidate turn: the same turn posted twice is decided once.
+    turn_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class VoiceDecisionRequest(BaseModel):
@@ -158,6 +165,8 @@ class VoiceDecisionRequest(BaseModel):
     turn_id: Optional[str] = Field(default=None, max_length=64)
     defer_fold: bool = False
     discard_turn_ids: List[str] = Field(default_factory=list, max_length=8)
+    # Additive: the realtime session this turn came from (telemetry only).
+    session_id: Optional[str] = Field(default=None, max_length=80)
 
 
 class VoiceFoldRequest(BaseModel):
@@ -181,6 +190,35 @@ class RealtimeTurnRequest(BaseModel):
     # visible to the daily-budget kill switch.
     audio_input_tokens: Optional[int] = None
     audio_output_tokens: Optional[int] = None
+    # Additive idempotency key ("u:<item_id>" / "a:<response_id>"): a retried or
+    # reconnect-duplicated save of the same turn lands once, and is metered once.
+    client_turn_id: Optional[str] = Field(default=None, max_length=96)
+
+
+class VoiceTelemetryRequest(BaseModel):
+    """Client-measured voice timings for one turn (all optional; epoch ms or ms deltas)."""
+    turn_id: Optional[str] = Field(default=None, max_length=96)
+    session_id: Optional[str] = Field(default=None, max_length=80)
+    channel: Optional[str] = Field(default=None, max_length=8)
+    transport: Optional[str] = Field(default=None, max_length=24)
+    lane: Optional[str] = Field(default=None, max_length=16)
+    model: Optional[str] = Field(default=None, max_length=48)
+    stt_model: Optional[str] = Field(default=None, max_length=48)
+    browser: Optional[str] = Field(default=None, max_length=48)
+    network: Optional[str] = Field(default=None, max_length=24)
+    error_type: Optional[str] = Field(default=None, max_length=48)
+    speech_end_timestamp: Optional[float] = None
+    transcript_final_timestamp: Optional[float] = None
+    decision_timestamp: Optional[float] = None
+    response_start_timestamp: Optional[float] = None
+    first_audio_timestamp: Optional[float] = None
+    interruption_timestamp: Optional[float] = None
+    interruption_stop_timestamp: Optional[float] = None
+    t1_ms: Optional[float] = None
+    t2_ms: Optional[float] = None
+    t3_ms: Optional[float] = None
+    t4_ms: Optional[float] = None
+    interruption_ms: Optional[float] = None
 
 
 class SubmitRequest(BaseModel):
@@ -470,12 +508,13 @@ def _prune_locked(now: float) -> None:
             _deferred.pop(aid, None)
 
 
-def _defer_fold(attempt_id: str, user_id: str, turn_id: str, args: tuple) -> None:
+def _defer_fold(attempt_id: str, user_id: str, turn_id: str, args: tuple, fn: Optional[Callable] = None) -> None:
     now = time.monotonic()
     with _deferred_lock:
         if turn_id in _discarded.get(attempt_id, {}):
             return  # the client already dropped this early decision
-        _deferred.setdefault(attempt_id, OrderedDict())[turn_id] = (user_id, args, now)
+        # (fn, args): V11 folds with _fold_session_state; the unified brain persists its own state.
+        _deferred.setdefault(attempt_id, OrderedDict())[turn_id] = (user_id, (fn or _fold_session_state, args), now)
         if len(_discarded) + len(_deferred) > 200:
             _prune_locked(now)
 
@@ -494,7 +533,8 @@ def _resolve_fold(attempt_id: str, user_id: str, turn_id: str, commit: bool) -> 
         if not commit:
             _discarded.setdefault(attempt_id, {})[turn_id] = time.monotonic()
         elif ent is not None:
-            _after_turn(attempt_id, _fold_session_state, *ent[1])
+            fold_fn, fold_args = ent[1]
+            _after_turn(attempt_id, fold_fn, *fold_args)
     return ent is not None
 
 
@@ -512,9 +552,9 @@ def _settle_deferred(attempt_id: str, user_id: str, discard_ids=(), apply_pendin
         if entries:
             # Only the attempt owner's own requests can touch its pending folds.
             for tid in [t for t, e in entries.items() if e[0] == user_id]:
-                args = entries.pop(tid)[1]
+                fold_fn, args = entries.pop(tid)[1]
                 if apply_pending:
-                    _after_turn(attempt_id, _fold_session_state, *args)
+                    _after_turn(attempt_id, fold_fn, *args)
                 else:
                     _discarded.setdefault(attempt_id, {})[tid] = time.monotonic()
             if not entries:
@@ -740,6 +780,12 @@ def post_message(
         window_seconds=60,
     )
 
+    # Unified interviewer brain (INTERVIEWER_BRAIN on / allow-listed). Flag off:
+    # everything below runs exactly as before.
+    from routes import attempts_brain
+    if attempts_brain.enabled(user_id, user_obj):
+        return attempts_brain.post_message(attempt_id, body, supabase, user_id, is_guest, t_req)
+
     # The previous turn's session_state fold must land before this turn reads it
     # (and an unfinished early voice decision must not).
     slot = _enter_turn(attempt_id)
@@ -946,8 +992,12 @@ def voice_decision(
     # session_state to handing its fold on, so an overlapping turn can never read
     # a stale learner state or overwrite a newer fold.
     speculative = bool(body.defer_fold and body.turn_id)
+    from routes import attempts_brain
+    use_brain = attempts_brain.enabled(user_id, user_obj)
     slot = _enter_turn(attempt_id, body.turn_id if speculative else None, body.discard_turn_ids)
     try:
+        if use_brain:
+            return attempts_brain.voice_decision(attempt_id, body, response, supabase, user_id, is_guest, t_req)
         return _voice_decision(attempt_id, body, response, supabase, user_id, is_guest, t_req)
     finally:
         _exit_turn(attempt_id, slot)
@@ -1103,10 +1153,23 @@ def post_realtime_turn(
     # /messages, still bounded.
     check_rate_limit(f"attempts:rt:{user_id}", max_calls=120, window_seconds=60)
 
+    # Idempotency (2026-09-29): the same client_turn_id is written - and metered -
+    # once, however many times it is posted (retry, reconnect, double callback).
+    from services.interviewer.dedupe import ROWS
+    fresh, existing_id = ROWS.claim(attempt_id, body.client_turn_id)
+    if not fresh:
+        return {"message_id": existing_id, "duplicate": True}
+
     # clarification_used is read-modify-written below: one save at a time per
     # attempt (the old one-at-a-time event loop gave this for free).
-    with keyed_lock(f"attempt-rt:{attempt_id}"):
-        return _realtime_turn(attempt_id, body, supabase, user_id)
+    try:
+        with keyed_lock(f"attempt-rt:{attempt_id}"):
+            out = _realtime_turn(attempt_id, body, supabase, user_id)
+    except BaseException:
+        ROWS.release(attempt_id, body.client_turn_id)
+        raise
+    ROWS.done(attempt_id, body.client_turn_id, out.get("message_id"))
+    return out
 
 
 def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id: str):
@@ -1145,26 +1208,27 @@ def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id
     # post_message does — the far end has already answered — so this records
     # consumption rather than gating it. See the C9 open item in the realtime
     # handoff before changing this.
-    clar_count = 0
-    if role == "user":
-        clar_count = count_clarifications(body.content, "voice")
-        if clar_count > 0:
-            new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
-            supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
+    clar_count = count_clarifications(body.content, "voice") if role == "user" else 0
 
-    saved = (
-        supabase.table("attempt_messages")
-        .insert(
-            {
-                "attempt_id": attempt_id,
-                "role": role,
-                "kind": "voice",
-                "content": body.content,
-                "is_clarification": clar_count > 0,
-            }
-        )
-        .execute()
+    # The row first, then consumption: a turn already persisted under this
+    # client_turn_id (e.g. saved before a restart) is neither counted nor metered twice.
+    from routes.attempts_brain import insert_message
+    message_id, inserted = insert_message(
+        supabase,
+        {
+            "attempt_id": attempt_id,
+            "role": role,
+            "kind": "voice",
+            "content": body.content,
+            "is_clarification": clar_count > 0,
+        },
+        body.client_turn_id,
     )
+    if not inserted:
+        return {"message_id": message_id, "duplicate": True}
+    if clar_count > 0:
+        new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
+        supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()
 
     # Meter it. gpt-realtime bills audio per token: input 1 tok/100ms, output
     # 1 tok/50ms. Booking a real cost here is the ONLY thing that makes voice
@@ -1183,7 +1247,22 @@ def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id
         turn_minutes = (body.audio_input_tokens or 0) / 600.0 + (body.audio_output_tokens or 0) / 1200.0
         deduct_realtime_credit(supabase, user_id, turn_minutes)
 
-    return {"message_id": saved.data[0]["id"] if saved.data else None}
+    return {"message_id": message_id}
+
+
+@router.post("/{attempt_id}/voice-telemetry")
+def voice_telemetry(
+    attempt_id: str,
+    body: VoiceTelemetryRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Client-measured voice timings (speech end, transcript final, first audible audio,
+    interruption). Logged as one structured telemetry line; nothing is stored."""
+    supabase = get_supabase_client()
+    user_id, _ = get_verified_user(supabase, authorization)
+    check_rate_limit(f"attempts:vt:{user_id}", max_calls=240, window_seconds=60)
+    from routes.attempts_brain import voice_telemetry as _vt
+    return _vt(attempt_id, body.model_dump(exclude_none=True), user_id)
 
 
 @router.post("/{attempt_id}/uploads")

@@ -49,6 +49,11 @@ WHISPER_PER_MIN = 0.006
 # Groq's whisper-large-v3-turbo is ~$0.04/hr ≈ $0.000667/min — ~9x cheaper than
 # OpenAI Whisper, same underlying model. Used when transcribe routes to Groq.
 GROQ_WHISPER_PER_MIN = float(os.getenv("GROQ_WHISPER_PER_MIN", "0.000667"))
+# OpenAI realtime transcription (gpt-live-transcribe), billed per minute of streamed
+# audio ($0.017/min at 2026-09-29, developers.openai.com/api/docs/models/gpt-live-transcribe).
+# Its rows are written under the SAME '/transcribe' endpoint as Whisper, so the
+# existing per-user voice-minute quota keeps applying unchanged.
+LIVE_TRANSCRIBE_PER_MIN = float(os.getenv("LIVE_TRANSCRIBE_PER_MIN", "0.017"))
 
 # TTS is priced per CHARACTER, not per token — it must NOT go in PRICES (those
 # are token tuples and _est_cost would read a TTS call as 0, because a speech
@@ -201,7 +206,9 @@ def log_ai_usage(
             tt = getattr(usage, "total_tokens", None)
             openai_id = getattr(response, "id", None)
 
-        if "whisper" in model and audio_minutes is not None:
+        if "live-transcribe" in model and audio_minutes is not None:
+            cost = audio_minutes * LIVE_TRANSCRIBE_PER_MIN
+        elif "whisper" in model and audio_minutes is not None:
             # OpenAI Whisper is $0.006/min; Groq's whisper-large-v3* is ~9x cheaper.
             # Any non-"whisper-1" whisper model is assumed to be the Groq endpoint.
             cost = audio_minutes * (WHISPER_PER_MIN if model == "whisper-1" else GROQ_WHISPER_PER_MIN)
