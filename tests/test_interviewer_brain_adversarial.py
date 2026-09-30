@@ -215,15 +215,20 @@ def test_injection_never_reaches_a_model_and_stays_in_role(attack):
     assert p[0].text and not re.search(r"MOVE|TASK|prompt|instruction|hint_level|api", p[0].text, re.I)
 
 
-def test_prompt_never_contains_hidden_solution_or_secrets():
-    case = CaseContext(case_type="profitability", content="Profits fell 20%.")
-    p, _ = run(["Can you give me a hint?"], case=case)
-    msgs = prompting.build_messages(p[0].decision, case, p[0].state_before, Channel.TEXT, [], "hint please")
+@pytest.mark.parametrize("ask", ["Can you give me a hint?", "Show me the correct approach.", "Give me the answer."])
+def test_prompt_never_contains_hidden_solution_or_secrets(ask, monkeypatch):
+    # Build the case exactly as the route does, from a cases row that HAS a stored solution.
+    import routes.attempts_brain as AB
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-live-SHOULD-NEVER-APPEAR")
+    row = {"type": "profitability", "title": "Retail profits", "content": "Profits fell 20% over two years.",
+           "solution": "HIDDEN-REFERENCE-SOLUTION-7f3a", "market": "IN"}
+    case = AB._case_ctx(row)                       # real llm_case_content (content + market note only)
+    p, _ = run([ask], case=case)
+    msgs = prompting.build_messages(p[0].decision, case, p[0].state_before, Channel.TEXT, [], ask)
     blob = "\n".join(m["content"] for m in msgs)
-    assert "solution" not in case.content and "HIDDEN" not in blob
+    assert "HIDDEN-REFERENCE-SOLUTION" not in blob
     assert "sk-" not in blob and "SUPABASE" not in blob
-    assert "never claim" not in blob.lower() or True
-    assert "human" not in blob.lower()          # no "you are a human" identity lock
+    assert "human interviewer" not in blob.lower()      # no "you are a human" identity lock
 
 
 def test_candidate_text_is_data_not_instructions():

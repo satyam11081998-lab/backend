@@ -1,8 +1,9 @@
 """
 Named regression tests for the brief's failure modes (section 57, A-L) and the
 invariants (section 48, 1-10). Backend-side items run here; the browser-side
-halves of I, J, K, L live in the frontend suite (company/tests/voice/*.test.mjs)
-and are referenced by name in MECE_INTERVIEWER_REGRESSION_REPORT.md.
+halves of I, J, K, L live in the frontend suites (company/qa/voice/*.test.cjs and
+the browser E2E in company/qa/e2e-voice/) and are referenced by name in
+docs/interviewer/MECE_INTERVIEWER_REGRESSION_REPORT.md.
 
     python -m pytest tests/test_interviewer_brain_regression.py -q
 """

@@ -1,10 +1,15 @@
 """
 Local load / concurrency test for the unified-brain routes.
 
-Runs the REAL FastAPI app under uvicorn (one worker, like production) with an
-in-memory database and a scripted provider that sleeps like a real one (first token
-after --llm-first-ms, then --llm-tail-ms), and drives N concurrent candidates, each
-with its own attempt, through a mixed TEXT/STT/VOICE interview.
+Runs the REAL FastAPI app under uvicorn (one worker, like production) in its OWN
+process (forked, so the load generator does not share its GIL) with an in-memory
+database and a scripted provider that sleeps like a real one (first token after
+--llm-first-ms, then --llm-tail-ms), and drives N concurrent candidates, each with its
+own attempt, through a mixed TEXT/STT/VOICE interview.
+
+--threadpool N sets anyio's worker-thread limit in the server (default: anyio's 40).
+Sync FastAPI routes - including every interviewer route, as before this change - hold
+one of those threads for the whole model call, so it bounds concurrent turns per worker.
 
 Measures per lane: server-side latency to first SSE token / JSON decision; errors;
 event-loop responsiveness (a trivial endpoint pinged during the load); RSS growth;
@@ -20,12 +25,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import multiprocessing as mp
 import os
 import random
 import resource
-import statistics
 import sys
-import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,7 +91,7 @@ def rss_mb():
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
 
 
-async def run_level(port, users, turns, db):
+async def run_level(port, users, turns):
     lat = {"NO_OUTPUT": [], "PRESENCE": [], "SUBSTANTIVE": [], "ERROR": []}
     first_token = []
     errors = []
@@ -158,11 +162,13 @@ async def run_level(port, users, turns, db):
         stop.set()
         await ping_task
 
-    # isolation: each attempt's rows contain only its own attempt id, user rows only script texts
-    iso_ok = all(m.get("attempt_id") in {f"a{i}" for i in range(users)} for m in db.rows())
+    # isolation: every row belongs to one of this level's attempts; no (attempt, turn) row twice
+    rows = await call(port, "GET", "/__rows")
+    server = await call(port, "GET", "/__stats")
+    iso_ok = all(m.get("attempt_id") in {f"a{i}" for i in range(users)} for m in rows)
     dup_rows = 0
     seen = set()
-    for m in db.rows():
+    for m in rows:
         k = (m.get("attempt_id"), m.get("client_turn_id"))
         if k[1] and k in seen:
             dup_rows += 1
@@ -173,8 +179,69 @@ async def run_level(port, users, turns, db):
         "ms": {lane: {"n": len(v), "p50": pct(v, 50), "p90": pct(v, 90), "p95": pct(v, 95)} for lane, v in lat.items()},
         "event_loop_ping_ms": {"n": len(pings), "p50": pct(pings, 50), "p95": pct(pings, 95), "max": round(max(pings), 1) if pings else None},
         "errors": errors[:20], "error_count": len(errors), "isolation_ok": iso_ok, "duplicate_rows": dup_rows,
-        "rss_mb_after": rss_mb(), "ledger_entries": dedupe.LEDGER.size(),
+        "server_rss_mb": server["rss_mb"], "ledger_entries": server["ledger_entries"], "rows": len(rows),
     }
+
+
+def build_app(db, llm, threadpool):
+    install_route_fakes(att, lambda: db)
+    engine.LLM_FACTORY = lambda plan: llm
+    engine.default_assessor = lambda uid: (lambda **kw: Assessment(material=False))
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        if threadpool:
+            import anyio.to_thread
+            anyio.to_thread.current_default_thread_limiter().total_tokens = threadpool
+        yield
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(att.router)
+
+    @app.get("/ping")
+    async def ping():
+        return {"ok": True}
+
+    @app.get("/__rows")
+    def rows():
+        return [{"attempt_id": m.get("attempt_id"), "client_turn_id": m.get("client_turn_id"), "role": m.get("role")}
+                for m in db.rows()]
+
+    @app.post("/__reset")
+    def reset():
+        db.tables["attempt_messages"].clear()
+        for row in db.tables["attempts"]:
+            row["session_state"] = {}
+        dedupe.LEDGER.__init__()
+        return {"ok": True}
+
+    @app.get("/__stats")
+    def stats():
+        return {"rss_mb": rss_mb(), "ledger_entries": dedupe.LEDGER.size()}
+
+    return app
+
+
+def serve(app, port):
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning", workers=1)
+
+
+async def wait_up(port):
+    async with httpx.AsyncClient() as c:
+        for _ in range(200):
+            try:
+                await c.get(f"http://127.0.0.1:{port}/ping")
+                return
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(0.05)
+    raise SystemExit("server did not start")
+
+
+async def call(port, method, path):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.request(method, f"http://127.0.0.1:{port}{path}")
+        return r.json()
 
 
 def main():
@@ -184,38 +251,26 @@ def main():
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--llm-first-ms", type=int, default=350)
     ap.add_argument("--llm-tail-ms", type=int, default=300)
+    ap.add_argument("--threadpool", type=int, default=0)
     a = ap.parse_args()
 
-    maxu = max(a.users)
-    db = MultiDB(maxu)
-    llm = TimedLLM(a.llm_first_ms, a.llm_tail_ms)
-    install_route_fakes(att, lambda: db)
-    engine.LLM_FACTORY = lambda plan: llm
-    engine.default_assessor = lambda uid: (lambda **kw: Assessment(material=False))
-    app = FastAPI()
-    app.include_router(att.router)
-
-    @app.get("/ping")
-    async def ping():
-        return {"ok": True}
-
-    config = uvicorn.Config(app, host="127.0.0.1", port=a.port, log_level="warning", workers=1)
-    server = uvicorn.Server(config)
-    th = threading.Thread(target=server.run, daemon=True)
-    th.start()
-    while not server.started:
-        time.sleep(0.05)
-    out = {"rss_mb_start": rss_mb(), "llm_first_ms": a.llm_first_ms, "llm_tail_ms": a.llm_tail_ms, "levels": []}
-    for u in a.users:
-        db.tables["attempt_messages"].clear()
-        for row in db.tables["attempts"]:
-            row["session_state"] = {}
-        dedupe.LEDGER.__init__()
-        out["levels"].append(asyncio.run(run_level(a.port, u, a.turns, db)))
-        print(json.dumps(out["levels"][-1]), flush=True)
-    server.should_exit = True
-    th.join(timeout=5)
-    print(json.dumps(out, indent=1))
+    db = MultiDB(max(a.users))
+    app = build_app(db, TimedLLM(a.llm_first_ms, a.llm_tail_ms), a.threadpool)
+    proc = mp.get_context("fork").Process(target=serve, args=(app, a.port), daemon=True)
+    proc.start()
+    try:
+        asyncio.run(wait_up(a.port))
+        out = {"llm_first_ms": a.llm_first_ms, "llm_tail_ms": a.llm_tail_ms,
+               "threadpool": a.threadpool or "anyio default (40)", "levels": []}
+        for u in a.users:
+            asyncio.run(call(a.port, "POST", "/__reset"))
+            lvl = asyncio.run(run_level(a.port, u, a.turns))
+            out["levels"].append(lvl)
+            print(json.dumps(lvl), flush=True)
+        print(json.dumps(out, indent=1))
+    finally:
+        proc.terminate()
+        proc.join(timeout=5)
 
 
 if __name__ == "__main__":

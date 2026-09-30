@@ -74,7 +74,7 @@ REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
 # Input transcription model for realtime voice turns. whisper-1 transcribes the
 # committed turn in one batch, which sits directly on the candidate-stops-speaking
 # -> interviewer-speaks path. Env-selectable so gpt-4o-mini-transcribe /
-# gpt-live-transcribe can be A/B-measured with tools/voice_latency_harness without a
+# gpt-live-transcribe can be A/B-measured (tools/voice_latency_report.py) without a
 # deploy (unchanged default: measured alternatives must win on accuracy too).
 REALTIME_TRANSCRIBE_MODEL = os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1")
 

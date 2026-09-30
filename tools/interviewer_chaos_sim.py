@@ -81,12 +81,23 @@ def run(sequences: int, turns: int, seed: int, verbose: bool = False) -> dict:
                                                                         error_type="assessor_timeout"))
     app = FastAPI()
     app.include_router(att.router)
-    client = TestClient(app, raise_server_exceptions=False)
     H = {"Authorization": "Bearer t"}
     stats = {"sequences": 0, "requests": 0, "duplicates_sent": 0, "status": {}, "lanes": {}, "violations": [],
              "errors_502": 0, "error_events": 0}
     t0 = time.time()
     for seq in range(sequences):
+        # One context-managed TestClient per sequence: a bare TestClient starts a new event loop
+        # per request and (in this starlette/anyio version) keeps each loop's objects alive, which
+        # made long runs slow down and grow in memory. That was the harness, not the app.
+        with TestClient(app, raise_server_exceptions=False) as client:
+            _sequence(seq, turns, rnd, S, client, H, stats, verbose)
+    stats["seconds"] = round(time.time() - t0, 1)
+    stats["telemetry"] = telemetry.snapshot()
+    return stats
+
+
+def _sequence(seq, turns, rnd, S, client, H, stats, verbose):
+    if True:
         S["db"] = FakeDB([], case_type=rnd.choice(["guesstimate", "profitability", "market_entry", "pricing"]))
         dedupe.LEDGER.__init__()
         dedupe.ROWS.__init__()
@@ -159,10 +170,7 @@ def run(sequences: int, turns: int, seed: int, verbose: bool = False) -> dict:
                 state_machine.validate_state(BrainState.from_dict(bs))
         stats["sequences"] += 1
         if verbose and seq % 200 == 0:
-            print(f"  ... {seq} sequences")
-    stats["seconds"] = round(time.time() - t0, 1)
-    stats["telemetry"] = telemetry.snapshot()
-    return stats
+            print(f"  ... {seq} sequences", flush=True)
 
 
 def main() -> int:
