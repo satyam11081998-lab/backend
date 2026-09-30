@@ -190,7 +190,8 @@ class RealtimeTurnRequest(BaseModel):
     # visible to the daily-budget kill switch.
     audio_input_tokens: Optional[int] = None
     audio_output_tokens: Optional[int] = None
-    # Additive idempotency key ("u:<item_id>" / "a:<response_id>"): a retried or
+    # Additive idempotency key ("u:<item_id>" / "a:<item_id>", or "a:<response_id>" when no
+    # turn id is known): a retried or
     # reconnect-duplicated save of the same turn lands once, and is metered once.
     client_turn_id: Optional[str] = Field(default=None, max_length=96)
 

@@ -24,7 +24,7 @@ decides; the provider layer talks to models. Tests drive the brain with in-memor
 | `numbers.py` | Number parsing (Indian + western scales, %, ₹/$, sci-notation), arithmetic-claim checks, anchor sanity for common guesstimate anchors | none |
 | `classify.py` | Deterministic signal extraction: help / solution / clarification / assumption-check / data request / frustration / recovery / thinking-aloud / floor-yield / structure / hypothesis (contextual) / final / transition / meta-injection / noise | none |
 | `policy.py` | State estimation, Gate A, Gate B, assistance ladder, question budget | none |
-| `assessor.py` | Optional small-model JSON judgement for step-completing analytic turns only; time-boxed; failure is reported, never silently turned into a fake reply | optional, small |
+| `assessor.py` | Optional small-model JSON judgement for step-completing analytic turns, and for bare results that look like a dropped/added zero (`numbers.scale_slip` trigger); time-boxed; failure is reported, never silently turned into a fake reply | optional, small |
 | `state_machine.py` | Transition validation and normalisation, loop guards (repeated hint / repair / question / presence), phase tracking | none |
 | `presence.py` | Presence wording chosen from the turn's context (no rotation, no hashing) | none |
 | `prompting.py` | Compact per-move prompts: role, case, state, move, explicit task, allowed behaviour | none |
@@ -90,7 +90,7 @@ for one attempt are serialised (`keyed_lock`).
 | SUBSTANTIVE | user + assistant row | one row per real model call (+ assessor row if called) | tokens / `lane:"SUBSTANTIVE", say` |
 | Error | user row only | failed call rows | `error` / HTTP 502 |
 Realtime rows are written by `/realtime-turn` with an idempotency key (`client_turn_id`:
-`u:<item_id>` / `a:<response_id>`), backed by an in-process LRU and, after migration 0071, a
+`u:<item_id>` / `a:<item_id>`), backed by an in-process LRU and, after migration 0071, a
 partial unique index.
 
 ## 7. Security boundaries
