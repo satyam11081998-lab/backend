@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from services.interviewer import presence
 from services.interviewer.assessor import Assessment
 from services.interviewer.classify import Signals
-from services.interviewer.numbers import anchor_correction_line, correction_line
+from services.interviewer.numbers import anchor_correction_line, correction_line, scale_slip
 from services.interviewer.types import (
     ASSISTANCE_INTERVENTIONS, LADDER, MAX_HINT_LEVEL, PRESENCE_INTERVENTIONS, BrainState, CandidateState,
     CaseContext, Channel, Decision, Intervention, Phase, TurnInput,
@@ -41,6 +41,7 @@ class PolicyContext:
     transcript_tail: List[Dict[str, str]]
     assess: Optional[Callable[..., Assessment]] = None
     assessor_timeout_s: float = 2.5
+    side_assessment: Optional[Assessment] = None   # an assessor call whose verdict did not decide the move
 
 
 def _episode_active(st: BrainState) -> bool:
@@ -58,6 +59,10 @@ def _next_rung(st: BrainState, sig: Signals, *, frustrated: bool = False) -> int
     if frustrated:
         rung = max(rung, 2)
     return max(1, min(MAX_HINT_LEVEL, rung))
+
+
+def _recent_candidate_texts(tail: List[Dict[str, str]]) -> List[str]:
+    return [(t.get("content") or "") for t in tail if t.get("role") == "user"][-3:]
 
 
 def _last_interviewer_line(tail: List[Dict[str, str]]) -> str:
@@ -118,6 +123,13 @@ def _ladder_decision(ctx: PolicyContext, state: CandidateState, reason: str, *, 
 
 
 def decide(ctx: PolicyContext) -> Decision:
+    d = _decide(ctx)
+    if ctx.side_assessment is not None and "assessment" not in (d.detail or {}):
+        d.detail = dict(d.detail or {}, assessment=_a_meta(ctx.side_assessment))   # telemetry / cost only
+    return d
+
+
+def _decide(ctx: PolicyContext) -> Decision:
     turn, sig, st, case = ctx.turn, ctx.sig, ctx.state, ctx.case
     voice_like = turn.channel in (Channel.VOICE, Channel.STT)
     recent_lines = st.recent_lines
@@ -217,6 +229,19 @@ def decide(ctx: PolicyContext) -> Decision:
         return _decision(Intervention.DIRECT_CORRECTION, CandidateState.MATERIAL_ERROR, "arithmetic_error",
                          fixed=correction_line(arith),
                          detail={"ratio": round(arith.ratio, 3), "op": arith.op_word})
+
+    # A bare result that is ~10^k away from a simple combination of the candidate's own recent
+    # numbers and matches none of them: ask the assessor (with the conversation) whether it is a
+    # real slip. Only its "material" verdict corrects; timeout / failure / "fine" -> carry on.
+    if not sig.question and not sig.final and not sig.transition:
+        slip = scale_slip(sig.raw, _recent_candidate_texts(ctx.transcript_tail))
+        if slip is not None:
+            a = _run_assessor(ctx)
+            ctx.side_assessment = a
+            if a is not None and a.ok and a.material:
+                return _decision(Intervention.DIRECT_CORRECTION, CandidateState.MATERIAL_ERROR, f"assessor_{a.kind}",
+                                 detail={"note": a.note, "kind": a.kind, "trigger": "scale_slip",
+                                         "factor": round(slip.factor, 2), "assessment": _a_meta(a)})
 
     if sig.transition:
         return _decision(Intervention.TRANSITION, CandidateState.TRANSITIONING, "transition_requested",

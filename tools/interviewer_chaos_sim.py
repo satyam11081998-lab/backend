@@ -99,6 +99,9 @@ def run(sequences: int, turns: int, seed: int, verbose: bool = False) -> dict:
 def _sequence(seq, turns, rnd, S, client, H, stats, verbose):
     if True:
         S["db"] = FakeDB([], case_type=rnd.choice(["guesstimate", "profitability", "market_entry", "pricing"]))
+        # Every sequence reuses case id "c1" with a new case type; the route's 120 s case cache would
+        # otherwise serve the previous sequence's type for a wall-clock-dependent stretch.
+        att._case_cache.clear()
         dedupe.LEDGER.__init__()
         dedupe.ROWS.__init__()
         sent_ids = []

@@ -398,3 +398,71 @@ def anchor_correction_line(f: AnchorFinding) -> str:
         region = {"india_population": "India's", "us_population": "The US", "world_population": "The world's"}[f.anchor.key]
         return f"{region} population is {f.anchor.spoken}, not {f.raw} — rework it from there."
     return f"Check the {label}: it's {f.anchor.spoken}, not {f.raw}."
+
+
+# ---------------------------------------------------------------------------
+# 4. Cross-turn scale slips (a TRIGGER for the assessor, never a verdict on its own)
+# ---------------------------------------------------------------------------
+# "That's 2.7 crore households." / "Okay, 7 years." / "So 4 lakh a year." - the result
+# is not written as an expression, so check_arithmetic() cannot judge it. If the stated
+# result matches no simple combination of the candidate's own recent numbers, but sits
+# almost exactly a power of ten away from one, it is probably a dropped/added zero. It
+# may also be an unstated factor the candidate applied in their head, which is why this
+# only asks the contextual assessor to look; it never corrects anything by itself.
+_DERIVED_RE = re.compile(
+    r"^\s*(so|that'?s|that is|which is|which gives|that gives|this gives|gives|giving|comes to|works out)\b"
+    r"|\b(so|that'?s|which is|which gives|that gives|comes to|works out to|i get|we get)\b\s*(about|around|roughly|~)?\s*[₹$]?\d",
+    re.IGNORECASE)
+
+
+@dataclass
+class ScaleSlip:
+    claimed: float
+    nearest: float        # the combination of the candidate's own numbers it is ~10^k away from
+    factor: float         # nearest / claimed
+
+
+def _within(a: float, b: float, tol: float) -> bool:
+    if a <= 0 or b <= 0:
+        return False
+    return abs(math.log(a / b)) <= math.log(tol)
+
+
+def scale_slip(text: str, recent_candidate_texts: List[str]) -> Optional[ScaleSlip]:
+    if not _DERIVED_RE.search(text or "") or check_arithmetic(text):
+        return None
+    nums = parse_numbers(text)
+    # Only a bare result statement ("So 4 lakh a year."): a turn that names its own factors
+    # ("... since only 10% are in the market") is explaining itself, not slipping a zero.
+    if len(nums) != 1 or nums[0].kind == "pct" or nums[0].value < 10:
+        return None
+    claimed = nums[0].value
+    ops: List[float] = []
+    for t in recent_candidate_texts[-3:]:
+        for n in parse_numbers(t):
+            if n.value > 0 and n.value not in ops:
+                ops.append(n.value)
+    ops = ops[-8:]
+    if len(ops) < 2:
+        return None
+    combos: List[float] = list(ops)
+    for i, a in enumerate(ops):
+        for j, b in enumerate(ops):
+            if i == j:
+                continue
+            combos += [a * b, a / b]
+            if i < j:
+                combos.append(a + b)
+                if a != b:
+                    combos.append(abs(a - b))
+    if any(_within(c, claimed, 1.5) for c in combos):
+        return None                      # consistent with something the candidate said
+    best: Optional[ScaleSlip] = None
+    for c in combos:
+        for k in (1, 2, 3):
+            for f in (10 ** k, 10 ** -k):
+                if _within(c, claimed * f, 1.25):
+                    cand = ScaleSlip(claimed=claimed, nearest=c, factor=c / claimed)
+                    if best is None or abs(math.log10(cand.factor)) < abs(math.log10(best.factor)):
+                        best = cand
+    return best
