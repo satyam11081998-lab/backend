@@ -12,7 +12,7 @@ from services.ai_scorer import score_case_answer, score_guesstimate_answer, AISc
 from services.badge_awarder import award_badges_for_submission
 from services.auth import get_verified_user_id
 from services.access_guard import assert_can_attempt, assert_can_submit
-from services.markets import case_market, intl_daily_ids, market_today, llm_case_content
+from services.markets import case_market, india_daily_row, intl_daily_ids, market_today, llm_case_content
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget
 from services.limits import ANSWER_MAX_CHARS
@@ -204,12 +204,8 @@ async def submit_answer(
             daily_date_val = us_today
     elif is_first_attempt:
         try:
-            sched_res = supabase.table("daily_schedule") \
-                .select("case_id") \
-                .eq("scheduled_date", today_ist) \
-                .limit(1) \
-                .execute()
-            sched_row = (sched_res.data or [None])[0] if sched_res and sched_res.data else None
+            # Same pair the access gate and the dashboard use (on/before today).
+            sched_row = india_daily_row(supabase, today_ist, exact=False)
             if sched_row and sched_row.get("case_id") == submission.case_id:
                 counted_for_daily = True
                 daily_date_val = today_ist
