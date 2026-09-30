@@ -36,7 +36,7 @@ cd D:\dev\mece\consilio
 git branch -D feat/unified-interviewer-brain
 ```
 (The fetched objects become unreachable and are pruned by `git gc` later. The bundle files in
-`D:\dev\mece\_handoff\` can be deleted by hand.)
+`D:\dev\mece\Claude outputs\unified-interviewer\` can be deleted by hand.)
 
 ### Stage B — merged and deployed, flag OFF (`INTERVIEWER_BRAIN` unset or `off`)
 Behaviour is the baseline V11 on every route; nothing to roll back functionally. The additive
