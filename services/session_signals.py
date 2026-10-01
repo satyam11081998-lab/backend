@@ -1,7 +1,7 @@
 """
 Deterministic session signals for the adaptive interviewer.
-V10.2: Fixed 'has_work' sticky bug, enhanced interrogative parsing (strips fillers), 
-and broadened imperative/solution exact-matching.
+V10.1: Added imperative directive parsing to catch direct demands (tell me, give me).
+Added affirmation detection for clean conversational hand-backs.
 """
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from typing import Any, Dict, Iterable, List
 _HELP = (
     "help", "hint", "i am stuck", "i'm stuck", "im stuck", " stuck",
     "not getting", "not able to", "unable to", "don't get", "dont get",
-    "how do i", "how do we", "how do you", "how to start", "how should i", 
-    "where do i start", "where to start", "what should i do", "what do i do", 
-    "confused", "i am lost", "i'm lost", "no idea", "not sure how", "guide me",
+    "how do i", "how to start", "how should i", "where do i start",
+    "where to start", "what should i do", "what do i do", "confused",
+    "i am lost", "i'm lost", "no idea", "not sure how", "guide me",
     "give me direction", "point me", "don't understand", "dont understand",
 )
 _SOLUTION = (
@@ -27,10 +27,8 @@ _SOLUTION = (
     "show me how", "what is the answer you", "you tell me first",
     "give me the final", "tell me the final", "just the final answer",
     "the final answer now", "what's the final answer", "whats the final answer",
-    "give me the answer", "just give me the", "how would you solve",
+    "give me the answer", "just give me the",
 )
-_EXACT_SOLUTION = {"answer", "solution", "solve it", "tell me"}
-
 _SKIP_STOP = (
     "leave it", "skip", "move on", "next question", "forget it",
     "i don't want to", "i dont want to", "i don't want", "dont want",
@@ -190,22 +188,14 @@ def _similar(a: str, b: str) -> bool:
 
 def detect_intent(text: str) -> Dict[str, Any]:
     t = _norm(text)
-    
-    # Strip conversational fillers from the start to accurately catch interrogatives (e.g. "so how do we...")
-    stripped_t = re.sub(r"^(so|and|but|then|well|now|actually|basically)\s+", "", t)
-    first_word = stripped_t.split(" ", 1)[0] if stripped_t else ""
-    
-    is_q = ("?" in t) or (first_word in _INTERROGATIVE)
-    is_sol = _has_any(t, _SOLUTION) or t in _EXACT_SOLUTION
-    
     flags = {
         "help_requested": _has_any(t, _HELP),
-        "solution_requested": is_sol,
+        "solution_requested": _has_any(t, _SOLUTION),
         "skip_or_stop": _has_any(t, _SKIP_STOP),
         "frustration": _has_any(t, _FRUSTRATION),
         "is_meta": _has_any(t, _META),
         "looks_garbage": _looks_garbage(text),
-        "is_question": is_q,
+        "is_question": ("?" in (text or "")) or (bool(t) and t.split(" ", 1)[0] in _INTERROGATIVE),
         "is_directive": _has_any(t, _DIRECTIVES),
         "is_greeting_only": t in _GREETING,
         "is_hypothesis": _has_any(t, _HYPOTHESIS_MARKERS)
@@ -266,9 +256,8 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     new_norm = _norm(new_user_message)
     intent = detect_intent(new_user_message)
 
-    # V10.2: Fixed historic memory bug. has_work is evaluated ONLY on the current turn to prevent infinite acks.
-    has_work = (len(new_norm) > 60 or bool(re.search(r"\d", new_norm)) or _has_any(new_norm, _WORK_MARKERS))
-    
+    has_work = (any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
+                or _has_any(new_norm, _WORK_MARKERS))
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
@@ -335,9 +324,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
     confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
     
-    # Must explicitly state finality to trigger sanity check
     states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
-    
     hedged_self_estimate = has_number and _has_any(new_norm, _HEDGE)
     just_recovered = _has_any(new_norm, _RECOVERY) and len(asst) >= 1
     error_materiality = _error_materiality(new_norm)
