@@ -67,6 +67,12 @@ class Intervention(str, Enum):
     OPEN = "OPEN"
     CLOSE = "CLOSE"
     DEFLECT = "DEFLECT"
+    # Contextual presence: a short beat that returns the floor, worded by the model from what the
+    # candidate actually said (never a stock "Right." for substantive work). Fall back to a plain
+    # deterministic hand-back if the model fails - they carry no case content to fabricate.
+    ACKNOWLEDGE_AND_CONTINUE = "ACKNOWLEDGE_AND_CONTINUE"   # name what they just did, hand back
+    REFLECT_PROGRESS = "REFLECT_PROGRESS"                   # reflect the shape of their structure/approach
+    ACKNOWLEDGE_AND_ORIENT = "ACKNOWLEDGE_AND_ORIENT"       # a stage of THEIR plan is done; name the next part of it
 
 
 class Lane(str, Enum):
@@ -75,7 +81,9 @@ class Lane(str, Enum):
     SUBSTANTIVE = "SUBSTANTIVE"
 
 
-PRESENCE_INTERVENTIONS = frozenset({Intervention.ACKNOWLEDGE, Intervention.HAND_BACK, Intervention.VALIDATE})
+CONTEXTUAL_PRESENCE = frozenset({Intervention.ACKNOWLEDGE_AND_CONTINUE, Intervention.REFLECT_PROGRESS,
+                                 Intervention.ACKNOWLEDGE_AND_ORIENT})
+PRESENCE_INTERVENTIONS = frozenset({Intervention.ACKNOWLEDGE, Intervention.HAND_BACK, Intervention.VALIDATE}) | CONTEXTUAL_PRESENCE
 
 # Assistance ladder, in order. Index == hint level.
 LADDER: List[Intervention] = [

@@ -16,7 +16,8 @@ from services.interviewer.assessor import Assessment
 from services.interviewer.classify import Signals
 from services.interviewer.numbers import anchor_correction_line, correction_line, scale_slip
 from services.interviewer.types import (
-    ASSISTANCE_INTERVENTIONS, LADDER, MAX_HINT_LEVEL, PRESENCE_INTERVENTIONS, BrainState, CandidateState,
+    ASSISTANCE_INTERVENTIONS, CONTEXTUAL_PRESENCE, LADDER, MAX_HINT_LEVEL, PRESENCE_INTERVENTIONS, BrainState,
+    CandidateState,
     CaseContext, Channel, Decision, Intervention, Phase, TurnInput,
 )
 
@@ -107,8 +108,38 @@ def _decision(intervention: Intervention, state: CandidateState, reason: str, *,
               detail: Optional[Dict[str, Any]] = None, max_q: int = 0, hint_level: int = 0) -> Decision:
     d = Decision(intervention=intervention, state=state, reason=reason, max_questions=max_q,
                  detail=detail or {}, fixed_text=fixed, hint_level=hint_level)
-    d.needs_model = d.lane.value == "SUBSTANTIVE" and fixed is None
+    d.needs_model = fixed is None and (d.lane.value == "SUBSTANTIVE" or intervention in CONTEXTUAL_PRESENCE)
     return d
+
+
+def _contextual(intervention: Intervention, state: CandidateState, reason: str, *, fallback: str, turn_type: str,
+                may_say_correct: bool = False, verified_claims: Optional[List[str]] = None,
+                extra: Optional[Dict[str, Any]] = None) -> Decision:
+    """A presence beat the model words from the candidate's own content. `fallback` is the plain
+    deterministic hand-back used only if the model fails (it carries no case content).
+    `may_say_correct` is True only when a check actually vetted the step - otherwise the line
+    must not say or imply that the work is right."""
+    detail: Dict[str, Any] = {"fallback": fallback, "turn_type": turn_type, "may_say_correct": bool(may_say_correct),
+                              "verified_claims": list(verified_claims or [])}
+    detail.update(extra or {})
+    return _decision(intervention, state, reason, detail=detail)
+
+
+def _verified_arithmetic(sig: Signals) -> List[str]:
+    """Explicit calculations in this turn that the deterministic checker found within tolerance."""
+    if not sig.arithmetic or any(f.severity != "ok" for f in sig.arithmetic):
+        return []
+    return [f.expression for f in sig.arithmetic]
+
+
+def _last_structure_turn(tail: List[Dict[str, str]]) -> str:
+    from services.interviewer.classify import extract as _extract
+    for t in reversed(tail):
+        if t.get("role") == "user":
+            c = (t.get("content") or "").strip()
+            if c and _extract(c).structure:
+                return c[:600]
+    return ""
 
 
 def _ladder_decision(ctx: PolicyContext, state: CandidateState, reason: str, *, frustrated: bool = False) -> Decision:
@@ -285,18 +316,25 @@ def _decide(ctx: PolicyContext) -> Decision:
             return _decision(Intervention.DIRECT_CORRECTION, CandidateState.MATERIAL_ERROR, f"assessor_{a.kind}",
                              detail={"note": a.note, "kind": a.kind, "assessment": _a_meta(a)})
         meta = {"assessment": _a_meta(a)} if a is not None else {}
+        vetted = bool(a is not None and a.ok and not a.material)
         if sig.validation_request:
-            return _decision(Intervention.VALIDATE, CandidateState.COMPLETING_STEP,
-                             "validation_ok" if (a and a.ok) else "validation_unassessed",
-                             fixed=presence.validate("approach_ok", recent_lines), detail=meta)
+            # "Is my approach okay?" - say it works only if the assessor actually checked it.
+            d = _contextual(Intervention.ACKNOWLEDGE_AND_CONTINUE, CandidateState.COMPLETING_STEP,
+                            "validation_ok" if vetted else "validation_unassessed",
+                            fallback=presence.validate("approach_ok" if vetted else "unassessed", recent_lines),
+                            turn_type="approach_check", may_say_correct=vetted, extra=meta)
+            return d
         if sig.structure:
             if sig.floor_yield or sig.completion or turn.channel != Channel.TEXT:
-                return _decision(Intervention.HAND_BACK, CandidateState.COMPLETING_STEP,
-                                 "structure_complete" if (a and a.ok) else "structure_unassessed",
-                                 fixed=presence.hand_back("structure", turn.channel, recent_lines), detail=meta)
+                return _contextual(Intervention.REFLECT_PROGRESS, CandidateState.COMPLETING_STEP,
+                                   "structure_complete" if vetted else "structure_unassessed",
+                                   fallback=presence.hand_back("structure" if vetted else "structure_unchecked",
+                                                               turn.channel, recent_lines),
+                                   turn_type="structure", may_say_correct=vetted, extra=meta)
             return _decision(Intervention.NO_OUTPUT, CandidateState.COMPLETING_STEP, "structure_in_progress", detail=meta)
-        return _decision(Intervention.HAND_BACK, CandidateState.COMPLETING_STEP, "hypothesis_floor_yield",
-                         fixed=presence.hand_back("proceed", turn.channel, recent_lines), detail=meta)
+        return _contextual(Intervention.ACKNOWLEDGE_AND_CONTINUE, CandidateState.COMPLETING_STEP, "hypothesis_floor_yield",
+                           fallback=presence.hand_back("proceed", turn.channel, recent_lines),
+                           turn_type="hypothesis", may_say_correct=False, extra=meta)
 
     # A causal claim about the business (not about the candidate's own process) in a case:
     # release the data that tests it. Guesstimates have no hidden data to release.
@@ -325,12 +363,30 @@ def _decide(ctx: PolicyContext) -> Decision:
     # ---------------- Gate B: presence ----------------
     last = st.last_action()
     last_was_presence = bool(last and last.get("i") in _PRESENCE_VALUES and not last.get("fy"))
+    recent_presence = any(a.get("i") in _PRESENCE_VALUES for a in st.recent(2))
+
+    # A stage of the candidate's OWN plan is finished ("so that's the urban side"): a human
+    # interviewer often marks it and points to the next part of that same plan. Only when their
+    # structure is on record, and never twice in a row.
+    if (sig.stage_done and not sig.question and st.frustration == 0 and not last_was_presence
+            and not recent_presence and not sig.next_part_named):
+        plan_text = _last_structure_turn(ctx.transcript_tail)
+        if plan_text:
+            return _contextual(Intervention.ACKNOWLEDGE_AND_ORIENT, CandidateState.COMPLETING_STEP, "stage_done",
+                               fallback=presence.hand_back("continue", turn.channel, recent_lines),
+                               turn_type="stage_done", may_say_correct=False,
+                               verified_claims=_verified_arithmetic(sig), extra={"candidate_plan": plan_text})
+
     long_completed_step = (sig.word_count >= 25 and not sig.question and sig.raw.rstrip().endswith((".", "!"))
                            and (sig.has_number or sig.structure or sig.hypothesis))
     if (turn.channel == Channel.VOICE and long_completed_step and not last_was_presence and st.frustration == 0
-            and not any(a.get("i") in _PRESENCE_VALUES for a in st.recent(2))):
-        return _decision(Intervention.ACKNOWLEDGE, CandidateState.COMPLETING_STEP, "long_step_presence",
-                         fixed=presence.acknowledge(recent_lines))
+            and not recent_presence):
+        # In voice a long finished step with no reaction feels like a dropped line. The beat names
+        # what they did (model-worded); it may call the work right only where a check verified it.
+        verified = _verified_arithmetic(sig)
+        return _contextual(Intervention.ACKNOWLEDGE_AND_CONTINUE, CandidateState.COMPLETING_STEP, "long_step_presence",
+                           fallback=presence.acknowledge(recent_lines), turn_type="step",
+                           may_say_correct=bool(verified), verified_claims=verified)
 
     if sig.question:
         # A question we could not classify as a request, clarification or floor-yield. Answering

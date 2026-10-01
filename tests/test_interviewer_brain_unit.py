@@ -273,7 +273,11 @@ def test_assessor_failure_is_reported_not_turned_into_content():
     def fake(**kw):
         return Assessment(material=False, ok=False, error_type="assessor_timeout")
     p = plan("Is my structure okay?", assess=fake)
-    assert p.decision.intervention == Intervention.VALIDATE
+    # Nothing checked it, so the beat may describe their structure but must not call it right.
+    assert p.decision.intervention == Intervention.ACKNOWLEDGE_AND_CONTINUE
+    assert p.decision.reason == "validation_unassessed" and p.decision.detail["may_say_correct"] is False
+    from services.interviewer.validate import _CORRECTNESS_RE
+    assert not _CORRECTNESS_RE.search(p.decision.detail["fallback"])
     assert p.assessment and p.assessment["error_type"] == "assessor_timeout"
 
 
@@ -343,8 +347,10 @@ def test_voice_acknowledges_long_completed_step_but_never_twice_in_a_row():
     long_step = ("So I take 30 crore households, 10 percent can afford a car, that is 3 crore households, and with a "
                  "seven year replacement cycle that gives about 43 lakh cars a year.")
     p1 = plan(long_step, channel=Channel.VOICE)
-    assert p1.decision.intervention == Intervention.ACKNOWLEDGE
-    st = {"brain": engine.finalize(p1, p1.text)}
+    # The beat is worded from their content now, not "Okay." / "Right."
+    assert p1.decision.intervention == Intervention.ACKNOWLEDGE_AND_CONTINUE and p1.needs_model
+    assert p1.decision.detail["fallback"] and p1.decision.max_questions == 0
+    st = {"brain": engine.finalize(p1, "Noted - 3 crore households over a seven year cycle; carry on.")}
     p2 = plan(long_step.replace("43", "45"), channel=Channel.VOICE, state=st)
     assert p2.decision.lane == Lane.NO_OUTPUT
     # text channel never acknowledges a long step

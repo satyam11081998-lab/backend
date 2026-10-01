@@ -43,10 +43,25 @@ PRAISE = "Great question! "
 MULTI_Q = " What else? And why?"
 
 
+CONTEXTUAL = {"ACKNOWLEDGE_AND_CONTINUE", "REFLECT_PROGRESS", "ACKNOWLEDGE_AND_ORIENT"}
+
+
 def move_of(messages: List[Dict[str, str]]) -> str:
     sysmsg = messages[0]["content"] if messages else ""
-    m = re.search(r"MOVE:\s*([A-Z_]+)", sysmsg)
+    m = re.search(r'"response_function":\s*"([A-Z_]+)"', sysmsg) or re.search(r"MOVE:\s*([A-Z_]+)", sysmsg)
     return m.group(1) if m else "ANSWER_DIRECT"
+
+
+def contextual_line(messages: List[Dict[str, str]], move: str) -> str:
+    """What a well-behaved model says for a contextual beat: about the candidate's own words."""
+    last = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    words = re.findall(r"[A-Za-z0-9.]+", last)[:7]
+    gist = " ".join(words).lower() or "that step"
+    if move == "REFLECT_PROGRESS":
+        return f"So your structure runs: {gist}; take it from there."
+    if move == "ACKNOWLEDGE_AND_ORIENT":
+        return f"That closes out {gist}; the next part of your plan is yours to take on."
+    return f"Noted - {gist}; carry on from there."
 
 
 class FakeLLM:
@@ -62,7 +77,7 @@ class FakeLLM:
 
     def _text(self, messages) -> str:
         mv = move_of(messages)
-        base = GOOD.get(mv, "Use annual figures for India only.")
+        base = contextual_line(messages, mv) if mv in CONTEXTUAL else GOOD.get(mv, "Use annual figures for India only.")
         mode = self.mode
         with self.lock:
             n = len(self.calls)

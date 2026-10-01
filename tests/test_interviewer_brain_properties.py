@@ -14,9 +14,10 @@ import tests.interviewer_fakes  # noqa: F401
 from services.interviewer import engine, state_machine
 from services.interviewer.dedupe import TurnLedger
 from services.interviewer.types import (
+    CONTEXTUAL_PRESENCE,
     MAX_HINT_LEVEL, CaseContext, Channel, Intervention, Lane, TurnInput,
 )
-from services.interviewer.validate import _BANNED_RE, _LEAK_RE, validate_text
+from services.interviewer.validate import _BANNED_RE, _CORRECTNESS_RE, _LEAK_RE, validate_text
 
 CASES = [CaseContext(case_type="guesstimate", content="Estimate cars sold in India per year."),
          CaseContext(case_type="profitability", content="An FMCG firm's profit fell 20%. Diagnose.")]
@@ -61,6 +62,12 @@ def test_decision_is_always_well_formed(text, channel, case):
     d = p.decision
     if d.lane == Lane.NO_OUTPUT:
         assert p.text is None and not p.needs_model
+    elif d.lane == Lane.PRESENCE and d.intervention in CONTEXTUAL_PRESENCE:
+        # model-worded beat: no fixed text, a plain fallback, no question, never a correctness
+        # claim in the fallback unless something verified the step
+        assert p.needs_model and not p.text and d.detail.get("fallback") and d.max_questions == 0
+        if not d.detail.get("may_say_correct"):
+            assert not _CORRECTNESS_RE.search(d.detail["fallback"])
     elif d.lane == Lane.PRESENCE:
         assert p.text and not p.needs_model and len(p.text) < 120
     else:

@@ -8,7 +8,9 @@ Enforced on every generated line (non-stream and stream):
     step?", "No hints", "Think harder", "isn't specified", ...),
   * no internal labels or instruction text (MOVE:, TASK:, hint level, ...),
   * question budget (0 or 1), no generic questions, no repeated questions,
-  * sentence cap per move and channel.
+  * sentence cap per move and channel,
+  * for contextual presence beats: no claim that the work is right unless a check vetted it,
+    no stock acknowledgement, and it must refer to what the candidate actually said.
 
 The validator REMOVES sentences; it never invents content. If nothing survives,
 the caller gets EmptyModelOutput - never a canned stand-in answer.
@@ -50,9 +52,53 @@ _BANNED_RE = re.compile("|".join(f"(?:{b})" for b in _BANNED), re.IGNORECASE)
 
 _LEAK_RE = re.compile(
     r"\b(MOVE|TASK|RULES|CONTEXT)\s*:|\b(MICRO_HINT|TARGETED_HINT|STRUCTURAL_HINT|DELIVER_SOLUTION|DATA_REVEAL|"
-    r"DIRECT_CORRECTION|ANSWER_DIRECT|TARGETED_PROBE|RETHINK_CUE|HAND_BACK|NO_OUTPUT|ACKNOWLEDGE|REPAIR)\b|"
+    r"DIRECT_CORRECTION|ANSWER_DIRECT|TARGETED_PROBE|RETHINK_CUE|HAND_BACK|NO_OUTPUT|ACKNOWLEDGE|REPAIR|"
+    r"ACKNOWLEDGE_AND_CONTINUE|REFLECT_PROGRESS|ACKNOWLEDGE_AND_ORIENT)\b|"
     r"assistance level|hint[_ ]level|system prompt|my instructions|these instructions|the application (has|decided)|"
+    r"control packet|response[_ ]function|may[_ ]say[_ ]correct|verified[_ ]claims|turn[_ ]type|"
     r"\bcandidate=|\bstage=", re.IGNORECASE)
+
+# Saying (or implying) the candidate's work is right. Allowed only when a check vetted it.
+_CORRECTNESS_RE = re.compile(
+    r"\b(that'?s|this is|it'?s|that is|you'?re|you are|you'?ve got it|your (math|maths|arithmetic|numbers?|calculation|"
+    r"structure|approach|logic|estimate|figure) (is|are)) (exactly )?(correct|right|accurate|sound|valid|spot on)\b|"
+    r"\b(that|this|it|the (math|maths|numbers?|arithmetic|logic)) (holds( up| together)?|checks out|adds up|is correct)\b|"
+    r"\bon the right track\b|\bcorrect(ly)?\b(?!ion)|\bexactly\b|\bthat works\b",
+    re.IGNORECASE)
+
+_GENERIC_WORDS = {
+    "okay", "ok", "right", "alright", "all", "got", "it", "sure", "fine", "go", "ahead", "carry", "on", "continue",
+    "please", "yes", "yeah", "mm", "hm", "mmhm", "mmm", "understood", "noted", "that", "works", "makes", "sense",
+    "keep", "going", "thanks", "thank", "you", "so", "and", "then", "with", "the", "it's", "its", "good", "great",
+    "proceed", "next", "move", "let's", "lets", "over", "to", "your", "floor",
+}
+_STOP = {
+    "that", "this", "with", "from", "then", "than", "they", "them", "their", "there", "here", "have", "will", "would",
+    "should", "could", "about", "into", "your", "you've", "youve", "what", "which", "when", "where", "while", "just",
+    "like", "also", "some", "take", "next", "part", "step", "going", "keep", "carry", "sure", "okay", "right",
+    "alright", "think", "make", "made", "does", "done", "each", "much", "many", "more", "most", "very", "really",
+    "first", "second", "third", "now", "well", "being", "been", "were", "isn't", "it's", "that's", "let's",
+}
+
+
+def _content_keys(text: str) -> set:
+    t = (text or "").lower()
+    keys = {w[:5] for w in re.findall(r"[a-z][a-z']{3,}", t) if w not in _STOP}
+    keys |= {n.lstrip("0") or "0" for n in re.findall(r"\d+(?:\.\d+)?", t)}
+    return keys
+
+
+def contextual_violations(text: str, candidate_text: str) -> List[str]:
+    """Checks for a contextual presence beat: it must not be a stock acknowledgement, and it must
+    be about what the candidate actually said (shares at least one content word or number)."""
+    out: List[str] = []
+    words = re.findall(r"[a-z']+", (text or "").lower())
+    if not words or all(w in _GENERIC_WORDS for w in words):
+        out.append("generic_ack")
+    elif not (_content_keys(text) & _content_keys(candidate_text)):
+        out.append("unreferenced")
+    return out
+
 
 _GENERIC_Q = re.compile(
     r"^\s*(and )?(what else|anything else|why|any other (factors|thoughts|ideas)|what do you think|thoughts|"
@@ -120,7 +166,8 @@ class SentenceFilter:
     """Stateful per-sentence filter shared by the stream gate and the batch validator."""
 
     def __init__(self, max_questions: int, max_sentences: int, recent_lines: Iterable[str] = (),
-                 recent_questions: Iterable[str] = ()):
+                 recent_questions: Iterable[str] = (), may_say_correct: bool = True):
+        self.may_say_correct = may_say_correct
         self.max_questions = max_questions
         self.max_sentences = max_sentences
         self.recent_lines = [_norm(x) for x in recent_lines if x]
@@ -157,6 +204,8 @@ class SentenceFilter:
                 self.violations.append("praise_opener")
         if _PRAISE_ANY.search(s):
             return self._drop("praise")
+        if not self.may_say_correct and _CORRECTNESS_RE.search(s):
+            return self._drop("unverified_claim")
         n_q = s.count("?")
         is_q = n_q > 0
         if is_q:
@@ -184,8 +233,8 @@ class SentenceFilter:
 
 
 def validate_text(text: str, *, max_questions: int, max_sentences: int, recent_lines: Iterable[str] = (),
-                  recent_questions: Iterable[str] = ()) -> ValidationResult:
-    f = SentenceFilter(max_questions, max_sentences, recent_lines, recent_questions)
+                  recent_questions: Iterable[str] = (), may_say_correct: bool = True) -> ValidationResult:
+    f = SentenceFilter(max_questions, max_sentences, recent_lines, recent_questions, may_say_correct)
     for s in split_sentences(strip_markdown(text)):
         f.accept(s)
     return f.result()

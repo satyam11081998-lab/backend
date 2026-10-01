@@ -39,6 +39,8 @@ def hand_back(trigger: str, channel: Channel, recent: Iterable[str]) -> str:
     elif trigger == "structure":      # structure laid out, no material gap
         options = (["Okay. Take it from there."] if channel != Channel.TEXT
                    else ["Okay, that works as a structure. Take it from there.", "Okay. Take it from there."])
+    elif trigger == "structure_unchecked":   # structure laid out, nothing has checked it: no verdict
+        options = ["Okay. Take it from there.", "Okay, over to you."]
     elif trigger == "here":           # "hello? are you there?"
         options = ["I'm here. Go ahead.", "Still here. Carry on."]
     else:
@@ -55,6 +57,8 @@ def validate(kind: str, recent: Iterable[str], value: Optional[str] = None) -> s
         options = ["Yes. Carry on.", "That holds. Keep going."]
     elif kind == "approach_ok":
         options = ["That works. Go ahead.", "Yes, that holds together. Carry on."]
+    elif kind == "unassessed":       # asked "is this right?" but nothing checked it: no verdict
+        options = ["Take it through to a number and we'll see where it lands.", "Carry it through and keep going."]
     else:
         options = ["That works. Carry on.", "Fine. Keep going."]
     return pick(options, recent)

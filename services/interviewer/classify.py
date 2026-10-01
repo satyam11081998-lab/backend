@@ -203,6 +203,16 @@ _COMPLETION = _rx(
     r"\bthat'?s (it|all)\b\s*[.!]*\s*$", r"^\s*(done|that'?s it|finished)\s*[.!]*\s*$",
     r"\bso (those|these) are (my|the) (buckets|branches|drivers|segments|factors)\b",
 )
+# A stage of the candidate's own plan is finished ("so that's the urban side", "that covers
+# demand", "urban is done"). Not a floor-yield and not a final answer.
+_STAGE_DONE = _rx(
+    r"\b(so )?that'?s (the|my) [a-z]+(?: [a-z]+)? (side|part|bit|branch|bucket|piece|segment|half|leg)\b(?! (of|for|is|was))",
+    r"\bthat (covers|completes|takes care of|wraps up) (the )?[a-z]+(?: [a-z]+)?( side| part| branch| bucket| segment| piece)?\b",
+    r"\b[a-z]+(?: [a-z]+)? (side|part|branch|bucket|segment|piece) (is )?(done|covered|sorted|complete)\b",
+    r"\b(done|finished) with (the )?[a-z]+(?: [a-z]+)? (side|part|branch|bucket|segment|piece)\b",
+)
+# ...and they already said what comes next ("now rural", "next, the cost side"): nothing to add.
+_NEXT_PART = _rx(r"\b(now|next|moving on|then)\b[ ,:-]*(to |on to |onto |for )?(the )?[a-z]+")
 _STRUCTURE = _rx(
     r"\b(i'?d|i would|i will|i'?ll|let me|let'?s|i want to|i'?m going to) (break|split|divide|segment|structure|bucket|decompose|look at|approach|categori[sz]e)\b",
     r"\b(framework|buckets?|branches|issue tree|mece|driver tree|profit tree)\b",
@@ -258,6 +268,8 @@ class Signals:
     floor_yield: bool = False
     validation_request: bool = False
     completion: bool = False
+    stage_done: bool = False               # a stage of the candidate's own plan is finished
+    next_part_named: bool = False          # ...and they already named what comes next
     structure: bool = False
     hypothesis: bool = False
     hedged: bool = False
@@ -359,6 +371,10 @@ def extract(text: str, *, is_partial: bool = False) -> Signals:
     s.floor_yield = bool(_FLOOR_PROCESS.search(norm))
     s.validation_request = bool(_VALIDATION_OF_WORK.search(norm))
     s.completion = bool(_COMPLETION.search(norm))
+    s.stage_done = bool(_STAGE_DONE.search(norm)) and not s.completion
+    if s.stage_done:
+        tail = norm[_STAGE_DONE.search(norm).end():]
+        s.next_part_named = bool(_NEXT_PART.search(tail))
     s.structure = bool(_STRUCTURE.search(norm))
     s.hedged = bool(_HEDGE.search(norm))
     s.stuck_soft = bool(_STUCK_SOFT.search(norm))

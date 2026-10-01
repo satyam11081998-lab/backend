@@ -21,7 +21,7 @@ from services.interviewer import classify, policy, responder, state_machine, tel
 from services.interviewer.assessor import Assessment, make_llm_assessor
 from services.interviewer.providers import CallMeta, InterviewerLLM, json_completer
 from services.interviewer.types import (
-    BrainState, CaseContext, Channel, Decision, InterviewerError, Lane, TurnInput,
+    CONTEXTUAL_PRESENCE, BrainState, CaseContext, Channel, Decision, InterviewerError, Lane, TurnInput,
 )
 
 STATE_KEY = "brain"
@@ -49,6 +49,7 @@ class TurnPlan:
     assessment: Optional[Dict[str, Any]] = None
     violations: List[str] = field(default_factory=list)
     llm: Any = None
+    soft_error: Optional[str] = None                 # contextual beat fell back to its plain hand-back
 
     @property
     def lane(self) -> Lane:
@@ -109,12 +110,24 @@ def _llm_for(plan: TurnPlan) -> Any:
 
 
 def word_complete(plan: TurnPlan) -> str:
-    """Voice path: full validated line (regenerates once if needed). Raises InterviewerError."""
+    """Full validated line (regenerates once if needed). Raises InterviewerError - except for a
+    contextual presence beat, which falls back to its plain deterministic hand-back (it carries no
+    case content, so the fallback invents nothing) and records the failure in telemetry."""
     if not plan.needs_model:
         return plan.text or ""
-    text, metas, res = responder.generate_complete(_llm_for(plan), plan.decision, plan.case, plan.state_before,
-                                                   plan.turn.channel, plan.transcript, plan.turn.text)
-    plan.metas.extend(metas)
+    contextual = plan.decision.intervention in CONTEXTUAL_PRESENCE
+    try:
+        text, metas, res = responder.generate_complete(_llm_for(plan), plan.decision, plan.case, plan.state_before,
+                                                       plan.turn.channel, plan.transcript, plan.turn.text,
+                                                       metas_out=plan.metas)
+    except InterviewerError as e:
+        fallback = (plan.decision.detail or {}).get("fallback")
+        if not contextual or not fallback:
+            raise
+        plan.soft_error = getattr(e, "error_type", None) or type(e).__name__
+        plan.violations = ["fallback"]
+        plan.text = fallback
+        return fallback
     plan.violations = list(res.violations)
     plan.text = text
     return text
@@ -126,9 +139,10 @@ def word_stream(plan: TurnPlan) -> Iterator[str]:
         if plan.text:
             yield plan.text
         return
-    if plan.decision.max_questions > 0:
-        # Moves that may ask a question are generated whole so a repeated or generic question
-        # can be regenerated once (a stream cannot be taken back).
+    if plan.decision.max_questions > 0 or plan.decision.intervention in CONTEXTUAL_PRESENCE:
+        # Generated whole: a question-allowed move so a repeated or generic question can be
+        # regenerated once, and a one-sentence contextual beat so it can be checked for being
+        # generic / unreferenced / unverified before the candidate sees any of it.
         yield word_complete(plan)
         return
     meta = CallMeta()
@@ -158,6 +172,8 @@ def finalize(plan: TurnPlan, final_text: Optional[str], *, error: Optional[BaseE
     error_type = None
     if error is not None:
         error_type = getattr(error, "error_type", None) or type(error).__name__
+    elif plan.soft_error:
+        error_type = f"{plan.soft_error}:fallback"
     elif a.get("error_type"):
         error_type = a.get("error_type")
     telemetry.emit_turn({
