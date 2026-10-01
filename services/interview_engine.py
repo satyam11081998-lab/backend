@@ -2,6 +2,12 @@
 Interview Engine — runs one interviewer turn against OpenAI.
 
 Implements V10 MECE Architecture: True Semantic Events, Dual Gates, and Safe UX Fallbacks.
+V12: function first, language second. Signals -> gates -> RESPONSE FUNCTION
+(services/interviewer_decision.decide_response) -> JSON INTERVIEWER CONTROL PACKET
+-> the model words the turn. The 0-token fast lane is kept only for silence and
+for turns that carried almost nothing; substantive candidate turns are always
+worded from their own content, validated, and fall back to a plain hand-back
+(never an error) if the model cannot produce a usable line.
 """
 
 import os
@@ -21,10 +27,12 @@ from prompts.interview_prompts import (
 )
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
 from services.session_signals import compute_signals, needs_contextual_assessment, build_signal_block
-from services.interviewer_mode import get_modality_instruction, ALLOW_QUESTIONS, build_mode_block
+from services.interviewer_mode import get_function_instruction, ALLOW_QUESTIONS, build_mode_block
 from services.interviewer_decision import (
     StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode, 
-    assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event
+    assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event,
+    decide_response, build_interviewer_control_packet, validate_contextual_line,
+    CONTEXTUAL_PRESENCE, scrub_control_leak, StreamLeakGuard,
 )
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 
@@ -60,9 +68,12 @@ def _resolve_adaptive_llm():
 
 def _build_adaptive_messages(case_content, case_type, transcript, new_user_message,
                              clarifications_exhausted, signals, mode, instruction, allow_questions,
-                             policy, prior_state, outcome):
-    block = (build_signal_block(signals)
-             + "\n\n" + build_mode_block(mode, instruction, allow_questions)
+                             policy, prior_state, outcome, packet=None, function=None):
+    # V12: the control packet carries the deterministic read of the learner (it
+    # replaces the SESSION SIGNALS lines); the learner-profile block is unchanged.
+    head = (build_mode_block(mode, instruction, allow_questions, packet, function) if packet
+            else build_signal_block(signals) + "\n\n" + build_mode_block(mode, instruction, allow_questions))
+    block = (head
              + "\n\n" + build_learning_block(
                  (prior_state or {}).get("profile"), signals, outcome))
     return build_adaptive_interviewer_messages(
@@ -74,6 +85,112 @@ def _build_adaptive_messages(case_content, case_type, transcript, new_user_messa
         signals_block=block,
         clarifications_exhausted=clarifications_exhausted,
     )
+
+
+CONTEXTUAL_MAX_TOKENS = 90
+CONTEXTUAL_TEMPERATURE = 0.7
+
+
+class _NoUsage:
+    usage = None
+    id = None
+
+
+def _recent_lines(transcript) -> List[str]:
+    return [(t.get("content") or "").strip() for t in transcript
+            if t.get("role") == "assistant" and (t.get("content") or "").strip()][-3:]
+
+
+def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarifications_exhausted,
+                        teaching_policy, prior_state, channel, is_voice_partial) -> Dict[str, Any]:
+    """Signals -> gates -> response function -> (for model turns) control packet + messages."""
+    policy = _teaching_policy(teaching_policy)
+    signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state,
+                              channel=channel, is_voice_partial=is_voice_partial)
+    if needs_contextual_assessment(signals):
+        signals.update(assess_context_with_llm(tlist, new_user_message, case_content))
+    decision = decide_response(signals)
+    plan = {"policy": policy, "signals": signals, "decision": decision,
+            "mode": decision["mode"], "function": decision["function"], "reason": decision["reason"]}
+    if decision["render"] != "model":
+        return plan
+    fn, mode = decision["function"], decision["mode"]
+    allow_questions = ALLOW_QUESTIONS.get(fn, ALLOW_QUESTIONS.get(mode, False))
+    instruction = get_function_instruction(fn, mode, policy, new_user_message, signals)
+    packet = build_interviewer_control_packet(signals, decision, candidate_text=new_user_message,
+                                              recent_lines=_recent_lines(tlist),
+                                              allow_questions=allow_questions)
+    outcome = evaluate_intervention_outcome(prior_state, signals)
+    plan.update({
+        "allow_questions": allow_questions,
+        "packet": packet,
+        "messages": _build_adaptive_messages(
+            case_content, case_type, tlist, new_user_message, clarifications_exhausted,
+            signals, mode, instruction, allow_questions, policy, prior_state, outcome,
+            packet=packet, function=fn),
+    })
+    return plan
+
+
+def _set_control(control_out, plan, tag, render):
+    if control_out is None:
+        return
+    control_out["tag"] = tag
+    control_out["mode"] = plan["mode"] if render != "silent" else "NO_OUTPUT"
+    control_out["function"] = plan["function"]
+    control_out["lane"] = plan["decision"]["lane"]
+    control_out["render"] = render
+    control_out["reason"] = plan["reason"]
+
+
+def _contextual_line(plan, new_user_message, channel, user_id) -> Dict[str, Any]:
+    """Word a contextual presence beat from the control packet.
+
+    One model call; one regeneration if the line is unusable (leaked metadata,
+    empty after the question/claim filter, or picks up nothing the candidate
+    said); then a plain fast-lane hand-back. A presence beat never becomes an
+    error and never becomes a stock line while the model can do better.
+    """
+    cli, model, provider = _resolve_adaptive_llm()
+    messages = list(plan["messages"])
+    max_sent = plan["packet"]["interviewer_control"]["response_generation"]["target_sentence_count"]
+    tag: Dict[str, str] = {}
+    best = ""
+    problems: List[str] = []
+    for attempt in range(2):
+        t0 = time.time()
+        try:
+            resp = cli.chat.completions.create(
+                model=model, messages=messages, temperature=CONTEXTUAL_TEMPERATURE,
+                max_tokens=CONTEXTUAL_MAX_TOKENS,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[interviewer] contextual_generation_failed function={plan['function']} "
+                  f"error={type(e).__name__}")
+            break
+        log_ai_usage(user_id=user_id, endpoint="/attempts/messages/contextual", model=model,
+                     response=resp, latency_ms=int((time.time() - t0) * 1000))
+        raw = (resp.choices[0].message.content or "").strip()
+        tag, clean = parse_control_tag(raw)
+        line, problems = validate_contextual_line(clean, new_user_message, channel, max_sent)
+        if line and not problems:
+            return {"text": line, "tag": tag or {}, "fallback": False, "problems": []}
+        if line and "leak" not in problems and not best and len(line.split()) > 3:
+            best = line  # usable words, just not specific enough: kept over a stock line
+        messages = messages + [
+            {"role": "assistant", "content": raw[:400]},
+            {"role": "system", "content": (
+                "That line cannot be used (" + ", ".join(problems or ["empty"]) + "). Write the "
+                "interviewer's line again: plain words only, no question, pick up something "
+                "specific the candidate just said, do not say their work is correct.")},
+        ]
+    if best:
+        print(f"[interviewer] contextual_line_accepted_with {problems} function={plan['function']}")
+        return {"text": best, "tag": tag or {}, "fallback": False, "problems": problems}
+    ev = get_fast_lane_event("HAND_BACK", plan["signals"])
+    print(f"[interviewer] contextual_fallback function={plan['function']} problems={problems}")
+    return {"text": ev["data"]["text"], "tag": {"mode": "HAND_BACK", "intervention": "fast_lane"},
+            "fallback": True, "problems": problems}
 
 
 # -----------------------------------------------------------------------------
@@ -97,70 +214,50 @@ def stream_interviewer_reply(
     
     if adaptive:
         tlist = list(transcript)
-        policy = _teaching_policy(teaching_policy)
-        
-        # 1. Deterministic Signals
-        signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state, channel=channel, is_voice_partial=is_voice_partial)
-        
-        # 2. Contextual Assessor
-        if needs_contextual_assessment(signals):
-            context_state = assess_context_with_llm(tlist, new_user_message, case_content)
-            signals.update(context_state)
-            
-        # 3. Two-Gate Intervention Routing
-        lane, mode, reason = evaluate_intervention_gate(signals)
-        
-        # 4. FAST LANE: SILENCE
-        if lane == "SILENCE":
-            t0 = time.time()
-            if control_out is not None:
-                control_out["tag"] = {"mode": "NO_OUTPUT", "intervention": "silence"}
-                control_out["mode"] = "NO_OUTPUT"
-                control_out["reason"] = reason
-            yield ""
-            
-            actual_ms = int((time.time() - t0) * 1000)
-            class _FastUsage:
-                usage = None
-                id = None
-            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_silence", model="local",
-                         response=_FastUsage(), latency_ms=max(1, actual_ms))
-            return
-            
-        # 5. FAST LANE: PRESENCE SEMANTIC EVENTS
-        if lane == "PRESENCE":
-            t0 = time.time()
-            fast_event_dict = get_fast_lane_event(mode, signals)
-            
-            if control_out is not None:
-                control_out["tag"] = {"mode": mode, "intervention": "fast_lane"}
-                control_out["mode"] = mode
-                control_out["reason"] = reason
+        plan = _plan_adaptive_turn(case_content, case_type, tlist, new_user_message,
+                                   clarifications_exhausted, teaching_policy, prior_state,
+                                   channel, is_voice_partial)
+        policy, signals = plan["policy"], plan["signals"]
+        mode, reason, function = plan["mode"], plan["reason"], plan["function"]
+        render = plan["decision"]["render"]
 
-            # Safe UX Fallback: If channel is text, yield raw text so existing SSE UI doesn't render JSON bubbles.
-            # If voice, yield JSON so client can intercept it for cached audio.
+        # FAST LANE: SILENCE (0 tokens)
+        if render == "silent":
+            t0 = time.time()
+            _set_control(control_out, plan, {"mode": "NO_OUTPUT", "intervention": "silence"}, "silent")
+            yield ""
+            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_silence", model="local",
+                         response=_NoUsage(), latency_ms=max(1, int((time.time() - t0) * 1000)))
+            return
+
+        # FAST LANE: a minimal turn gets a minimal beat (0 tokens). Only SHORT_ACK /
+        # HAND_BACK reach here, and only when the candidate's turn was not substantive.
+        if render == "fast":
+            t0 = time.time()
+            fast_event_dict = get_fast_lane_event(function, signals)
+            _set_control(control_out, plan, {"mode": function, "intervention": "fast_lane"}, "fast")
+            # Text: plain line (the SSE UI renders text). Voice: the typed event.
             if channel == "text":
                 yield fast_event_dict["data"]["text"]
             else:
                 yield json.dumps(fast_event_dict)
-            
-            actual_ms = int((time.time() - t0) * 1000)
-            class _FastUsageBeat:
-                usage = None
-                id = None
             log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_event", model="local",
-                         response=_FastUsageBeat(), latency_ms=max(1, actual_ms))
+                         response=_NoUsage(), latency_ms=max(1, int((time.time() - t0) * 1000)))
             return
-            
-        # 6. DEEP LANE (LLM Generation)
-        allow_questions = ALLOW_QUESTIONS.get(mode, False)
-        instruction = get_modality_instruction(mode, policy, new_user_message, signals)
-        outcome = evaluate_intervention_outcome(prior_state, signals)
-        
-        messages = _build_adaptive_messages(
-            case_content, case_type, tlist, new_user_message, clarifications_exhausted,
-            signals, mode, instruction, allow_questions, policy, prior_state, outcome
-        )
+
+        # CONTEXTUAL PRESENCE: the model words the beat from the control packet.
+        if function in CONTEXTUAL_PRESENCE:
+            out = _contextual_line(plan, new_user_message, channel, user_id)
+            _set_control(control_out, plan, out["tag"], "fast" if out["fallback"] else "model")
+            if control_out is not None and out["fallback"]:
+                control_out["fallback"] = True
+            yield out["text"]
+            return
+
+        # DEEP LANE (substantive functions): same generation path as before, now
+        # briefed by the control packet.
+        allow_questions = plan["allow_questions"]
+        messages = plan["messages"]
         cli, model, provider = _resolve_adaptive_llm()
     else:
         messages = build_interviewer_messages(
@@ -206,12 +303,10 @@ def stream_interviewer_reply(
         
         raw_text = (resp.choices[0].message.content or "").strip()
         tag, clean_text = parse_control_tag(raw_text)
-        final_text = enforce_mode(clean_text, mode, allow_questions, policy)
+        final_text = enforce_mode(scrub_control_leak(clean_text), mode, allow_questions, policy)
         
         if control_out is not None:
-            control_out["tag"] = tag or {}
-            control_out["mode"] = mode
-            control_out["reason"] = reason if 'reason' in locals() else ""
+            _set_control(control_out, plan, tag or {}, "model")
             
         yield final_text
         log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
@@ -237,6 +332,7 @@ def stream_interviewer_reply(
 
     final = _U()
     stripper = StreamTagStripper() if adaptive else None
+    guard = StreamLeakGuard() if adaptive else None
     try:
         for chunk in stream:
             if getattr(chunk, "usage", None):
@@ -250,15 +346,17 @@ def stream_interviewer_reply(
             if token:
                 if stripper is not None:
                     for _out in stripper.feed(token):
-                        yield _out
+                        yield from guard.feed(_out)
                 else:
                     yield token
         if stripper is not None:
             for _out in stripper.flush():
-                yield _out
+                yield from guard.feed(_out)
+            held = guard.flush(fallback=enforce_mode("", mode, False, policy))
+            if held:
+                yield held
             if control_out is not None:
-                control_out["tag"] = getattr(stripper, "tag", {}) or {}
-                control_out["mode"] = mode
+                _set_control(control_out, plan, getattr(stripper, "tag", {}) or {}, "model")
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
@@ -282,38 +380,31 @@ def complete_interviewer_reply(
     transcript = list(transcript)
     
     if adaptive:
-        policy = _teaching_policy(teaching_policy)
-        signals = compute_signals(transcript, new_user_message, policy, prior_state=prior_state, channel=channel, is_voice_partial=is_voice_partial)
-        
-        if needs_contextual_assessment(signals):
-            context_state = assess_context_with_llm(transcript, new_user_message, case_content)
-            signals.update(context_state)
-            
-        lane, mode, reason = evaluate_intervention_gate(signals)
-        
-        if lane == "SILENCE":
-            if control_out is not None:
-                control_out["tag"] = {"mode": "NO_OUTPUT", "intervention": "silence"}
-                control_out["mode"] = "NO_OUTPUT"
-                control_out["reason"] = reason
+        plan = _plan_adaptive_turn(case_content, case_type, transcript, new_user_message,
+                                   clarifications_exhausted, teaching_policy, prior_state,
+                                   channel, is_voice_partial)
+        policy, signals = plan["policy"], plan["signals"]
+        mode, reason, function = plan["mode"], plan["reason"], plan["function"]
+        render = plan["decision"]["render"]
+
+        if render == "silent":
+            _set_control(control_out, plan, {"mode": "NO_OUTPUT", "intervention": "silence"}, "silent")
             return ""
-            
-        if lane == "PRESENCE":
-            fast_event = get_fast_lane_event(mode, signals)
-            if control_out is not None:
-                control_out["tag"] = {"mode": mode, "intervention": "fast_lane"}
-                control_out["mode"] = mode
-                control_out["reason"] = reason
+
+        if render == "fast":
+            fast_event = get_fast_lane_event(function, signals)
+            _set_control(control_out, plan, {"mode": function, "intervention": "fast_lane"}, "fast")
             return fast_event["data"]["text"] if channel == "text" else json.dumps(fast_event)
-            
-        allow_questions = ALLOW_QUESTIONS.get(mode, False)
-        instruction = get_modality_instruction(mode, policy, new_user_message, signals)
-        outcome = evaluate_intervention_outcome(prior_state, signals)
-        
-        messages = _build_adaptive_messages(
-            case_content, case_type, transcript, new_user_message, clarifications_exhausted,
-            signals, mode, instruction, allow_questions, policy, prior_state, outcome
-        )
+
+        if function in CONTEXTUAL_PRESENCE:
+            out = _contextual_line(plan, new_user_message, channel, None)
+            _set_control(control_out, plan, out["tag"], "fast" if out["fallback"] else "model")
+            if control_out is not None and out["fallback"]:
+                control_out["fallback"] = True
+            return out["text"]
+
+        allow_questions = plan["allow_questions"]
+        messages = plan["messages"]
         cli, model, provider = _resolve_adaptive_llm()
     else:
         messages = build_interviewer_messages(
@@ -346,11 +437,9 @@ def complete_interviewer_reply(
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
-        text = enforce_mode(text, mode, allow_questions, policy)
+        text = enforce_mode(scrub_control_leak(text), mode, allow_questions, policy)
         if control_out is not None:
-            control_out["tag"] = tag or {}
-            control_out["mode"] = mode
-            control_out["reason"] = reason
+            _set_control(control_out, plan, tag or {}, "model")
     return text
 
 

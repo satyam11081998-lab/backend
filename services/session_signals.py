@@ -1,7 +1,11 @@
 """
 Deterministic session signals for the adaptive interviewer.
-V10.1: Added imperative directive parsing to catch direct demands (tell me, give me).
-Added affirmation detection for clean conversational hand-backs.
+V10.2: Fixed 'has_work' sticky bug, enhanced interrogative parsing (strips fillers),
+and broadened imperative/solution exact-matching.
+V12: adds a read of WHAT KIND of turn this is (turn_type, is_substantive_reasoning,
+step_completed, asks_to_proceed) so the policy layer can pick a conversational
+function, and reads the presence cool-down from the persisted response function
+(a model-worded acknowledgement can no longer be recognised by its exact text).
 """
 from __future__ import annotations
 
@@ -12,9 +16,9 @@ from typing import Any, Dict, Iterable, List
 _HELP = (
     "help", "hint", "i am stuck", "i'm stuck", "im stuck", " stuck",
     "not getting", "not able to", "unable to", "don't get", "dont get",
-    "how do i", "how to start", "how should i", "where do i start",
-    "where to start", "what should i do", "what do i do", "confused",
-    "i am lost", "i'm lost", "no idea", "not sure how", "guide me",
+    "how do i", "how do we", "how do you", "how to start", "how should i", 
+    "where do i start", "where to start", "what should i do", "what do i do", 
+    "confused", "i am lost", "i'm lost", "no idea", "not sure how", "guide me",
     "give me direction", "point me", "don't understand", "dont understand",
 )
 _SOLUTION = (
@@ -27,8 +31,10 @@ _SOLUTION = (
     "show me how", "what is the answer you", "you tell me first",
     "give me the final", "tell me the final", "just the final answer",
     "the final answer now", "what's the final answer", "whats the final answer",
-    "give me the answer", "just give me the",
+    "give me the answer", "just give me the", "how would you solve",
 )
+_EXACT_SOLUTION = {"answer", "solution", "solve it", "tell me"}
+
 _SKIP_STOP = (
     "leave it", "skip", "move on", "next question", "forget it",
     "i don't want to", "i dont want to", "i don't want", "dont want",
@@ -152,9 +158,125 @@ _PRESENCE_TEXT_MATCHES = [
 ]
 
 _AFFIRMATION_WORDS = {
-    "ok", "okay", "got", "right", "understood", "yes", "yeah", "yep", 
+    "ok", "okay", "got", "right", "understood", "yes", "yeah", "yep",
     "sure", "makes", "agreed", "correct", "exactly", "proceed", "continue"
 }
+
+# --- V12: what kind of turn is this? ------------------------------------------
+# These read the SHAPE of the candidate's turn. They never decide wording; the
+# policy layer (interviewer_decision.decide_response) turns them into a function.
+_STRUCTURE_WORDS = (
+    "split", "segment", "bucket", "break it into", "break this into", "break it down",
+    "break this down", "breakdown", "categor", "framework", "my structure", "the structure",
+    "drivers", "branches", "mece", "two parts", "three parts", "two sides", "both sides",
+    "revenue side", "cost side", "demand side", "supply side", "top-down", "bottom-up",
+)
+_SEQUENCE_WORDS = (
+    "first", "then ", "after that", "next,", "next i", "finally", "step one", "step two",
+    "followed by", "once i have", "once we have", "from there", "from the updated",
+)
+_STRATEGIC_WORDS = (
+    "rather than", "instead of", "the real issue", "the key driver", "key question",
+    "trade-off", "tradeoff", "trade off", "on the other hand", "bigger lever",
+    "biggest lever", "root cause", "the underlying", "more important", "what matters",
+    "premium", "realization", "realisation", "differentiat", "the risk is", "the catch",
+    "not just", "not only", "the flip side", "second-order", "second order",
+)
+_RESULT_WORDS = (
+    "that gives", "which gives", "this gives", "gives us", "gives me", "so we get",
+    "we get ", "comes to", "comes out", "works out", "that's about", "thats about",
+    "that is about", "which is about", "so the total", "so total", "total is",
+    "total cost is", "in total", "so roughly", "so about", " = ", "equals", "so overall",
+    "that means", "new profit margin is", "the new margin is", "the margin is",
+)
+_CALC_WORDS = (
+    "multiply", "multiplied", "divide", "divided", "times", " x ", "*", "/", " per ",
+    "%", "percent", "plus", "minus", "subtract", "add ",
+)
+_PROCEED_ASKS = (
+    "shall i proceed", "should i proceed", "can i proceed", "may i proceed",
+    "shall i continue", "should i continue", "can i continue", "shall i go ahead",
+    "should i go ahead", "can i go ahead", "can i move on", "shall i move on",
+    "should i move on", "shall we proceed", "should we proceed", "is that okay",
+    "is that ok", "is this okay", "is this ok", "is that fine", "is this fine",
+    "does that make sense", "does this make sense", "sound good", "sounds good?",
+    "okay to proceed", "ok to proceed", "good to go",
+)
+_CONFIDENCE_HIGH = ("definitely", "clearly", "obviously", "certainly", "for sure", "surely")
+
+_NUM_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:%|percent|crore|lakh|million|billion|k\b)?", re.I)
+
+
+def numbers_stated(text: str, limit: int = 8) -> List[str]:
+    """Numbers as the candidate wrote them (with a unit word when one is attached)."""
+    out: List[str] = []
+    for m in _NUM_TOKEN_RE.finditer(text or ""):
+        tok = re.sub(r"\s+", " ", m.group(0)).strip().rstrip(",")
+        if tok and tok not in out:
+            out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def classify_turn(new_norm: str, intent: Dict[str, Any], is_affirmation_only: bool) -> Dict[str, Any]:
+    """Deterministic shape of one candidate turn.
+
+    turn_type: affirmation | help_request | solution_request | question |
+               strategic_insight | structure | calculation_result | calculation |
+               plan | hypothesis | estimate | statement
+    """
+    words = new_norm.split()
+    wc = len(words)
+    has_number = bool(re.search(r"\d", new_norm))
+    strategic = _has_any(new_norm, _STRATEGIC_WORDS)
+    structure = _has_any(new_norm, _STRUCTURE_WORDS)
+    result = has_number and _has_any(new_norm, _RESULT_WORDS)
+    calc = has_number and _has_any(new_norm, _CALC_WORDS)
+    sequence_hits = sum(1 for w in _SEQUENCE_WORDS if w in new_norm)
+    plan = sequence_hits >= 2 or _has_any(new_norm, _PLANNING) or (
+        _has_any(new_norm, _WORK_MARKERS) and wc >= 6)
+
+    if is_affirmation_only:
+        turn_type = "affirmation"
+    elif intent.get("solution_requested"):
+        turn_type = "solution_request"
+    elif intent.get("help_requested"):
+        turn_type = "help_request"
+    elif intent.get("is_question") and wc < 12:
+        turn_type = "question"
+    elif strategic and wc >= 10:
+        turn_type = "strategic_insight"
+    elif result:
+        turn_type = "calculation_result"
+    elif structure and not calc:
+        turn_type = "structure"
+    elif plan and sequence_hits >= 2:
+        turn_type = "plan"
+    elif calc:
+        turn_type = "calculation"
+    elif structure:
+        turn_type = "structure"
+    elif plan:
+        turn_type = "plan"
+    elif intent.get("is_hypothesis"):
+        turn_type = "hypothesis"
+    elif has_number:
+        turn_type = "estimate"
+    else:
+        turn_type = "statement"
+
+    reasoning_shape = turn_type in ("strategic_insight", "structure", "calculation_result",
+                                    "calculation", "plan", "hypothesis", "estimate")
+    is_substantive = reasoning_shape and (
+        wc >= 20 or (wc >= 12 and turn_type in ("calculation_result", "strategic_insight", "structure")))
+    return {
+        "turn_type": turn_type,
+        "word_count": wc,
+        "is_substantive_reasoning": bool(is_substantive),
+        "step_completed": bool(result),
+        "asks_to_proceed": _has_any(new_norm, _PROCEED_ASKS),
+    }
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
@@ -188,14 +310,22 @@ def _similar(a: str, b: str) -> bool:
 
 def detect_intent(text: str) -> Dict[str, Any]:
     t = _norm(text)
+    
+    # Strip conversational fillers from the start to accurately catch interrogatives (e.g. "so how do we...")
+    stripped_t = re.sub(r"^(so|and|but|then|well|now|actually|basically)\s+", "", t)
+    first_word = stripped_t.split(" ", 1)[0] if stripped_t else ""
+    
+    is_q = ("?" in t) or (first_word in _INTERROGATIVE)
+    is_sol = _has_any(t, _SOLUTION) or t in _EXACT_SOLUTION
+    
     flags = {
         "help_requested": _has_any(t, _HELP),
-        "solution_requested": _has_any(t, _SOLUTION),
+        "solution_requested": is_sol,
         "skip_or_stop": _has_any(t, _SKIP_STOP),
         "frustration": _has_any(t, _FRUSTRATION),
         "is_meta": _has_any(t, _META),
         "looks_garbage": _looks_garbage(text),
-        "is_question": ("?" in (text or "")) or (bool(t) and t.split(" ", 1)[0] in _INTERROGATIVE),
+        "is_question": is_q,
         "is_directive": _has_any(t, _DIRECTIVES),
         "is_greeting_only": t in _GREETING,
         "is_hypothesis": _has_any(t, _HYPOTHESIS_MARKERS)
@@ -256,24 +386,42 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     new_norm = _norm(new_user_message)
     intent = detect_intent(new_user_message)
 
-    has_work = (any((len(c) > 60 or re.search(r"\d", c)) for c in (cand + [new_norm]))
-                or _has_any(new_norm, _WORK_MARKERS))
+    # V10.2: Fixed historic memory bug. has_work is evaluated ONLY on the current turn to prevent infinite acks.
+    has_work = (len(new_norm) > 60 or bool(re.search(r"\d", new_norm)) or _has_any(new_norm, _WORK_MARKERS))
+    
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
     candidate_repeating = any(_similar(new_norm, c) for c in cand[-4:])
     
-    words = new_norm.split()
-    is_affirmation_only = len(words) > 0 and len(words) <= 3 and any(w in _AFFIRMATION_WORDS for w in words)
+    # V12: punctuation-insensitive ("Okay." / "Yes," from typing or ASR are affirmations too).
+    words = re.findall(r"[a-z0-9']+", new_norm)
+    is_affirmation_only = (len(words) > 0 and len(words) <= 3 and not re.search(r"\d", new_norm)
+                           and any(w in _AFFIRMATION_WORDS for w in words))
 
     recent_assistant_turns = asst[-4:] if len(asst) > 0 else []
     
     last_action_was_presence = False
-    
+
     if len(asst) > 0:
         last_turn_content = asst[-1]
         content_norm = _norm(last_turn_content)
         if content_norm in _PRESENCE_TEXT_MATCHES or "event_type" in content_norm:
             last_action_was_presence = True
+
+    # V12: a model-worded acknowledgement has no fixed text, so the cool-down is
+    # read from the response function persisted for the previous candidate turn.
+    ps = prior_state or {}
+    recent_functions = [f for f in (ps.get("recent_functions") or []) if isinstance(f, str)][-4:]
+    last_function = ps.get("last_function") if isinstance(ps.get("last_function"), str) else None
+    try:
+        function_turn = int(ps.get("function_turn") or 0)
+    except (TypeError, ValueError):
+        function_turn = 0
+    if (last_function in PRESENCE_FUNCTIONS and function_turn and function_turn >= len(cand)
+            and len(asst) > 0):
+        last_action_was_presence = True
+
+    shape = classify_turn(new_norm, intent, is_affirmation_only)
 
     tw = 0
     for c in reversed(cand + [new_norm]):
@@ -309,7 +457,8 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     asks_owned_fact = (intent["intent"] == "clarification") and _has_any(new_norm, _OWNED_FACT) and not intent["help_requested"]
 
     is_session_open = (
-        (intent["intent"] == "greeting")
+        # V12: a bare "okay"/"so" mid-case is not a greeting that re-opens the case.
+        (intent["intent"] == "greeting" and len(cand) == 0)
         or (len(asst) == 0 and len(cand) == 0)
         or (len(cand) == 0 and len(new_norm) <= 24 and _has_any(new_norm, _KICKOFF)
             and not intent["solution_requested"]
@@ -324,7 +473,9 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
     confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
     
+    # Must explicitly state finality to trigger sanity check
     states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
+    
     hedged_self_estimate = has_number and _has_any(new_norm, _HEDGE)
     just_recovered = _has_any(new_norm, _RECOVERY) and len(asst) >= 1
     error_materiality = _error_materiality(new_norm)
@@ -369,8 +520,44 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "hedged_self_estimate": hedged_self_estimate,
         "just_recovered": just_recovered,
         "error_materiality": error_materiality,
-        "new_message_norm": new_norm
+        "new_message_norm": new_norm,
+        # V12 turn shape + conversation memory (read by interviewer_decision)
+        "turn_type": shape["turn_type"],
+        "word_count": shape["word_count"],
+        "is_substantive_reasoning": shape["is_substantive_reasoning"],
+        "step_completed": shape["step_completed"],
+        "asks_to_proceed": shape["asks_to_proceed"],
+        "numbers_stated": numbers_stated(new_user_message),
+        "candidate_confidence": ("low" if hedged_self_estimate or _has_any(new_norm, _HEDGE)
+                                 else "high" if _has_any(new_norm, _CONFIDENCE_HIGH) else "moderate"),
+        "recent_functions": recent_functions,
+        "last_function": last_function,
+        "candidate_plan": _latest_plan(transcript),
     }
+
+
+# Functions that are a presence beat (acknowledge / hand back), fast-lane or
+# model-worded. Kept here (not in interviewer_decision) to avoid an import cycle.
+PRESENCE_FUNCTIONS = frozenset({
+    "SHORT_ACK", "HAND_BACK", "ACKNOWLEDGE_AND_CONTINUE", "ACKNOWLEDGE_AND_ORIENT",
+    "REFLECT_PROGRESS", "VALIDATE_AND_HAND_BACK",
+})
+
+
+def _latest_plan(transcript: Iterable[Dict[str, str]], max_chars: int = 240):
+    """The candidate's most recent earlier turn that laid out a plan or structure
+    (so ACKNOWLEDGE_AND_ORIENT can point to THEIR next part, never a new one)."""
+    for t in reversed(list(transcript or [])):
+        if (t.get("role") or "user") != "user":
+            continue
+        n = _norm(t.get("content"))
+        if not n:
+            continue
+        sequence_hits = sum(1 for w in _SEQUENCE_WORDS if w in n)
+        if (sequence_hits >= 2 or _has_any(n, _STRUCTURE_WORDS)) and len(n.split()) >= 12:
+            raw = re.sub(r"\s+", " ", (t.get("content") or "").strip())
+            return raw[:max_chars] + ("..." if len(raw) > max_chars else "")
+    return None
 
 def needs_contextual_assessment(sig: Dict[str, Any]) -> bool:
     if sig.get("help_requested") or sig.get("solution_requested"): return False

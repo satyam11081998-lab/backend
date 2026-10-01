@@ -547,11 +547,14 @@ def _fold_session_state(
     Shared by /messages and /voice-decision so both paths keep ONE learner state.
     """
     tag = ctl.get("tag") or {}
-    if not tag:
+    function = ctl.get("function")
+    # V12: the response function is folded even when the model emitted no tag --
+    # it is the next turn's presence cool-down and repetition memory.
+    if not tag and not function:
         return
     try:
         _sig = compute_signals(transcript, user_text, teaching_policy or "coached", session_state)
-        _new_state = update_session_state(session_state, tag, _sig)
+        _new_state = update_session_state(session_state, tag, _sig, function=function)
         supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
         _viol = detect_violations(reply_text, teaching_policy or "coached", tag)
         if _viol:
@@ -892,7 +895,7 @@ def post_message(
             if _TIMING_LOG:
                 print(f"[timing] /messages attempt={attempt_id} pre_ms={pre_ms} "
                       f"first_token_ms={first_ms} reply_ms={_ms(t_stream)} total_ms={_ms(t_req)} "
-                      f"mode={ctl.get('mode')} silent={silent}")
+                      f"mode={ctl.get('mode')} function={ctl.get('function')} silent={silent}")
         except InterviewEngineError as e:
             yield f"event: error\ndata: {str(e)[:200]}\n\n"
         except Exception as e:  # noqa: BLE001
@@ -921,7 +924,7 @@ def voice_decision(
     realtime voice session and return its decision:
 
         {"lane": "SILENCE" | "PRESENCE" | "SUBSTANTIVE",
-         "mode": <V11 mode>, "reason": <V11 reason>,
+         "mode": <V11 mode>, "function": <V12 response function>, "reason": <V11 reason>,
          "say": <exact line to speak, or null>,
          "event": <V11 interviewer_presence event, or null>}
 
@@ -1012,6 +1015,15 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
     event = None
     if _is_v11_silence(ctl, parts):
         lane, say = "SILENCE", None
+    elif ctl.get("lane") == "PRESENCE" and ctl.get("render") == "model":
+        # V12 contextual presence: a model-worded acknowledgement of the candidate's
+        # own work. Same shape as a fast-lane beat so every client handles it.
+        lane = "PRESENCE"
+        say = "".join(parts).strip()
+        if not say:
+            raise HTTPException(status_code=502, detail="The interviewer presence event had no line.")
+        event = {"event_type": "interviewer_presence",
+                 "data": {"mode": ctl.get("function") or "PRESENCE", "code": "CTX", "text": say}}
     elif tag.get("intervention") == "fast_lane":
         lane = "PRESENCE"
         raw = "".join(parts).strip()
@@ -1046,11 +1058,12 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
     response.headers["Server-Timing"] = f"pre;dur={pre_ms}, engine;dur={engine_ms}, total;dur={total_ms}"
     if _TIMING_LOG:
         print(f"[timing] /voice-decision attempt={attempt_id} pre_ms={pre_ms} engine_ms={engine_ms} "
-              f"total_ms={total_ms} lane={lane} mode={ctl.get('mode')}")
+              f"total_ms={total_ms} lane={lane} mode={ctl.get('mode')} function={ctl.get('function')}")
 
     return {
         "lane": lane,
         "mode": ctl.get("mode"),
+        "function": ctl.get("function"),
         "reason": ctl.get("reason"),
         "say": say,
         "event": event,

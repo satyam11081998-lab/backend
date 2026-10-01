@@ -225,7 +225,11 @@ check("HINT line has no question (V11 HINT forbids one)", d.get("say") and "?" n
 check("deep-lane prompt is V11's ('YOUR MOVE THIS TURN: HINT')", "YOUR MOVE THIS TURN: HINT" in system_text(calls))
 check("deep-lane prompt carries none of the old static interviewer", not any(p in system_text(calls) for p in OLD_PHRASES))
 check("no attempt_messages row written by voice-decision", not [w for w in db.writes if w[1] == "attempt_messages"])
-check("untagged deep-lane reply: no state fold (same rule as /messages)", db.state_writes() == [])
+# V12: an untagged reply still folds its response function (the next turn's
+# presence cool-down / repetition memory), but nothing the tag would drive moves.
+check("untagged deep-lane reply: only the response function is folded (hint ladder unchanged)",
+      len(db.state_writes()) == 1 and db.state_writes()[0].get("last_function") == "MICRO_HINT"
+      and db.state_writes()[0].get("hint_level") == 0, db.state_writes())
 r, db, calls = decide("Can you help me here?", reply="<<mode=coach; intervention=micro_hint; hint=2>>\n\nSplit buyers by age first.")
 d = r.json()
 check("control tag never reaches the voice line", d.get("say") == "Split buyers by age first.", d.get("say"))
