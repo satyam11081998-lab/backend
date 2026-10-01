@@ -1,9 +1,7 @@
 """
 Interview Engine — runs one interviewer turn against OpenAI.
 
-Implements V11 Contextual Response Generation Layer.
-Pipeline: Signals -> Response Function (Python) -> Control Packet (JSON) -> Natural Language (LLM).
-Retains 0-token Fast Lane for true SILENCE and simple local acks.
+Implements V10 MECE Architecture: True Semantic Events, Dual Gates, and Safe UX Fallbacks.
 """
 
 import os
@@ -22,12 +20,13 @@ from prompts.interview_prompts import (
     build_conversation_scoring_user_prompt,
 )
 from prompts.interview_prompts_v2 import build_adaptive_interviewer_messages
-from services.session_signals import compute_signals
-from services.interviewer_mode import ALLOW_QUESTIONS, build_mode_block
+from services.session_signals import compute_signals, needs_contextual_assessment, build_signal_block
+from services.interviewer_mode import get_modality_instruction, ALLOW_QUESTIONS, build_mode_block
 from services.interviewer_decision import (
-    StreamTagStripper, parse_control_tag, enforce_mode, 
-    determine_response_function, build_interviewer_control_packet, get_fast_lane_event
+    StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode, 
+    assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event
 )
+from services.learning_model import evaluate_intervention_outcome, build_learning_block
 
 load_dotenv()
 
@@ -60,17 +59,19 @@ def _resolve_adaptive_llm():
     return openai_client() or _client, model, "openai"
 
 def _build_adaptive_messages(case_content, case_type, transcript, new_user_message,
-                             clarifications_exhausted, response_function, control_packet, policy):
-    # The mode block now contains the rich JSON payload and strict LLM generation instructions
-    block = build_mode_block(response_function, control_packet)
-    
+                             clarifications_exhausted, signals, mode, instruction, allow_questions,
+                             policy, prior_state, outcome):
+    block = (build_signal_block(signals)
+             + "\n\n" + build_mode_block(mode, instruction, allow_questions)
+             + "\n\n" + build_learning_block(
+                 (prior_state or {}).get("profile"), signals, outcome))
     return build_adaptive_interviewer_messages(
         case_content=case_content,
         case_type=case_type,
         transcript=transcript,
         new_user_message=new_user_message,
         teaching_policy=policy,
-        signals_block=block,  # Passed as the primary driving instruction
+        signals_block=block,
         clarifications_exhausted=clarifications_exhausted,
     )
 
@@ -98,53 +99,67 @@ def stream_interviewer_reply(
         tlist = list(transcript)
         policy = _teaching_policy(teaching_policy)
         
-        # 1. State Estimation
+        # 1. Deterministic Signals
         signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state, channel=channel, is_voice_partial=is_voice_partial)
         
-        # 2. Determine Intent (Policy Layer)
-        response_function = determine_response_function(signals)
+        # 2. Contextual Assessor
+        if needs_contextual_assessment(signals):
+            context_state = assess_context_with_llm(tlist, new_user_message, case_content)
+            signals.update(context_state)
+            
+        # 3. Two-Gate Intervention Routing
+        lane, mode, reason = evaluate_intervention_gate(signals)
         
-        # 3. Fast Lane Intercept (0 LLM Tokens)
-        if response_function == "NO_OUTPUT":
+        # 4. FAST LANE: SILENCE
+        if lane == "SILENCE":
             t0 = time.time()
             if control_out is not None:
                 control_out["tag"] = {"mode": "NO_OUTPUT", "intervention": "silence"}
                 control_out["mode"] = "NO_OUTPUT"
+                control_out["reason"] = reason
             yield ""
+            
             actual_ms = int((time.time() - t0) * 1000)
             class _FastUsage:
                 usage = None
                 id = None
-            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_silence", model="local", response=_FastUsage(), latency_ms=max(1, actual_ms))
+            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_silence", model="local",
+                         response=_FastUsage(), latency_ms=max(1, actual_ms))
             return
             
-        # Fast Lane Intercept for short, non-substantive affirmations
-        if response_function in ["SHORT_ACK", "HAND_BACK"] and not signals.get("is_substantive_reasoning"):
+        # 5. FAST LANE: PRESENCE SEMANTIC EVENTS
+        if lane == "PRESENCE":
             t0 = time.time()
-            fast_event_dict = get_fast_lane_event(response_function, signals)
+            fast_event_dict = get_fast_lane_event(mode, signals)
+            
             if control_out is not None:
-                control_out["tag"] = {"mode": response_function, "intervention": "fast_lane"}
-                control_out["mode"] = response_function
-                
+                control_out["tag"] = {"mode": mode, "intervention": "fast_lane"}
+                control_out["mode"] = mode
+                control_out["reason"] = reason
+
+            # Safe UX Fallback: If channel is text, yield raw text so existing SSE UI doesn't render JSON bubbles.
+            # If voice, yield JSON so client can intercept it for cached audio.
             if channel == "text":
                 yield fast_event_dict["data"]["text"]
             else:
                 yield json.dumps(fast_event_dict)
-                
+            
             actual_ms = int((time.time() - t0) * 1000)
             class _FastUsageBeat:
                 usage = None
                 id = None
-            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_event", model="local", response=_FastUsageBeat(), latency_ms=max(1, actual_ms))
+            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_event", model="local",
+                         response=_FastUsageBeat(), latency_ms=max(1, actual_ms))
             return
             
-        # 4. Contextual Generation (Deep Lane)
-        control_packet = build_interviewer_control_packet(signals, response_function)
-        allow_questions = control_packet["interviewer_control"]["interviewer_decision"]["question_allowed"]
+        # 6. DEEP LANE (LLM Generation)
+        allow_questions = ALLOW_QUESTIONS.get(mode, False)
+        instruction = get_modality_instruction(mode, policy, new_user_message, signals)
+        outcome = evaluate_intervention_outcome(prior_state, signals)
         
         messages = _build_adaptive_messages(
             case_content, case_type, tlist, new_user_message, clarifications_exhausted,
-            response_function, control_packet, policy
+            signals, mode, instruction, allow_questions, policy, prior_state, outcome
         )
         cli, model, provider = _resolve_adaptive_llm()
     else:
@@ -178,7 +193,7 @@ def stream_interviewer_reply(
 
     t0 = time.time()
     
-    # 5. Pre-Emission Safety Validation
+    # 7. Pre-Emission Safety Validation for Deep Lane Zero-Question Modes
     if adaptive and not allow_questions:
         try:
             resp = _complete(cli, model)
@@ -191,11 +206,12 @@ def stream_interviewer_reply(
         
         raw_text = (resp.choices[0].message.content or "").strip()
         tag, clean_text = parse_control_tag(raw_text)
-        final_text = enforce_mode(clean_text, response_function, allow_questions, policy)
+        final_text = enforce_mode(clean_text, mode, allow_questions, policy)
         
         if control_out is not None:
             control_out["tag"] = tag or {}
-            control_out["mode"] = response_function
+            control_out["mode"] = mode
+            control_out["reason"] = reason if 'reason' in locals() else ""
             
         yield final_text
         log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
@@ -242,7 +258,7 @@ def stream_interviewer_reply(
                 yield _out
             if control_out is not None:
                 control_out["tag"] = getattr(stripper, "tag", {}) or {}
-                control_out["mode"] = response_function if 'response_function' in locals() else "UNKNOWN"
+                control_out["mode"] = mode
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
@@ -269,27 +285,34 @@ def complete_interviewer_reply(
         policy = _teaching_policy(teaching_policy)
         signals = compute_signals(transcript, new_user_message, policy, prior_state=prior_state, channel=channel, is_voice_partial=is_voice_partial)
         
-        response_function = determine_response_function(signals)
+        if needs_contextual_assessment(signals):
+            context_state = assess_context_with_llm(transcript, new_user_message, case_content)
+            signals.update(context_state)
+            
+        lane, mode, reason = evaluate_intervention_gate(signals)
         
-        if response_function == "NO_OUTPUT":
+        if lane == "SILENCE":
             if control_out is not None:
                 control_out["tag"] = {"mode": "NO_OUTPUT", "intervention": "silence"}
                 control_out["mode"] = "NO_OUTPUT"
+                control_out["reason"] = reason
             return ""
             
-        if response_function in ["SHORT_ACK", "HAND_BACK"] and not signals.get("is_substantive_reasoning"):
-            fast_event = get_fast_lane_event(response_function, signals)
+        if lane == "PRESENCE":
+            fast_event = get_fast_lane_event(mode, signals)
             if control_out is not None:
-                control_out["tag"] = {"mode": response_function, "intervention": "fast_lane"}
-                control_out["mode"] = response_function
+                control_out["tag"] = {"mode": mode, "intervention": "fast_lane"}
+                control_out["mode"] = mode
+                control_out["reason"] = reason
             return fast_event["data"]["text"] if channel == "text" else json.dumps(fast_event)
             
-        control_packet = build_interviewer_control_packet(signals, response_function)
-        allow_questions = control_packet["interviewer_control"]["interviewer_decision"]["question_allowed"]
+        allow_questions = ALLOW_QUESTIONS.get(mode, False)
+        instruction = get_modality_instruction(mode, policy, new_user_message, signals)
+        outcome = evaluate_intervention_outcome(prior_state, signals)
         
         messages = _build_adaptive_messages(
             case_content, case_type, transcript, new_user_message, clarifications_exhausted,
-            response_function, control_packet, policy
+            signals, mode, instruction, allow_questions, policy, prior_state, outcome
         )
         cli, model, provider = _resolve_adaptive_llm()
     else:
@@ -323,10 +346,11 @@ def complete_interviewer_reply(
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
-        text = enforce_mode(text, response_function, allow_questions, policy)
+        text = enforce_mode(text, mode, allow_questions, policy)
         if control_out is not None:
             control_out["tag"] = tag or {}
-            control_out["mode"] = response_function
+            control_out["mode"] = mode
+            control_out["reason"] = reason
     return text
 
 
