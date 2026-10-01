@@ -13,6 +13,8 @@ from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance
 from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS
+from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions, VOICE_TOOLS
+from services.voice_coach import voice_interviewer_mode, voice_state
 
 load_dotenv()
 
@@ -72,23 +74,25 @@ REALTIME_SEMANTIC_EAGERNESS = os.getenv("REALTIME_SEMANTIC_EAGERNESS", "low")
 REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
 
 
-def build_turn_detection() -> dict:
+def build_turn_detection(create_response: bool = False) -> dict:
     """Turn-detection config for the realtime session, chosen by REALTIME_TURN_MODE.
 
     Default is semantic_vad (words-based end-of-turn); server_vad (fixed silence)
     is the env-selectable fallback. Both keep barge-in — the candidate can always
     cut the interviewer off mid-sentence.
 
-    create_response is OFF in both: the realtime model never answers a candidate
-    turn on its own. The browser sends the final transcript to V11
-    (/attempts/{id}/voice-decision) and only then issues response.create with the
-    line V11 approved — or nothing at all, for V11 SILENCE.
+    create_response is OFF in both for the default (renderer) interviewer: the
+    realtime model never answers a candidate turn on its own. The browser sends
+    the final transcript to V11 (/attempts/{id}/voice-decision) and only then
+    issues response.create with the line V11 approved — or nothing at all, for
+    V11 SILENCE. The model-led interviewer (VOICE_INTERVIEWER) turns it ON: the
+    model converses by itself, steered by prompts/voice_interviewer_playbook.py.
     """
     if REALTIME_TURN_MODE == "semantic_vad":
         return {
             "type": "semantic_vad",
             "eagerness": REALTIME_SEMANTIC_EAGERNESS,
-            "create_response": False,
+            "create_response": create_response,
             "interrupt_response": True,
         }
     return {
@@ -96,7 +100,7 @@ def build_turn_detection() -> dict:
         "threshold": 0.5,
         "prefix_padding_ms": 300,
         "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
-        "create_response": False,
+        "create_response": create_response,
         "interrupt_response": True,
     }
 
@@ -184,7 +188,7 @@ async def create_realtime_session(
 
     case = (
         supabase.table("cases")
-        .select("id, title, type, content")
+        .select("*")
         .eq("id", body.case_id)
         .limit(1)
         .execute()
@@ -192,16 +196,36 @@ async def create_realtime_session(
     if not case.data:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    # The realtime model is a voice only: V11 decides every interviewer turn via
-    # /attempts/{id}/voice-decision, so no interviewer prompt or case content
-    # goes into this session (see prompts/voice_renderer.py).
-    instructions = VOICE_RENDERER_INSTRUCTIONS
+    interviewer = voice_interviewer_mode(uid, getattr(user_obj, "email", None))
+    tools_cfg: dict = {}
+    if interviewer == "model_led":
+        # The model IS the interviewer: playbook + case (never the solution) +
+        # the coach notes already on this attempt; tools for hints and the answer.
+        from services.markets import llm_case_content
+        row = case.data[0]
+        notes = []
+        if body.attempt_id:
+            try:
+                att = (supabase.table("attempts").select("user_id, session_state")
+                       .eq("id", body.attempt_id).limit(1).execute())
+                if att.data and att.data[0].get("user_id") == uid:
+                    notes = voice_state(att.data[0].get("session_state")).get("coach_notes") or []
+            except Exception as e:  # noqa: BLE001 -- notes are a nicety, never a blocker
+                print(f"[realtime] coach notes not read: {type(e).__name__}")
+        instructions = build_voice_interviewer_instructions(llm_case_content(row), row.get("type") or "", notes)
+        tools_cfg = {"tools": VOICE_TOOLS, "tool_choice": "auto"}
+    else:
+        # The realtime model is a voice only: V11 decides every interviewer turn via
+        # /attempts/{id}/voice-decision, so no interviewer prompt or case content
+        # goes into this session (see prompts/voice_renderer.py).
+        instructions = VOICE_RENDERER_INSTRUCTIONS
 
     payload = {
         "session": {
             "type": "realtime",
             "model": REALTIME_MODEL,
             "instructions": instructions,
+            **tools_cfg,
             "audio": {
                 "input": {
                     # Words-based end-of-turn (semantic_vad) by default so a
@@ -209,7 +233,7 @@ async def create_realtime_session(
                     # that was the #1 cause of the interviewer interrupting and
                     # repeating itself. See build_turn_detection() and the
                     # REALTIME_TURN_MODE note above; barge-in stays on.
-                    "turn_detection": build_turn_detection(),
+                    "turn_detection": build_turn_detection(create_response=(interviewer == "model_led")),
                     "transcription": {"model": "whisper-1"},
                 },
                 "output": {"voice": REALTIME_VOICE},
@@ -249,7 +273,7 @@ async def create_realtime_session(
         log_ai_usage(
             user_id=uid, endpoint="/realtime/session", model=REALTIME_MODEL,
             audio_minutes=0, latency_ms=latency_ms, success=True,
-            meta={"case_id": body.case_id, "attempt_id": body.attempt_id},
+            meta={"case_id": body.case_id, "attempt_id": body.attempt_id, "interviewer": interviewer},
         )
 
         return {
@@ -259,6 +283,9 @@ async def create_realtime_session(
             "voice": REALTIME_VOICE,
             "max_session_seconds": session_cap,
             "credits": get_balance(supabase, uid, tier),
+            # "renderer" = V11/V12 decides each turn (default); "model_led" = the
+            # model converses, steered by /voice-coach and /voice-tool.
+            "interviewer": interviewer,
         }
 
     except HTTPException:

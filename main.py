@@ -96,3 +96,5 @@ from routes import seo as _seo
 app.include_router(_seo.router)
 from routes import broadcast as _broadcast
 app.include_router(_broadcast.router)
+from routes import voice_coach as _voice_coach
+app.include_router(_voice_coach.router)
