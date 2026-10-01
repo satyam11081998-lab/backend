@@ -1,54 +1,55 @@
 MECE Interviewer - FILE MANIFEST
-Generated 2026-09-30 04:30 UTC from the committed branch tips.
+Generated 2026-10-01 11:14 UTC from the committed branch tips.
 Columns: status (A added / M modified / D deleted), +lines, -lines, sha256 of the file at the branch tip, path.
 This manifest lists itself without a hash (a file cannot contain its own hash).
 
-== backend (consilio-backend): branch feat/unified-interviewer-brain (tip = the commit that adds this manifest), base main @ 9e009c5
-A  +  100 -    0  3f1fb58d9313eac9fc937e4a04af90989fc59f7c6e0c3d6c492af0944fb1c1a7  docs/interviewer/MECE_INTERVIEWER_ADVERSARIAL_REPORT.md
-A  +  117 -    0  e0dd46abee1249fdb5fabc53173902f46d8ac69a6f03bd9237304b764546959b  docs/interviewer/MECE_INTERVIEWER_ARCHITECTURE.md
+== backend (consilio-backend): branch feat/unified-interviewer-brain (tip = the commit that adds this manifest), base main @ 8c6530f
+A  +  101 -    0  9d8d556c2fa1df29878c8988367ec85006290cdd11c47d6fe1b5637580fac0e4  docs/interviewer/MECE_INTERVIEWER_ADVERSARIAL_REPORT.md
+A  +  119 -    0  fbcc202f395f2cfb2ddfd953fea8e69bde3deda999139f9ec900b08791de5586  docs/interviewer/MECE_INTERVIEWER_ARCHITECTURE.md
 A  +  109 -    0  56c44cc5ebe88149a7549aa4a936a2053ba27c7ed50b2db8a29c89c15e08b53d  docs/interviewer/MECE_INTERVIEWER_CALL_GRAPH.md
-A  +   92 -    0  ecd79e65eff2a83b0f093fb0a72ee36eaf0862be02aab21df1e5a96ed94cf4db  docs/interviewer/MECE_INTERVIEWER_COST_REPORT.md
-A  +   89 -    0  (this file)  docs/interviewer/MECE_INTERVIEWER_FILE_MANIFEST.txt
-A  +  109 -    0  ddfd8bc80c9d71478ff395a7f53a6f962ad8b16216b2e4f0f01ab7a03460399d  docs/interviewer/MECE_INTERVIEWER_LATENCY_REPORT.md
-A  +   83 -    0  eef0d732d1164ebdc64dfe481e647c22a74b296e7290522199b001bd9cd353fd  docs/interviewer/MECE_INTERVIEWER_LOAD_REPORT.md
-A  +   90 -    0  cc7b40b0e5934523ec90fe5732440c506c49e06133741cd9156ace20eb6f32ea  docs/interviewer/MECE_INTERVIEWER_PRODUCT_SPEC.md
-A  +   96 -    0  1d12a9ddd579ad839404382814dd0c20d2bff749f9b05676f5ae079c17b3b20a  docs/interviewer/MECE_INTERVIEWER_REALTIME_REPORT.md
-A  +  100 -    0  11880f5ebaa9cfb8c7495422b637d0477d2fcb4a90a075675758807b54b30b18  docs/interviewer/MECE_INTERVIEWER_REGRESSION_REPORT.md
-A  +   82 -    0  8dc45d087217a7bcb6678d9a3dfa631bdc17ba1b36537818b1637d717ea9a713  docs/interviewer/MECE_INTERVIEWER_ROLLBACK.md
-A  +   89 -    0  13e7659ef9980b15cafb2303c9d5f57280f761714c4e656d16473b0d038ee1d6  docs/interviewer/MECE_INTERVIEWER_RUNTIME_TRACE.md
-A  +   51 -    0  3bc920dcdf96de8e9db90eb00ce25ef54d66f97363b2e19c76ea971a8f7d847c  docs/interviewer/MECE_INTERVIEWER_SECURITY_REPORT.md
-A  +   72 -    0  087c7fea4a0245d7b1c88f9cf31761fcc180eeebeb1b4b292c4b54f31b7dd60a  docs/interviewer/MECE_INTERVIEWER_STATE_MACHINE.md
+A  +  100 -    0  c374019ba96a484896f0da54cedbed73269964c624a5be08aa12ff88bc9ecea9  docs/interviewer/MECE_INTERVIEWER_COST_REPORT.md
+A  +   90 -    0  (this file)  docs/interviewer/MECE_INTERVIEWER_FILE_MANIFEST.txt
+A  +  117 -    0  5f71eb0c841ad99777af1e4730488a31dddd1cf7fa15d12cafc75b2c6ad2a8c7  docs/interviewer/MECE_INTERVIEWER_LATENCY_REPORT.md
+A  +   86 -    0  b016e8555b6cb1903c159f75068d4e62d6826c4005e8c23fe816a5739a1c752a  docs/interviewer/MECE_INTERVIEWER_LOAD_REPORT.md
+A  +  106 -    0  20dcac7267bdec1c0ef3ff8f5c88899e339775ff20e83720c86b6f62738f7d92  docs/interviewer/MECE_INTERVIEWER_PRODUCT_SPEC.md
+A  +   97 -    0  1b1557c047cf52b97f386818f60a16bd06cf31075469ff3836226ae09cd84093  docs/interviewer/MECE_INTERVIEWER_REALTIME_REPORT.md
+A  +  123 -    0  748c99ad896d4df3b433bd51f97bac3525df412e282739f0287a7eece8716320  docs/interviewer/MECE_INTERVIEWER_REGRESSION_REPORT.md
+A  +   89 -    0  b19a7cf9482cbe12d074f773bb3d812249501bc0ca3c75e0dc9961a258b90702  docs/interviewer/MECE_INTERVIEWER_ROLLBACK.md
+A  +   96 -    0  76e76bdf59a462f19a001ba68c9db18d521a5ebdcf86fd4b03b65c7820e5227c  docs/interviewer/MECE_INTERVIEWER_RUNTIME_TRACE.md
+A  +   53 -    0  944b3d5b13b46418164dd49d6c19dd6539061726a8bcd8e24299a813805515c8  docs/interviewer/MECE_INTERVIEWER_SECURITY_REPORT.md
+A  +   73 -    0  3fafd89d8d13b3d542a4188ebb6ff97b539bab3ebfc80193c5d8c3c55f277d2b  docs/interviewer/MECE_INTERVIEWER_STATE_MACHINE.md
 A  +   79 -    0  9df510546b4852a523fec623d16991ffe0e2ebc2940386bc8be81b210be48cd4  docs/interviewer/MECE_INTERVIEWER_STT_REPORT.md
-A  +  111 -    0  b05f94777e7bbcfcdebf6753e70df56f803c94a973add0d45d4cd0d165e051f5  docs/interviewer/MECE_INTERVIEWER_TEST_REPORT.md
+A  +  119 -    0  760cd82f0903bc63ba145c602efc31dedc4b15afa404721d93e2df953fc995a4  docs/interviewer/MECE_INTERVIEWER_TEST_REPORT.md
 A  +   25 -    0  2cc9f17e7b06c465e56f5f6301c500d36501e456ec14a0288c67cdc7b96279f9  docs/interviewer/README.md
-M  +  108 -   28  322aaa251b6fe9ea67ff9323278e45f6e19093a7a79ac51a7cf118d53ecd6fcb  routes/attempts.py
+M  +  108 -   28  5da498c1e77d39135b93898dead512ef515394ec38cd46fb0eb9febccdcb320a  routes/attempts.py
 A  +  354 -    0  349a17a9ed75baf0c3f40772c09e3b6d6e53946191f9b86b2ea7ea7760918e9b  routes/attempts_brain.py
 M  +  127 -    1  2e2a1e040cba92fa723cc9146544ea36d13469c8e6abe1e51d2b4bc272cefe7d  routes/realtime.py
 M  +    8 -    1  09849704f4112f24dcb7f3a50502d9c7679ef30d273c181e9a4e00f124bd5df8  services/ai_usage.py
 M  +   13 -  229  6b461800e27f692624480472c96e41cb9d232187d84962ecf65a2486af56bed5  services/copilot/engine/prompts_interview.py
 A  +   12 -    0  4969fa85f2eda61e9c1d13b540e96f7f0b8101e32ada54264213b12bc3e1e293  services/interviewer/__init__.py
 A  +  116 -    0  ba5645bc4bf2c566c5a7b01ec1bd266f14d546472e91793b254636095a77ea7e  services/interviewer/assessor.py
-A  +  399 -    0  f357b20e4a5bbabbba31d8ee42926d545ad9e9f6cd60a92c7c8f0432bed389e1  services/interviewer/classify.py
+A  +  415 -    0  fff3682d61b0b5e3c42c23dea80d031a5e09df4eb91a163e64d3f962effc73ac  services/interviewer/classify.py
 A  +  132 -    0  ddbdd5b50de082946d9c76e5ddbb32017082a541d5d7f86181d17e84a02100cd  services/interviewer/dedupe.py
-A  +  195 -    0  6c292f832a0f7ce0fa409efc0585af6f914283c96d55c290ebcfb9c9a0e27b02  services/interviewer/engine.py
+A  +  211 -    0  f1dc78988f6acbbbb02c82c21f4663ec4530af0cbf464e260ad6a1c6f2f9cb3c  services/interviewer/engine.py
 A  +   47 -    0  fe754f294138f3bea84e03fd252ab46e70448cb3247680bc99def6fbe0526b36  services/interviewer/flags.py
 A  +  116 -    0  e1f47ba374cf5e4008cecfeeb3194feec27c840939d4e2c5025ae63d392a2b2d  services/interviewer/normalize.py
 A  +  468 -    0  3817ad3c00106cf7d3378c95410bcee0a9aeef847b804cad66b28bc63858d58f  services/interviewer/numbers.py
-A  +  372 -    0  b392b69c061ed8ec12c69388f4e50141539a6d41186a5aedcb970f44fc6f66d9  services/interviewer/policy.py
-A  +  117 -    0  367c2361447d1e4fc77a117b18ac4694152f133215376e6f1269e9d0f79ad95d  services/interviewer/presence.py
-A  +  154 -    0  15805acbec54353049eddf67b776b78205fd0ecd67b50eb067d59c275a70502f  services/interviewer/prompting.py
+A  +  428 -    0  478fc25ca91d5b71616cdb7047763a217020487e40bfbd3f05b90725f9c04ed7  services/interviewer/policy.py
+A  +  121 -    0  1d9c54d4c0fe3b3c44cf50cbbf97e1554e5685a626d21b31fa9877b712e96b0b  services/interviewer/presence.py
+A  +  256 -    0  d315360c6100e3500bc3b45c4ebdf275f6d84fd61797b4c8540630c174167278  services/interviewer/prompting.py
 A  +  211 -    0  644d7daa441ca7573086b1e5353cf0fd1fa5454c704bf9fbbac9ee7dfc3259d9  services/interviewer/providers.py
-A  +   85 -    0  c8b323e03fe4fa4fab65e7503e6b4d1f85cbc8ca4ec2330c2d774fecbe974287  services/interviewer/responder.py
+A  +  112 -    0  04d4cc642b4e1cf1e6a6aa21f7b1fe1d6c08c7452f1bbb2400eb5e6257284f0c  services/interviewer/responder.py
 A  +  175 -    0  818c0aec0a6d011d3d7bc146f368f2cc5b36f1878464363c5c578e27ee0b4459  services/interviewer/state_machine.py
 A  +   95 -    0  645eef6ec9bb69a14c8ca40ade6fbd06c5a746504a148b708c94d601a479f9a3  services/interviewer/telemetry.py
-A  +  273 -    0  5d4a49285d4378dbd1a37361438e7b3b5f84fc91a334f4564711b24085818f31  services/interviewer/types.py
-A  +  230 -    0  2f721527712985c9115aa8118a8d762f3cf95c5ea423f04904b41d9e9ac08125  services/interviewer/validate.py
-A  +  243 -    0  1059714e1fb4e77f46536df33f9deddc129750eb1ccb45df1fee88db338ceb96  tests/interviewer_fakes.py
+A  +  281 -    0  9da060878ff8173107e712f45fef95da8031ef6ec587a593cd5d003300ff33f9  services/interviewer/types.py
+A  +  279 -    0  46cfbfe168ffa0f41610c1eea99746867f84d392590d1f5f7a89ea9f34461814  services/interviewer/validate.py
+A  +  258 -    0  3eac2eb6e4d3c7c821f69cfeb3866aed436b11ab1d4940d1d4b761aaa58c12c1  tests/interviewer_fakes.py
 A  +  246 -    0  4fc141c9970681dc7dc29915b5531d0ff3ee75770987e248cdd70e0fd37b9526  tests/test_interviewer_brain_adversarial.py
-A  +  148 -    0  c11d1decc3849d7314e57b098933c36275c94cf3b2853a86bcb076dd1743b34c  tests/test_interviewer_brain_properties.py
+A  +  233 -    0  1cf64219511b83e5e4195ba6eea92022a8d9ca1d0a6e6d446c97761f9ec1505e  tests/test_interviewer_brain_contextual.py
+A  +  155 -    0  2039e087e8ca8b604fed1b83d89bb62ac2c96d5af834064d11f54cb300bdfffd  tests/test_interviewer_brain_properties.py
 A  +  246 -    0  b3a0c30ec30b94b7acaa7ef4e97c2069af09c25538d027e3ec9cc852a5915b29  tests/test_interviewer_brain_regression.py
 A  +  298 -    0  6326504d8c3dae416adb8e2df1f3d7184637e44b0a99423aadff667bc311773d  tests/test_interviewer_brain_routes.py
-A  +  410 -    0  bdd3732dd010e25ce710f2220cc231920968c1ca0f463ac1484ea200b54d53c1  tests/test_interviewer_brain_unit.py
+A  +  416 -    0  3738b80ccc8a5a173f6884b4b88803020e26996f35804966987c4034b774fe4f  tests/test_interviewer_brain_unit.py
 A  +  122 -    0  56e595e83130a2d4070ab3d138fc58b866d0eaaeedead67cacb540b773e7fe70  tools/brain_overhead_bench.py
 A  +  172 -    0  46295fe4f5008ede25affa755077b3f29b563e6528ecbc9607587a81e5d30af3  tools/e2e_voice_backend.py
 A  +  196 -    0  37909ee3a1227de2f021d7bcb1b4f18d065fba5663d21a6d572d50561d4a2487  tools/interviewer_chaos_sim.py
@@ -56,10 +57,10 @@ A  +  188 -    0  c28f9957963112373056c56f4b55e4bfe079c7d5e8a1b0737d8ae278d7e1ac
 A  +  277 -    0  8fee967265a189b4de911f1d08c282893dfd46b178465860a3018449264b611a  tools/interviewer_load_test.py
 A  +   81 -    0  bf759a257a1db5534a49a5ace21f3bb395d80f93b8d168014960572ad6023778  tools/text_latency_probe.py
 A  +  114 -    0  38e2376e2d28000708f2303fa80dc4d9cba05668e1060c027d3dfc3276f244ef  tools/voice_latency_report.py
-   52 files
+   53 files
 
-== frontend (consilio): branch feat/unified-interviewer-brain @ 7f8007e, base main @ a73be90
-A  +  126 -    0  b63846eeefefce87dd07576292a425a12dbf542c796047d042b658a2d6d9bab9  .brain/handoffs/ANTIGRAVITY_HANDOFF_unified-interviewer.md
+== frontend (consilio): branch feat/unified-interviewer-brain @ 39fc265, base main @ 2b8a8ba
+A  +  137 -    0  b71971bf1a7186532fb503c8e62ac35687384cb37aad9fb0212fafa37520dcb5  .brain/handoffs/ANTIGRAVITY_HANDOFF_unified-interviewer.md
 M  +   18 -    4  1073e1159aeb3d61f06451f33b7fcdfb309bcb6787fe0c23ff2acbfea1bebd4a  components/solve/ConversationalSolve.tsx
 M  +  108 -    1  eb0b05ef13013189de5626067ba871074d2ff035ea60a8ad93ea05c0345cd141  components/solve/VoiceInterview.tsx
 M  +  110 -   57  e1eb00e578245f7d4e8fe7547e180b2294bbeb82f01b8ab0073f79a9f938fb90  components/solve/VoiceInterviewRealtime.tsx
@@ -73,9 +74,9 @@ A  +   25 -    0  789698c7dc744b4064799a37779e60b5173e9030b0bddf9bc56d292825cf60
 A  +   38 -    0  6205c36b3910de397298c9113f8b99c62aacf8d656a04448383132957b81e0be  qa/e2e-voice/harness-entry.tsx
 A  +    3 -    0  d757ed7956f33af6cf76e088c772d86e3178e10076dcf7c95a6deab6a8ac226d  qa/e2e-voice/harness.html
 A  +   37 -    0  318eb705c8cfcc0285d4ec1ff498163961890260b4c626821bca6e607e407de0  qa/e2e-voice/make-speech-wav.cjs
-A  +  161 -    0  2e24d203487b77fa8a4bada2e228425fd340633ddea4035d5f8b27da0154001e  qa/e2e-voice/mock-realtime-server.cjs
+A  +  165 -    0  79839d46242b0ddddda961364416aceee9e3ff545ce9e9a866681a5dbbba739e  qa/e2e-voice/mock-realtime-server.cjs
 A  +  111 -    0  6a79f3ed20bea4809375f1bfb5ba26be006a54a69b5c4fbf4ba1bb29fb07a737  qa/e2e-voice/run-stt.cjs
-A  +  283 -    0  5dc2a76ce09f94964e149eb0b7331a57c9eb5842463a3e5d75d05011ecfa162a  qa/e2e-voice/run.cjs
+A  +  299 -    0  7d7bd221d55d11684a8b31f4a2a234753d6796e6d07c0a5bb5ff0bb69335ad67  qa/e2e-voice/run.cjs
 A  +   49 -    0  175600e79fbc319751a94eabe805ee1aef09c871c3e6eb8750443f576d1c6b00  qa/e2e-voice/stt-entry.tsx
 A  +    3 -    0  90c1839e30460a3563c3c952cacc7451c6915468fc7f8a392ea320d39d158aae  qa/e2e-voice/stt.html
 A  +   24 -    0  f7989fff68792aea3f0abbcfc1d32ae66512200f0f391d8f0bbac07f72043e40  qa/ts-register.cjs
