@@ -34,12 +34,13 @@ from services.session_signals import compute_signals
 # ---------------------------------------------------------------- the switch
 
 def voice_interviewer_mode(user_id: Optional[str], email: Optional[str]) -> str:
-    """'model_led' or 'renderer' (the current V11/V12 flow).
+    """'model_led' (default) or 'renderer' (the V11/V12 decide-every-turn flow).
 
-    VOICE_INTERVIEWER = renderer (default) | model_led | allowlist
-    VOICE_INTERVIEWER_ALLOWLIST = comma-separated emails or user ids (allowlist mode)
+    VOICE_INTERVIEWER = model_led (default) | renderer | allowlist
+    VOICE_INTERVIEWER_ALLOWLIST = comma-separated emails or user ids (allowlist mode:
+    listed users get model_led, everyone else renderer)
     """
-    mode = (os.getenv("VOICE_INTERVIEWER", "renderer") or "renderer").strip().lower()
+    mode = (os.getenv("VOICE_INTERVIEWER", "model_led") or "model_led").strip().lower()
     if mode == "model_led":
         return "model_led"
     if mode == "allowlist":

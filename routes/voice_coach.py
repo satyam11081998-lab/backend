@@ -72,7 +72,12 @@ def voice_coach(attempt_id: str, authorization: Optional[str] = Header(default=N
         if changed:
             v["coach_notes"] = notes
             _save_state(supabase, attempt_id, vc.with_voice_state(session_state, v))
-    instructions = build_voice_interviewer_instructions(llm_case_content(case), case.get("type") or "", notes)
+    from services.markets import case_market
+    from prompts.voice_renderer import strip_say_label
+    instructions = build_voice_interviewer_instructions(
+        llm_case_content(case), case.get("type") or "", notes, hint=case.get("hint"), solution=case.get("solution"),
+        transcript=[dict(t, content=strip_say_label(t.get("content") or "")) for t in transcript],
+        market=case_market(case))
     return {"changed": changed, "notes": notes, "instructions": instructions if changed else None}
 
 

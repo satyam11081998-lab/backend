@@ -3,7 +3,7 @@ Model-led realtime voice interviewer (VOICE_INTERVIEWER): the speech model
 converses by itself; the server coaches alongside.
 
 Proves, with fakes only (no network, no keys):
-  1. SWITCH    -- off by default; on for everyone, or only for an allowlist.
+  1. SWITCH    -- model-led by default; renderer (V11/V12 per turn) or an allowlist on request.
   2. SESSION   -- in model-led mode the realtime session carries the playbook +
                   case (never the solution), the hint/answer tools, and lets the
                   model answer by itself (create_response on, barge-in kept). The
@@ -132,7 +132,9 @@ class FakeDB:
 print("=" * 72)
 print("1. SWITCH")
 print("=" * 72)
-check("default: renderer (today's flow)", vc.voice_interviewer_mode("u1", "a@b.com") == "renderer")
+check("default: model-led (the realtime model converses)", vc.voice_interviewer_mode("u1", "a@b.com") == "model_led")
+os.environ["VOICE_INTERVIEWER"] = "renderer"
+check("VOICE_INTERVIEWER=renderer: back to V11/V12 deciding each turn", vc.voice_interviewer_mode("u1", "a@b.com") == "renderer")
 os.environ["VOICE_INTERVIEWER"] = "model_led"
 check("VOICE_INTERVIEWER=model_led: everyone", vc.voice_interviewer_mode("u9", None) == "model_led")
 os.environ["VOICE_INTERVIEWER"] = "allowlist"
@@ -191,28 +193,90 @@ def mint(env=None, state=None):
     return out, (_FakeAsyncClient.last or {}).get("session", {})
 
 
-out, sess = mint()
+out, sess = mint("renderer")
 td = sess["audio"]["input"]["turn_detection"]
-check("default session unchanged: renderer instructions, no tools, create_response off",
+check("renderer session unchanged: renderer instructions, no tools, create_response off, whisper-1",
       sess["instructions"] == VOICE_RENDERER_INSTRUCTIONS and "tools" not in sess and td["create_response"] is False
-      and out.get("interviewer") == "renderer", (out.get("interviewer"), td))
-out, sess = mint("model_led", state={"voice": {"coach_notes": ["They asked for help: call get_hint."]}})
+      and sess["audio"]["input"]["transcription"]["model"] == "whisper-1"
+      and out.get("interviewer") == "renderer" and out.get("open_first") is False, (out.get("interviewer"), td))
+
+HIST = [{"role": "user", "content": "Hi, I'd like to start with Chennai's households."},
+        {"role": "assistant", "content": "SAY: Sure, go ahead with households."}]
+
+
+def mint_with_history(env=None, state=None, history=HIST):
+    os.environ.pop("VOICE_INTERVIEWER", None)
+    if env:
+        os.environ["VOICE_INTERVIEWER"] = env
+    db = FakeDB(history, session_state=state)
+    rt.get_supabase_client = lambda: db
+    out = asyncio.run(rt.create_realtime_session(rt.RealtimeSessionRequest(case_id="c1", attempt_id="a1"),
+                                                 authorization="Bearer t"))
+    os.environ.pop("VOICE_INTERVIEWER", None)
+    return out, (_FakeAsyncClient.last or {}).get("session", {})
+
+
+out, sess = mint_with_history(state={"voice": {"coach_notes": ["They asked for help: call get_hint."]}})
 td = sess["audio"]["input"]["turn_detection"]
 ins = sess["instructions"]
-check("model-led: the model answers by itself, barge-in kept",
-      td["create_response"] is True and td["interrupt_response"] is True, td)
-check("model-led: playbook + case in the instructions", "Do NOT question every step" in ins and CASE_CONTENT in ins)
-check("model-led: the solution is NOT in the instructions",
-      "48,000" not in ins and SOLUTION[:40] not in ins and "16 lakh" not in ins)
-check("model-led: hint and answer tools offered",
-      [t["name"] for t in sess.get("tools", [])] == ["get_hint", "answer_request"] and sess.get("tool_choice") == "auto")
-check("model-led: notes already on the attempt carried into a new session", "They asked for help: call get_hint." in ins)
-check("model-led: response tells the client which interviewer it got", out.get("interviewer") == "model_led")
+check("default session is model-led: the model answers by itself, barge-in kept",
+      out.get("interviewer") == "model_led" and td["create_response"] is True and td["interrupt_response"] is True, td)
+check("model-led: replies are not held back (semantic_vad eagerness medium by default)", td.get("eagerness") == "medium", td)
+check("model-led: NO tools by default (a tool call is a round trip = lag)", "tools" not in sess, sess.get("tools"))
+check("model-led: the interviewer opens the call; per-turn coach off",
+      out.get("open_first") is True and out.get("coach") is False, out)
+check("prompt: the case sits on top", ins.startswith("=== THE CASE") and CASE_CONTENT in ins.split("===")[2])
+check("prompt: private notes carry the stored hint and model solution", HINT in ins and SOLUTION in ins)
+check("prompt: notes are marked never to be read out, answer only under the rule",
+      "never read these out" in ins and "ONLY under the ANSWER RULE" in ins)
+check("prompt: the conversation so far (chat -> voice) is carried over, without the SAY label",
+      "CANDIDATE: Hi, I'd like to start with Chennai's households." in ins
+      and "INTERVIEWER: Sure, go ahead with households." in ins and "SAY:" not in ins)
+check("prompt: coach notes are NOT added when the coach is off", "They asked for help: call get_hint." not in ins)
+check("prompt: playbook sits below the case", ins.index("=== THE CASE") < ins.index("=== HOW YOU RUN THIS"))
+for phrase in ("HOW A STRUCTURED THINKER WORKS A CASE", "MECE", "Guesstimate / market sizing", "Profitability",
+               "Market entry", "Sanity-check", "Pick up THEIR words", "question can come without a question mark",
+               "Do NOT question every step", "at most ONE question", "real talk", "CUE", "FRAMEWORK", "ANALOGY",
+               "results page", "Never say \"that's for you to figure out\"", "Natural Indian English"):
+    check(f"playbook states: {phrase!r}", phrase in ins)
+os.environ["VOICE_COACH"] = "on"
+out, sess = mint_with_history(state={"voice": {"coach_notes": ["They asked for help: call get_hint."]}})
+check("VOICE_COACH=on: coach notes join the prompt and the client is told to coach",
+      "They asked for help: call get_hint." in sess["instructions"] and out.get("coach") is True)
+os.environ.pop("VOICE_COACH")
+os.environ["VOICE_TOOLS"] = "on"
+out, sess = mint_with_history()
+check("VOICE_TOOLS=on: hint/answer tools offered (opt-in)", [t["name"] for t in sess.get("tools", [])] == ["get_hint", "answer_request"])
+os.environ.pop("VOICE_TOOLS")
+us = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate", market="US")
+check("US cases: American English, dollars", "Natural American English" in us and "lakh" not in us.split("TALKING IN REAL TIME")[1].split("\n")[3])
 
-base = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate")
-for phrase in ("results page", "answer_request", "get_hint", "Never refuse help", "At most ONE question",
-               "question may come without a question mark"):
-    check(f"playbook states: {phrase!r}", phrase in base)
+
+class _RejectThenOk:
+    calls = []
+
+    def __init__(self, *a, **k): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+    async def post(self, url, headers=None, json=None):
+        import copy
+        _RejectThenOk.calls.append(copy.deepcopy(json))
+        model = json["session"]["audio"]["input"]["transcription"]["model"]
+        r = _FakeResp()
+        if model != "whisper-1":
+            r = types.SimpleNamespace(status_code=400, text='{"error":"unknown model"}', json=lambda: {})
+        return r
+
+
+rt.httpx = types.SimpleNamespace(AsyncClient=_RejectThenOk)
+os.environ["REALTIME_TRANSCRIBE_MODEL"] = "gpt-live-transcribe"
+out, _ = mint_with_history()
+models = [c["session"]["audio"]["input"]["transcription"]["model"] for c in _RejectThenOk.calls]
+check("a rejected transcription model never takes voice down (retried with whisper-1)",
+      models == ["gpt-live-transcribe", "whisper-1"] and out.get("client_secret") == "ek_test", models)
+os.environ.pop("REALTIME_TRANSCRIBE_MODEL")
+rt.httpx = types.SimpleNamespace(AsyncClient=_FakeAsyncClient)
 
 print()
 print("=" * 72)
@@ -336,8 +400,9 @@ app.include_router(rvc.router)
 client = TestClient(app)
 H = {"Authorization": "Bearer t"}
 
+os.environ["VOICE_INTERVIEWER"] = "renderer"
 r = client.post("/attempts/a1/voice-coach", headers=H)
-check("switch off -> 409 (routes are inert)", r.status_code == 409, r.status_code)
+check("renderer mode -> 409 (routes are inert)", r.status_code == 409, r.status_code)
 os.environ["VOICE_INTERVIEWER"] = "allowlist"
 os.environ["VOICE_INTERVIEWER_ALLOWLIST"] = "owner@example.com"
 
@@ -347,7 +412,8 @@ j = r.json()
 check("/voice-coach: notes + refreshed instructions when they change",
       r.status_code == 200 and j["changed"] and vc.NOTE_ASKED_HELP in j["notes"]
       and vc.NOTE_ASKED_HELP in (j["instructions"] or "") and CASE_CONTENT in j["instructions"], j)
-check("/voice-coach: refreshed instructions never carry the solution", "48,000" not in (j["instructions"] or ""))
+check("/voice-coach: refreshed instructions are the full prompt (case on top, notes, history)",
+      (j["instructions"] or "").startswith("=== THE CASE") and "CANDIDATE: I'm stuck" in (j["instructions"] or ""))
 check("/voice-coach: notes saved on the attempt", DB.state().get("voice", {}).get("coach_notes") == j["notes"])
 r = client.post("/attempts/a1/voice-coach", headers=H)
 check("/voice-coach: same notes again -> changed false, no instructions resent",

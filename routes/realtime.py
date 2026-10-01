@@ -15,6 +15,7 @@ from services.realtime_credits import has_credit, get_balance
 from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS
 from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions, VOICE_TOOLS
 from services.voice_coach import voice_interviewer_mode, voice_state
+from prompts.voice_renderer import strip_say_label
 
 load_dotenv()
 
@@ -74,7 +75,14 @@ REALTIME_SEMANTIC_EAGERNESS = os.getenv("REALTIME_SEMANTIC_EAGERNESS", "low")
 REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
 
 
-def build_turn_detection(create_response: bool = False) -> dict:
+# Model-led sessions answer by themselves, so how long semantic_vad waits after
+# the candidate stops IS the reply latency. "medium" is OpenAI's default (and
+# ChatGPT-voice-like); "low" waits longest (more room for thinking pauses);
+# "high" answers fastest.
+REALTIME_MODEL_LED_EAGERNESS = os.getenv("REALTIME_MODEL_LED_EAGERNESS", "medium")
+
+
+def build_turn_detection(create_response: bool = False, eagerness: Optional[str] = None) -> dict:
     """Turn-detection config for the realtime session, chosen by REALTIME_TURN_MODE.
 
     Default is semantic_vad (words-based end-of-turn); server_vad (fixed silence)
@@ -91,7 +99,7 @@ def build_turn_detection(create_response: bool = False) -> dict:
     if REALTIME_TURN_MODE == "semantic_vad":
         return {
             "type": "semantic_vad",
-            "eagerness": REALTIME_SEMANTIC_EAGERNESS,
+            "eagerness": eagerness or REALTIME_SEMANTIC_EAGERNESS,
             "create_response": create_response,
             "interrupt_response": True,
         }
@@ -198,28 +206,43 @@ async def create_realtime_session(
 
     interviewer = voice_interviewer_mode(uid, getattr(user_obj, "email", None))
     tools_cfg: dict = {}
+    coach_on = False
     if interviewer == "model_led":
-        # The model IS the interviewer: playbook + case (never the solution) +
-        # the coach notes already on this attempt; tools for hints and the answer.
-        from services.markets import llm_case_content
+        # The model IS the interviewer and nothing sits between the candidate and
+        # its reply: everything it needs is in this one prompt - the case on top,
+        # private notes (hint + model solution), the conversation so far (they may
+        # have started in chat), and the common structured-thinking playbook.
+        # No tools by default: a tool call is a round trip, i.e. lag.
+        from services.markets import llm_case_content, case_market
         row = case.data[0]
-        notes = []
+        notes, history = [], []
         if body.attempt_id:
             try:
                 att = (supabase.table("attempts").select("user_id, session_state")
                        .eq("id", body.attempt_id).limit(1).execute())
                 if att.data and att.data[0].get("user_id") == uid:
                     notes = voice_state(att.data[0].get("session_state")).get("coach_notes") or []
-            except Exception as e:  # noqa: BLE001 -- notes are a nicety, never a blocker
-                print(f"[realtime] coach notes not read: {type(e).__name__}")
-        instructions = build_voice_interviewer_instructions(llm_case_content(row), row.get("type") or "", notes)
-        tools_cfg = {"tools": VOICE_TOOLS, "tool_choice": "auto"}
+                    msgs = (supabase.table("attempt_messages").select("role, content, created_at")
+                            .eq("attempt_id", body.attempt_id).order("created_at", desc=False).execute())
+                    history = [m for m in (msgs.data or []) if m.get("role") in ("user", "assistant")]
+            except Exception as e:  # noqa: BLE001 -- context is a nicety, never a blocker
+                print(f"[realtime] attempt context not read: {type(e).__name__}")
+        coach_on = os.getenv("VOICE_COACH", "off").strip().lower() in ("1", "on", "true", "yes")
+        instructions = build_voice_interviewer_instructions(
+            llm_case_content(row), row.get("type") or "", notes if coach_on else None,
+            hint=row.get("hint"), solution=row.get("solution"),
+            transcript=[dict(m, content=strip_say_label(m.get("content") or "")) for m in history],
+            market=case_market(row))
+        if os.getenv("VOICE_TOOLS", "off").strip().lower() in ("1", "on", "true", "yes"):
+            tools_cfg = {"tools": VOICE_TOOLS, "tool_choice": "auto"}
     else:
         # The realtime model is a voice only: V11 decides every interviewer turn via
         # /attempts/{id}/voice-decision, so no interviewer prompt or case content
         # goes into this session (see prompts/voice_renderer.py).
         instructions = VOICE_RENDERER_INSTRUCTIONS
 
+    model_led = interviewer == "model_led"
+    transcribe_model = (os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1") or "whisper-1").strip()
     payload = {
         "session": {
             "type": "realtime",
@@ -233,8 +256,10 @@ async def create_realtime_session(
                     # that was the #1 cause of the interviewer interrupting and
                     # repeating itself. See build_turn_detection() and the
                     # REALTIME_TURN_MODE note above; barge-in stays on.
-                    "turn_detection": build_turn_detection(create_response=(interviewer == "model_led")),
-                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": build_turn_detection(
+                        create_response=model_led,
+                        eagerness=(REALTIME_MODEL_LED_EAGERNESS if model_led else None)),
+                    "transcription": {"model": transcribe_model},
                 },
                 "output": {"voice": REALTIME_VOICE},
             },
@@ -252,6 +277,16 @@ async def create_realtime_session(
                 },
                 json=payload,
             )
+            if res.status_code in (400, 422) and transcribe_model != "whisper-1":
+                # A transcription model the account or API does not accept must
+                # never take voice down: retry once with the known-good one.
+                print(f"[realtime] transcription model {transcribe_model!r} rejected; retrying with whisper-1")
+                payload["session"]["audio"]["input"]["transcription"] = {"model": "whisper-1"}
+                res = await client.post(
+                    CLIENT_SECRETS_URL,
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json=payload,
+                )
         latency_ms = int((time.time() - t0) * 1000)
 
         if res.status_code >= 400:
@@ -286,6 +321,10 @@ async def create_realtime_session(
             # "renderer" = V11/V12 decides each turn (default); "model_led" = the
             # model converses, steered by /voice-coach and /voice-tool.
             "interviewer": interviewer,
+            # Model-led: the interviewer opens the call itself; per-turn coaching
+            # is off unless VOICE_COACH=on (it is async, but the prompt does the work).
+            "open_first": model_led,
+            "coach": bool(model_led and coach_on),
         }
 
     except HTTPException:

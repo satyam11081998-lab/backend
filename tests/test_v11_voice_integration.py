@@ -393,7 +393,11 @@ rt.get_ai_input_quota = lambda sb, uid: {"tier": "pro"}
 rt.has_credit = lambda *a, **k: True
 rt.get_balance = lambda *a, **k: {"total_remaining": 10}
 rt.log_ai_usage = lambda **k: None
+# These checks cover the renderer interviewer (V11/V12 decides every turn). Since
+# 2026-10-02 realtime defaults to the model-led interviewer (tests/test_voice_model_led.py).
+os.environ["VOICE_INTERVIEWER"] = "renderer"
 out = asyncio.run(rt.create_realtime_session(rt.RealtimeSessionRequest(case_id="c1", attempt_id="a1"), authorization="Bearer t"))
+os.environ.pop("VOICE_INTERVIEWER")
 sess = (_FakeAsyncClient.last or {}).get("session", {})
 td = sess.get("audio", {}).get("input", {}).get("turn_detection", {})
 check("OpenAI session minted", out.get("client_secret") == "ek_test")
