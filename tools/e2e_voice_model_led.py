@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 import routes.attempts as att  # noqa: E402
 import routes.realtime as rt  # noqa: E402
 import routes.voice_coach as rvc  # noqa: E402
+import routes.realtime_gemini as rtg  # noqa: E402
 import services.ai_providers as ap  # noqa: E402
 import services.ai_usage as au  # noqa: E402
 
@@ -118,7 +119,16 @@ class HintModel:
         return types.SimpleNamespace(choices=[_Choice(text)], usage=None, id="fake")
 
 
-def build_app(mock_url: str) -> FastAPI:
+class _FakeTokens:
+    def create(self, config):
+        _GEMINI["last_config"] = config
+        return types.SimpleNamespace(name="auth_tokens/e2e")
+
+
+_GEMINI: dict = {}
+
+
+def build_app(mock_url: str, gemini_ws: str = "ws://127.0.0.1:8768") -> FastAPI:
     user = types.SimpleNamespace(id="u1", email="owner@example.com", is_anonymous=False)
     for mod in (att, rt, rvc):
         mod.get_supabase_client = lambda: DBI
@@ -141,12 +151,38 @@ def build_app(mock_url: str) -> FastAPI:
     rt.CLIENT_SECRETS_URL = f"{mock_url}/v1/realtime/client_secrets"
     ap.openai_client = lambda: HintModel()
     au.log_ai_usage = lambda **k: None
+    # Gemini Live: same real route, token minted by a fake SDK, socket to the mock.
+    fake_genai = types.ModuleType("google.genai")
+    fake_genai.Client = lambda api_key=None: types.SimpleNamespace(auth_tokens=_FakeTokens())
+    import google
+    sys.modules["google.genai"] = fake_genai
+    google.genai = fake_genai
+    rtg.GEMINI_API_KEY = "test"
+    rtg.WS_BASE = gemini_ws
+    rtg._resolve_live_model = lambda: "fake-live"
+    rtg.get_supabase_client = lambda: DBI
+    rtg.get_verified_user = lambda sb, a: ("u1", user)
+    rtg.is_guest_user = lambda u: False
+    rtg.check_rate_limit = lambda *a, **k: None
+    rtg.assert_daily_budget = lambda *a, **k: None
+    rtg.get_ai_input_quota = lambda sb, uid: {"tier": "pro"}
+    rtg.has_credit = lambda *a, **k: True
+    rtg.get_balance = lambda *a, **k: {"total_remaining": 30}
+    rtg.log_ai_usage = lambda **k: None
+    rtg.deduct_credit = lambda *a, **k: None
 
     app = FastAPI()
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
     app.include_router(rt.router, prefix="/realtime")
     app.include_router(att.router)
     app.include_router(rvc.router)
+    app.include_router(rtg.router, prefix="/realtime-gemini")
+
+    @app.get("/__e2e/gemini")
+    def gemini_cfg():
+        cfg = ((_GEMINI.get("last_config") or {}).get("live_connect_constraints") or {}).get("config") or {}
+        return {"system_instruction": cfg.get("system_instruction"),
+                "response_modalities": cfg.get("response_modalities")}
 
     @app.get("/__e2e/db")
     def dump():
@@ -167,5 +203,6 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--mock", default="http://127.0.0.1:8766")
+    p.add_argument("--gemini-ws", default="ws://127.0.0.1:8768")
     a = p.parse_args()
-    uvicorn.run(build_app(a.mock), host="127.0.0.1", port=a.port, log_level="warning")
+    uvicorn.run(build_app(a.mock, a.gemini_ws), host="127.0.0.1", port=a.port, log_level="warning")

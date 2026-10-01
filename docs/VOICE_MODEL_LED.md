@@ -1,4 +1,8 @@
-# Realtime voice interviewer — prompt-led (default since 2026-10-02)
+# Realtime voice interviewer — live, prompt-led (default since 2026-10-02)
+
+**Nothing to set.** Both live voice transports are live by default: whichever the admin voice mode
+is — `gemini` (Gemini Live) or `realtime` (OpenAI Realtime) — the speech model is the interviewer
+and talks to the candidate directly, speech to speech. No Render variable is needed.
 
 ## What it is
 
@@ -33,6 +37,12 @@ candidate has asked for it** is cut (`response.cancel` + `output_audio_buffer.cl
 back to a framework. Once they have asked, it never cuts (their transcript can land after the
 model has started speaking).
 
+**Gemini Live** (`routes/realtime_gemini.py`, `components/solve/VoiceInterviewGemini.tsx`): the
+same prompt is pinned into the session token as `system_instruction` (never sent to the browser);
+the client opens the call with one text turn, plays Gemini's own audio as it streams, shows and
+saves both transcripts in speaking order (`lib/voice/gemini-live.ts`), stops the voice on
+barge-in, and applies the same answer guardrail (cut, then steer once the cut turn ends).
+
 Unchanged: transcript saving (`/realtime-turn`, same rows for scoring), C9 counting, credits and
 metering, scoring and the results page. Gemini and the standard (pipeline) voice are not affected.
 
@@ -40,9 +50,9 @@ metering, scoring and the results page. Gemini and the standard (pipeline) voice
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `VOICE_INTERVIEWER` | `model_led` | `renderer` = back to V11/V12 deciding every turn (the old flow); `allowlist` = model-led only for `VOICE_INTERVIEWER_ALLOWLIST` |
+| `VOICE_INTERVIEWER` | `model_led` | applies to OpenAI Realtime AND Gemini Live. `renderer` = back to V11/V12 deciding every turn (the old transcribe → decide → read-out flow); `allowlist` = live only for `VOICE_INTERVIEWER_ALLOWLIST` |
 | `REALTIME_MODEL_LED_EAGERNESS` | `medium` | `high` answers sooner after the candidate stops; `low` waits longest (more room for thinking pauses) |
-| `REALTIME_TRANSCRIBE_MODEL` | `whisper-1` | candidate transcription (does NOT affect reply speed — the model hears the audio). Set `gpt-live-transcribe` for a live transcript; if the API rejects it the session retries with `whisper-1` automatically |
+| `REALTIME_TRANSCRIBE_MODEL` | `gpt-4o-mini-transcribe` (live OpenAI sessions) / `whisper-1` (renderer) | candidate transcription on OpenAI Realtime; streams the words as they are spoken. It does NOT affect reply speed (the model hears the audio). If the API rejects the model, the session retries with `whisper-1` automatically. Gemini Live transcribes natively |
 | `VOICE_COACH` | `off` | `on` = after each turn the server's learner read adds notes to the prompt (async) |
 | `VOICE_TOOLS` | `off` | `on` = offer `get_hint` / `answer_request` server tools (adds a round trip when used) |
 
@@ -51,6 +61,11 @@ metering, scoring and the results page. Gemini and the standard (pipeline) voice
 - Backend: `python -m tests.test_voice_model_led` (session payload, prompt order and contents,
   history carry-over, coach/tools opt-in, transcription fallback, coach and tool routes).
 - Frontend: `node --test qa/voice/model-led.test.cjs`, `npx tsc --noEmit`, `next build`.
-- Browser E2E: `qa/e2e-voice/run-model-led.cjs` — real component, headless Chromium, real WebRTC
-  to a mock realtime peer, real backend routes in memory: 16/16, three runs.
+- Browser E2E: `qa/e2e-voice/run-model-led.cjs` (OpenAI: real WebRTC to a mock realtime peer) 16/16,
+  and `qa/e2e-voice/run-gemini-live.cjs` (Gemini: real WebSocket to a mock Gemini Live server,
+  real `/realtime-gemini/session`) 13/13, three runs each.
+- Known trade-off: on OpenAI Realtime the browser receives the session instructions (with the
+  private notes) in its `session.created` event, so a determined user could read the model
+  solution in devtools; Gemini keeps them inside the token. The solution is shown on the results
+  page anyway.
 - NOT verified: the real model's conversation quality and latency with this prompt.

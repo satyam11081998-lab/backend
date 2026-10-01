@@ -11,8 +11,10 @@ Credit-gated exactly like OpenAI realtime. Deduction is by elapsed conversation
 SECONDS (Gemini Live is priced per-minute of audio), reported by the client to
 /realtime-gemini/usage as it runs and on close.
 
-NON-DEFAULT: reached only when the admin sets voice_mode = "gemini". Until then
-nothing here runs, so it cannot disturb the pipeline or OpenAI realtime modes.
+Reached when the admin sets voice_mode = "gemini". Since 2026-10-02 the session is
+LIVE by default: Gemini is the interviewer (prompts/voice_interviewer_playbook.py)
+and answers the candidate directly; VOICE_INTERVIEWER=renderer restores the old
+V11-decides-every-turn flow.
 """
 
 import os
@@ -30,7 +32,9 @@ from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance, deduct as deduct_credit
-from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS
+from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS, strip_say_label
+from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions
+from services.voice_coach import voice_interviewer_mode
 
 load_dotenv()
 
@@ -125,15 +129,37 @@ def create_gemini_session(
             detail="You're out of real-time interview minutes. Buy a minute pack, or use the standard voice mode — it's unlimited on Pro.",
         )
 
-    case = supabase.table("cases").select("id, title, type, content").eq("id", body.case_id).limit(1).execute()
+    case = supabase.table("cases").select("*").eq("id", body.case_id).limit(1).execute()
     if not case.data:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    # Gemini Live is only the interviewer's VOICE: V11 decides every turn via
-    # /attempts/{id}/voice-decision and the browser sends the approved line as
-    # "SAY: ...". No interviewer prompt or case content goes into this session
-    # (see prompts/voice_renderer.py).
-    instructions = VOICE_RENDERER_INSTRUCTIONS
+    interviewer = voice_interviewer_mode(uid, getattr(user_obj, "email", None))
+    if interviewer == "model_led":
+        # LIVE (default): Gemini IS the interviewer and answers the candidate in its
+        # own voice straight away. Everything it needs is pinned into the session
+        # here: the case on top, private notes (hint + model solution), the
+        # conversation so far (chat -> voice), and the structured-thinking playbook.
+        from services.markets import llm_case_content, case_market
+        row = case.data[0]
+        history = []
+        if body.attempt_id:
+            try:
+                att = (supabase.table("attempts").select("user_id").eq("id", body.attempt_id).limit(1).execute())
+                if att.data and att.data[0].get("user_id") == uid:
+                    msgs = (supabase.table("attempt_messages").select("role, content, created_at")
+                            .eq("attempt_id", body.attempt_id).order("created_at", desc=False).execute())
+                    history = [dict(m, content=strip_say_label(m.get("content") or ""))
+                               for m in (msgs.data or []) if m.get("role") in ("user", "assistant")]
+            except Exception as e:  # noqa: BLE001 -- context is a nicety, never a blocker
+                print(f"[gemini-rt] attempt context not read: {type(e).__name__}")
+        instructions = build_voice_interviewer_instructions(
+            llm_case_content(row), row.get("type") or "", None,
+            hint=row.get("hint"), solution=row.get("solution"), transcript=history, market=case_market(row))
+    else:
+        # RENDERER (VOICE_INTERVIEWER=renderer): Gemini is only the interviewer's
+        # VOICE: V11 decides every turn via /attempts/{id}/voice-decision and the
+        # browser sends the approved line as "SAY: ...".
+        instructions = VOICE_RENDERER_INSTRUCTIONS
 
     now = datetime.datetime.now(tz=datetime.timezone.utc)
     # Ephemeral token WITH constraints, minted via the google-genai SDK. Ephemeral
@@ -180,18 +206,21 @@ def create_gemini_session(
         log_ai_usage(
             user_id=uid, endpoint="/realtime-gemini/session", model=GEMINI_LIVE_MODEL,
             audio_minutes=0, latency_ms=int((time.time() - t0) * 1000), success=True,
-            meta={"case_id": body.case_id, "attempt_id": body.attempt_id},
+            meta={"case_id": body.case_id, "attempt_id": body.attempt_id, "interviewer": interviewer},
         )
         return {
             "token": token_name,
             "ws_url": f"{WS_BASE}?access_token={token_name}",
             "model": f"models/{model_id}",
             "voice": GEMINI_LIVE_VOICE,
-            "instructions": instructions,
             # Exact setup the browser should send. Constraints supply the config, so
             # this stays minimal; kept here so it is tunable without a UI redeploy.
             "setup": {"model": f"models/{model_id}"},
             "credits": get_balance(supabase, uid, quota["tier"]),
+            # "model_led" = live speech-to-speech interviewer (default);
+            # "renderer" = V11 decides each turn and Gemini says the line.
+            "interviewer": interviewer,
+            "open_first": interviewer == "model_led",
         }
     except HTTPException:
         raise

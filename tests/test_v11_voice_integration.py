@@ -435,7 +435,9 @@ rtg.has_credit = lambda *a, **k: True
 rtg.get_balance = lambda *a, **k: {"total_remaining": 10}
 rtg.log_ai_usage = lambda **k: None
 rtg._resolve_live_model = lambda: "fake-live"
+os.environ["VOICE_INTERVIEWER"] = "renderer"  # these checks cover the renderer flow (live is the default)
 _res = rtg.create_gemini_session(rtg.GeminiSessionRequest(case_id="c1", attempt_id="a1"), authorization="Bearer t")
+os.environ.pop("VOICE_INTERVIEWER")
 out = asyncio.run(_res) if asyncio.iscoroutine(_res) else _res  # sync handler since the speed pass
 cfg = ((captured.get("config") or {}).get("live_connect_constraints") or {}).get("config") or {}
 check("Gemini session minted", out.get("token") == "auth_tokens/test")

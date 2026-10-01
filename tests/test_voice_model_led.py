@@ -223,6 +223,8 @@ check("default session is model-led: the model answers by itself, barge-in kept"
       out.get("interviewer") == "model_led" and td["create_response"] is True and td["interrupt_response"] is True, td)
 check("model-led: replies are not held back (semantic_vad eagerness medium by default)", td.get("eagerness") == "medium", td)
 check("model-led: NO tools by default (a tool call is a round trip = lag)", "tools" not in sess, sess.get("tools"))
+check("model-led: streaming transcription model by default (live transcript)",
+      sess["audio"]["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe", sess["audio"]["input"]["transcription"])
 check("model-led: the interviewer opens the call; per-turn coach off",
       out.get("open_first") is True and out.get("coach") is False, out)
 check("prompt: the case sits on top", ins.startswith("=== THE CASE") and CASE_CONTENT in ins.split("===")[2])
@@ -277,6 +279,64 @@ check("a rejected transcription model never takes voice down (retried with whisp
       models == ["gpt-live-transcribe", "whisper-1"] and out.get("client_secret") == "ek_test", models)
 os.environ.pop("REALTIME_TRANSCRIBE_MODEL")
 rt.httpx = types.SimpleNamespace(AsyncClient=_FakeAsyncClient)
+
+print()
+print("=" * 72)
+print("2b. GEMINI LIVE SESSION (the admin's current voice mode)")
+print("=" * 72)
+import routes.realtime_gemini as rtg  # noqa: E402
+_gcap = {}
+
+
+class _FakeTokens:
+    def create(self, config):
+        _gcap["config"] = config
+        return types.SimpleNamespace(name="auth_tokens/test")
+
+
+import types as _types  # noqa: E402
+_fake_genai = _types.ModuleType("google.genai")
+_fake_genai.Client = lambda api_key=None: types.SimpleNamespace(auth_tokens=_FakeTokens())
+import google  # noqa: E402
+sys.modules["google.genai"] = _fake_genai
+google.genai = _fake_genai
+rtg.GEMINI_API_KEY = "test"
+rtg.get_verified_user = lambda sb, a: ("u1", types.SimpleNamespace(id="u1", email="owner@example.com", is_anonymous=False))
+rtg.is_guest_user = lambda u: False
+rtg.check_rate_limit = lambda *a, **k: None
+rtg.assert_daily_budget = lambda *a, **k: None
+rtg.get_ai_input_quota = lambda sb, uid: {"tier": "pro"}
+rtg.has_credit = lambda *a, **k: True
+rtg.get_balance = lambda *a, **k: {"total_remaining": 10}
+rtg.log_ai_usage = lambda **k: None
+rtg._resolve_live_model = lambda: "fake-live"
+
+
+def gmint(env=None, history=HIST):
+    os.environ.pop("VOICE_INTERVIEWER", None)
+    if env:
+        os.environ["VOICE_INTERVIEWER"] = env
+    db = FakeDB(history)
+    rtg.get_supabase_client = lambda: db
+    out = rtg.create_gemini_session(rtg.GeminiSessionRequest(case_id="c1", attempt_id="a1"), authorization="Bearer t")
+    os.environ.pop("VOICE_INTERVIEWER", None)
+    cfg = ((_gcap.get("config") or {}).get("live_connect_constraints") or {}).get("config") or {}
+    return out, cfg
+
+
+gout, gcfg = gmint()
+gins = gcfg.get("system_instruction") or ""
+check("Gemini default is LIVE: interviewer=model_led, opens the call", gout.get("interviewer") == "model_led" and gout.get("open_first") is True, gout)
+check("Gemini live: the session prompt is the playbook with the case on top",
+      gins.startswith("=== THE CASE") and CASE_CONTENT in gins and "HOW A STRUCTURED THINKER" in gins)
+check("Gemini live: private notes + conversation so far (no SAY label)",
+      SOLUTION in gins and "CANDIDATE: Hi, I'd like to start" in gins and "SAY:" not in gins)
+check("Gemini live: still speech-to-speech with both transcripts streaming",
+      gcfg.get("response_modalities") == ["AUDIO"] and "input_audio_transcription" in gcfg and "output_audio_transcription" in gcfg)
+check("Gemini: the prompt (with private notes) is never sent back to the browser", "instructions" not in gout)
+gout, gcfg = gmint("renderer")
+check("Gemini VOICE_INTERVIEWER=renderer: old flow (voice-renderer instructions)",
+      gcfg.get("system_instruction") == VOICE_RENDERER_INSTRUCTIONS and gout.get("interviewer") == "renderer")
 
 print()
 print("=" * 72)

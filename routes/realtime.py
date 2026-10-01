@@ -242,7 +242,12 @@ async def create_realtime_session(
         instructions = VOICE_RENDERER_INSTRUCTIONS
 
     model_led = interviewer == "model_led"
-    transcribe_model = (os.getenv("REALTIME_TRANSCRIBE_MODEL", "whisper-1") or "whisper-1").strip()
+    # Live (model-led) sessions use a streaming transcription model so the
+    # candidate's words appear as they speak; transcription never delays a reply
+    # (the model hears the audio itself). If the API rejects the model, the mint
+    # below retries with whisper-1, so voice can never break over this.
+    transcribe_model = (os.getenv("REALTIME_TRANSCRIBE_MODEL")
+                        or ("gpt-4o-mini-transcribe" if model_led else "whisper-1")).strip()
     payload = {
         "session": {
             "type": "realtime",
