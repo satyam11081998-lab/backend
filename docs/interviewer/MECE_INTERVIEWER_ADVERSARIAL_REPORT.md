@@ -65,6 +65,7 @@ state passes `validate_state`; no refusal or leak text reaches the candidate.
 | Run | Sequences × turns | Requests | Duplicate turn ids sent | HTTP | Violations | Wall time |
 |---|---|---|---|---|---|---|
 | **final** (seed 20260929, rebased code, deterministic harness) | 3,000 × 25 | 75,000 | 8,560 | 72,864 × 200, 2,136 × 502 (injected provider failure / empty output on `/voice-decision`) | **0** | 230.2 s; re-run on the final tip: identical counts, 225.2 s |
+| **2026-10-01** (contextual presence + `main` merged) | 3,000 × 25 | 75,000 | 8,560 | 72,864 × 200, 2,136 × 502 | **0** | 230.8 s; 522 structure turns now REFLECT_PROGRESS; 159 of them fell back to the plain hand-back under injected faults (36 provider errors, 123 empty/invalid model output) — none surfaced as an error |
 | earlier full runs (same seed; before the rebase, and before the case-cache reset) | 3,000 × 25 | 75,000 each | 8,560 | 72,860 / 72,877 × 200 | **0** | 229.8 s / 231.7 s |
 | scaling check (seed 3) | 400 × 25 | 10,000 | — | — | **0** | 29.8 s |
 | smoke (seed 1) | 50 × 25 | 1,250 | 157 | 1,218 × 200, 32 × 502 | **0** | 5.6 s |

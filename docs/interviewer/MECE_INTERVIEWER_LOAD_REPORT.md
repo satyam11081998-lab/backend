@@ -1,6 +1,6 @@
 # MECE Interviewer — Load & Concurrency Report
 
-Date: 2026-09-30. Tool: `python -m tools.interviewer_load_test`. **Local only** — nothing was sent
+Date: 2026-10-01. Tool: `python -m tools.interviewer_load_test`. **Local only** — nothing was sent
 to production, Supabase or any provider (no authorization was given for production load tests,
 and none was attempted).
 
@@ -28,15 +28,18 @@ decision for VOICE. Substantive includes the simulated 650 ms model.
 
 | concurrent candidates | requests | throughput (req/s) | NO_OUTPUT P50 / P95 (ms) | PRESENCE P50 / P95 | SUBSTANTIVE P50 / P95 | event-loop ping P50 / P95 / max | errors | isolation | duplicate rows | server RSS |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 5 | 50 | 9.4 | 4.1 / 7.6 | 4.1 / 5.8 | 658 / 680 | 1.5 / 2.4 / 71 | 0 | OK | 0 | 95 MB |
-| 10 | 100 | 19.0 | 3.9 / 22.6 | 3.8 / 24.9 | 654 / 678 | 1.5 / 1.8 / 10 | 0 | OK | 0 | 96 MB |
-| 25 | 250 | 43.3 | 4.4 / 65.7 | 3.8 / 6.8 | 655 / 706 | 1.8 / 3.0 / 18 | 0 | OK | 0 | 98 MB |
-| 50 | 500 | 80.5 | 7.0 / 123 | 5.7 / 14.5 | 656 / 762 | 2.7 / 7.0 / 34 | 0 | OK | 0 | 103 MB |
-| 100 | 1,000 | 85.6 | 352 / 2,697 | 62 / 1,075 | 716 / 2,315 | 5.5 / 181 / 2,944 | 0 | OK | 0 | 111 MB |
+| 5 | 50 | 9.5 | 4.9 / 10.5 | 4.4 / 7.2 | 656 / 683 | 2.0 / 2.8 / 77 | 0 | OK | 0 | 95 MB |
+| 10 | 100 | 19.0 | 4.6 / 24.5 | 4.1 / 25.5 | 655 / 680 | 2.0 / 2.6 / 11 | 0 | OK | 0 | 96 MB |
+| 25 | 250 | 43.2 | 4.9 / 65.0 | 4.5 / 8.8 | 655 / 715 | 2.3 / 3.6 / 20 | 0 | OK | 0 | 99 MB |
+| 50 | 500 | 79.7 | 9.1 / 138 | 6.4 / 16.4 | 657 / 763 | 3.2 / 8.4 / 39 | 0 | OK | 0 | 104 MB |
+| 100 | 1,000 | 88.1 | 351 / 2,540 | 67 / 841 | 721 / 2,555 | 5.9 / 348 / 2,492 | 0 | OK | 0 | 112 MB |
 
-Final run on the final branch tip (`--port 8794`). Two earlier identical runs (before the rebase,
-and after it) gave the same picture within noise (50 candidates: NO_OUTPUT P95 113–123 ms,
-SUBSTANTIVE P95 741–747 ms; 100 candidates: NO_OUTPUT P95 2.8–2.9 s).
+Final run on 2026-10-01 after the contextual-presence change and the merge of `main`
+(`--port 8795`). The load script's turns contain no finished structures, so this mostly measures
+the routes and fixed beats; the contextual beats' only extra cost is one model call, i.e. the same
+cost profile as the SUBSTANTIVE column. Three earlier identical runs (2026-09-30, before and after
+the rebase) gave the same picture within noise (50 candidates: NO_OUTPUT P95 113–138 ms,
+SUBSTANTIVE P95 741–763 ms; 100: NO_OUTPUT P95 2.5–2.9 s).
 
 Same levels with **120 worker threads** (`--threadpool 120`):
 
@@ -53,7 +56,7 @@ reason the tool changed.
 ## 3. Reading the numbers
 
 - **Up to 50 aggressive concurrent candidates on 2 vCPUs:** silence and presence answer in
-  single-digit milliseconds at P50 and ≤ 125 ms at P95; substantive turns add ≤ ~110 ms at P95 on
+  single-digit milliseconds at P50 and ≤ 140 ms at P95; substantive turns add ≤ ~110 ms at P95 on
   top of the model's own time; the event loop stays responsive; zero errors, zero cross-attempt
   leakage, zero duplicate rows. VERIFIED (locally, with a simulated provider).
 - **At 100 the box saturates at ~76–88 requests/s** (CPU: both processes share 2 vCPUs). Latency

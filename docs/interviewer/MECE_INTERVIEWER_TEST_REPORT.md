@@ -1,8 +1,9 @@
 # MECE Interviewer — Test Report (summary of all evidence)
 
-Date: 2026-09-30. Branches `feat/unified-interviewer-brain` in both repos, rebased onto
-backend `main` `9e009c5` and frontend `main` `a73be90`. Everything below was run on the rebased
-code unless marked otherwise.
+Date: 2026-10-01. Branches `feat/unified-interviewer-brain` in both repos, with `main` merged in
+(backend `main` `8c6530f`, frontend `main` `2b8a8ba`, both merged without conflicts). Everything
+below was run on that code, including the contextual-presence change (function first, then
+model-worded beats from a JSON control packet) added the same day.
 
 Labels: **VERIFIED** — reproduced here by a test or run; **PARTIALLY VERIFIED** — verified with
 fakes or mocks standing in for a provider or the browser's far end; **UNVERIFIED** — could not be
@@ -17,19 +18,20 @@ measured here (no network route to OpenAI/Groq/Supabase, no keys, no physical de
 | 3 | Named regressions (§57 A–L, invariants 1–10) | see the regression report | `pytest tests/test_interviewer_brain_regression.py` | 47 passed | VERIFIED |
 | 4 | Property-based (hypothesis, 400 examples each) | well-formed decisions for any text; invariants 2–6; state machine for any sequence; validator contract | `pytest tests/test_interviewer_brain_properties.py` | 9 passed | VERIFIED |
 | 5 | Diversified / adversarial | 17 case types, 6 personas, linguistic/numeric/emotional/noise diversity, 50-turn drift, transition graph, 14 injection attacks, hidden-solution leak, duplication | `pytest tests/test_interviewer_brain_adversarial.py` | 101 passed | VERIFIED |
-| | **Backend brain total** | | all five files | **354 passed, 0 failed** | VERIFIED |
-| 6 | Chaos simulation | 3,000 random 25-turn sessions through the real routes with fault injection | `python -m tools.interviewer_chaos_sim --sequences 3000 --turns 25 --seed 20260929` | 75,000 requests (8,560 duplicate turn ids, 7 injected model fault modes), **0 violations**, 230 s | VERIFIED (fakes) |
+| 5b | Contextual presence | replays of long explanations that used to get "Okay." / "Right." / "That works. Go ahead."; verdict only when verified; stock / unrelated / unverified lines rejected; regeneration then plain fallback; provider failure falls back on beats but not on hints; orienting by the candidate's own plan; JSON control packet contents; real routes (text, voice, provider down) | `pytest tests/test_interviewer_brain_contextual.py` | 21 passed | VERIFIED (scripted model) |
+| | **Backend brain total** | | all six files | **375 passed, 0 failed** | VERIFIED |
+| 6 | Chaos simulation | 3,000 random 25-turn sessions through the real routes with fault injection | `python -m tools.interviewer_chaos_sim --sequences 3000 --turns 25 --seed 20260929` | 75,000 requests (8,560 duplicate turn ids, 7 injected model fault modes), **0 violations**, 231 s; 522 contextual beats, 159 of them fell back to the plain hand-back under injected faults | VERIFIED (fakes) |
 | 7 | V11 (flag OFF) | the unchanged baseline engine | `python -m tests.test_v11_voice_integration` · `test_count_clarifications` · `test_learning_model` · `test_session_signals` · `test_interviewer_mode` | ALL PASS (74 checks) · 14/14 · ALL PASS · 5 FAILED · 24 FAILURES — **the same failures as on `main`** (pre-existing, F14; V11 files are byte-identical to `main`) | VERIFIED |
 | 8 | Frontend unit | realtime turn controller (12), live-transcription assembler + SSE parsing (7) | `node --require ./qa/ts-register.cjs --test qa/voice/*.test.cjs` | 19/19 | VERIFIED |
-| 9 | Realtime browser E2E | headless Chromium + fake mic + werift WebRTC mock peer + real routes | `node qa/e2e-voice/run.cjs` | 24/24 (incl. 30 repeated barge-ins) | PARTIALLY VERIFIED |
+| 9 | Realtime browser E2E | headless Chromium + fake mic + werift WebRTC mock peer + real routes | `node qa/e2e-voice/run.cjs` | 24/24 on 6 consecutive runs (incl. 30 repeated barge-ins per run) | PARTIALLY VERIFIED |
 | 10 | STT browser E2E | headless Chromium + fake mic + real VAD + real routes + fake `/transcribe` and `/speak` | `node qa/e2e-voice/run-stt.cjs` | 13/13 | PARTIALLY VERIFIED |
 | 11 | Typecheck | whole frontend | `tsc --noEmit -p .` | EXIT 0 | VERIFIED |
 | 12 | Production build | whole frontend | `next build` (Google Fonts mocked via `NEXT_FONT_GOOGLE_MOCKED_RESPONSES`; the build host cannot reach Google) | EXIT 0 | VERIFIED |
 | 13 | Bundle scan | built `.next/static` | grep for key-shaped / JWT-shaped values and prompt markers | 0 / 0 / 0 | VERIFIED |
 | 14 | Migration 0071 | real local Postgres (pgserver) on top of 0002 | apply twice; duplicate insert; NULL keys | idempotent; duplicate rejected; NULL rows unaffected | VERIFIED (not Supabase) |
 | 15 | Python compile | every changed backend module | `python -m py_compile …` | EXIT 0 | VERIFIED |
-| 16 | Brain overhead | decision + route overhead, N = 200 / 60 per condition | `python -m tools.brain_overhead_bench` | decision P95 ≤ 0.52 ms; route to first event P95 ≤ 4.9 ms | VERIFIED (in process) |
-| 17 | Load / concurrency | real uvicorn worker in its own process, simulated 650 ms model, 5–100 concurrent candidates | `python -m tools.interviewer_load_test --users 5 10 25 50 100 --turns 10` | 0 errors, isolation OK, 0 duplicate rows at every level; saturates at ~76–88 req/s on 2 vCPU (see load report) | VERIFIED (local) |
+| 16 | Brain overhead | decision + route overhead, N = 200 / 60 per condition | `python -m tools.brain_overhead_bench` | decision P95 ≤ 0.65 ms; route to first event P95 ≤ 5.4 ms | VERIFIED (in process) |
+| 17 | Load / concurrency | real uvicorn worker in its own process, simulated 650 ms model, 5–100 concurrent candidates | `python -m tools.interviewer_load_test --users 5 10 25 50 100 --turns 10` | 0 errors, isolation OK, 0 duplicate rows at every level; saturates at ~80–88 req/s on 2 vCPU (see load report) | VERIFIED (local) |
 | 18 | Cost model | scripted 10/20-turn interviews, call and token counts | `python -m tools.interviewer_cost_model` | see cost report | PARTIALLY VERIFIED |
 | 19 | Runtime trace | 11 requests through the real routes with telemetry | trace script | see runtime trace | VERIFIED (fakes) |
 
@@ -58,6 +60,8 @@ measured here (no network route to OpenAI/Groq/Supabase, no keys, no physical de
 | Adversarial | "provide a hint", "wat … shud", "Still not helping." missed; "How would you solve this?" → full solution; "What population should I use?" → assumption check | classifier fixes, each with a test |
 | Leak test (strengthened) | (no bug) test now builds the prompt from a real `cases` row that carries a solution | — |
 | Chaos harness | TestClient kept every per-request event loop alive (harness only) | one context-managed client per sequence |
+| Property tests (contextual change) | the text fallback after an UNCHECKED structure said "that works as a structure" - a verdict nothing had checked | neutral fallback ("Okay. Take it from there.") unless the assessor vetted it |
+| Realtime E2E (contextual change) | interruption check flaky (28-29/30) on a busy box: the mock peer sends no audio and ended responses after ~0.25 s, so the client's silence detector correctly decided the line had finished | mock holds `response.done` open during the interruption loop; 6/6 runs 30/30 |
 | Load harness | server and client sharing a GIL distorted the 50/100 levels | server in its own process |
 
 
@@ -75,7 +79,7 @@ else.
 | 2 | What population should I use? | SUBSTANTIVE / ANSWER_DIRECT (`clarification`) | *(model-worded ANSWER_DIRECT, 0 question max)* |
 | 3 | Can I assume India only? | SUBSTANTIVE / ANSWER_DIRECT (`assumption_check`) | *(model-worded ANSWER_DIRECT, 0 question max)* |
 | 4 | let me think | NO_OUTPUT / NO_OUTPUT (`thinking_aloud`) | — (silence; keeps listening) |
-| 5 | I'd split by urban and rural, then income, then ownership. That's my structure. | PRESENCE / HAND_BACK (`structure_complete`) | Okay. Take it from there. |
+| 5 | I'd split by urban and rural, then income, then ownership. That's my structure. | PRESENCE / REFLECT_PROGRESS (`structure_complete`) | *(model-worded from their words, 1 sentence, may say it holds; fallback "Okay. Take it from there.")* |
 | 6 | Shall I proceed? | PRESENCE / HAND_BACK (`floor_yield`) | Yes, go ahead. |
 | 7 | Urban is 35%, so about 11 crore households. | NO_OUTPUT / NO_OUTPUT (`progressing`) | — (silence; keeps listening) |
 | 8 | Can you give me a hint? | SUBSTANTIVE / MICRO_HINT (`help_requested`) | *(model-worded MICRO_HINT, 0 question max)* |
@@ -101,6 +105,10 @@ Read as a human interviewer would:
 - **It helps when asked or visibly stuck** (turns 8 and 18) and then gets out of the way — the
   candidate's "Oh right, affordability." gets a two-word hand-back, not more teaching.
 - **Floor-yields get one short beat** ("Yes, go ahead."), never a probe.
+- **A finished structure gets a line about that structure** (turn 5), not "Okay. Take it from
+  there." The model words it from the candidate's own branches; the stock line remains only as
+  the fallback if the model fails. Here the assessor checked the structure, so the line may say
+  it holds; unchecked, it may not.
 - **It catches the one material slip** (turn 16: 2.7 crore households on a 7-year cycle is ~39
   lakh a year, not 4 lakh) — found during this review. The first version of the brain let it pass
   because the arithmetic was spread across three turns; the cross-turn scale-slip trigger was added

@@ -1,6 +1,6 @@
 # MECE Interviewer — Cost Report
 
-Date: 2026-09-30. Tool: `python -m tools.interviewer_cost_model` (scripted interviews through the
+Date: 2026-10-01 (re-run after the contextual-presence change and the merge of `main`). Tool: `python -m tools.interviewer_cost_model` (scripted interviews through the
 real brain with a counting fake model). **Every dollar figure here is a model estimate, not a
 measured bill** (PARTIALLY VERIFIED: call counts are exact for the scripts; tokens are
 characters/4; audio seconds are characters/15; prices as listed below). Real spend must be read
@@ -28,22 +28,30 @@ input tokens per call are roughly 2–3× the figures below (≈1,000–1,500 pe
 
 | interview / channel | turns | NO_OUTPUT / PRESENCE / SUBSTANTIVE | generation calls | assessor calls | model calls per turn | V11 model calls per turn (same script) | est. input tokens | output cap | text model $ (gpt-4o-mini) | $ if Groq llama-70b | assessor $ | interviewer lines spoken |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| strong_10 / text | 10 | 7 / 0 / 3 | 1 | 0 | 0.1 | 0.3 | 444 | 180 | 0.00017 | 0.00040 | 0 | 3 |
-| strong_10 / voice | 10 | 7 / 0 / 3 | 1 | 0 | 0.1 | 0.3 | 458 | 140 | 0.00015 | 0.00038 | 0 | 3 |
-| average_10 / text | 10 | 5 / 2 / 3 | 1 | 0 | 0.1 | 0.6 | 439 | 180 | 0.00017 | 0.00040 | 0 | 5 |
-| average_10 / voice | 10 | 5 / 2 / 3 | 1 | 0 | 0.1 | 0.6 | 453 | 140 | 0.00015 | 0.00038 | 0 | 5 |
-| weak_10 / text | 10 | 2 / 0 / 8 | 5 | 0 | 0.5 | 0.7 | 2,495 | 1,100 | 0.00103 | 0.00234 | 0 | 8 |
-| weak_10 / voice | 10 | 1 / 1 / 8 | 5 | 0 | 0.5 | 0.7 | 2,566 | 860 | 0.00090 | 0.00219 | 0 | 9 |
-| mixed_20 / text | 20 | 11 / 2 / 7 | 5 | 2 | 0.35 | 0.45 | 2,414 | 900 | 0.00090 | 0.00214 | 0.00012 | 9 |
-| mixed_20 / voice | 20 | 10 / 3 / 7 | 5 | 2 | 0.35 | 0.45 | 2,459 | 700 | 0.00079 | 0.00200 | 0.00012 | 10 |
+| strong_10 / text | 10 | 7 / 0 / 3 | 1 | 0 | 0.1 | 0.3 | 697 | 180 | 0.00021 | 0.00055 | 0 | 3 |
+| strong_10 / voice | 10 | 7 / 0 / 3 | 1 | 0 | 0.1 | 0.3 | 706 | 140 | 0.00019 | 0.00053 | 0 | 3 |
+| average_10 / text | 10 | 5 / 2 / 3 | 1 | 0 | 0.1 | 0.6 | 692 | 180 | 0.00021 | 0.00055 | 0 | 5 |
+| average_10 / voice | 10 | 5 / 2 / 3 | 1 | 0 | 0.1 | 0.6 | 702 | 140 | 0.00019 | 0.00052 | 0 | 5 |
+| weak_10 / text | 10 | 2 / 0 / 8 | 5 | 0 | 0.5 | 0.7 | 3,854 | 1,100 | 0.00124 | 0.00314 | 0 | 8 |
+| weak_10 / voice | 10 | 1 / 1 / 8 | 5 | 0 | 0.5 | 0.7 | 3,874 | 860 | 0.00110 | 0.00297 | 0 | 9 |
+| mixed_20 / text | 20 | 11 / 2 / 7 | 6 | 2 | 0.4 | 0.55 | 4,451 | 1,040 | 0.00129 | 0.00345 | 0.00012 | 9 |
+| mixed_20 / voice | 20 | 10 / 3 / 7 | 6 | 2 | 0.4 | 0.45 | 4,499 | 800 | 0.00115 | 0.00329 | 0.00012 | 10 |
 
 Why substantive turns outnumber generation calls: OPEN, CLOSE, DIRECT_CORRECTION and DEFLECT
-lines are worded deterministically (no model), as are all PRESENCE lines.
+lines are worded deterministically (no model), as are the fixed PRESENCE lines.
 
-**Silence and presence bill nothing.** NO_OUTPUT and PRESENCE turns make no model call and write
-no `ai_usage_log` row (route test `test_silence_and_presence_never_touch_meters`). Baseline V11
-wrote an `ai_usage_log` row with `model="local"` for every silent/presence turn (F6) — no dollars,
-but ledger noise. VERIFIED.
+**Silence and fixed presence bill nothing.** NO_OUTPUT turns and fixed PRESENCE beats ("Shall I
+proceed?" → "Yes, go ahead.") make no model call and write no `ai_usage_log` row (route test
+`test_silence_and_presence_never_touch_meters`). Baseline V11 wrote an `ai_usage_log` row with
+`model="local"` for every silent/presence turn (F6) — no dollars, but ledger noise. VERIFIED.
+
+**Contextual presence costs one call (two if regenerated).** Since 2026-10-01 a finished
+structure, an "is my approach okay?" and a long finished step in voice get a line worded from the
+candidate's content instead of a stock phrase. In the 20-turn mixed script that is one extra call
+(5 → 6 generation calls). Each call now carries the JSON control packet, which adds roughly 250
+input tokens per call (≈ +$0.00004 per call on gpt-4o-mini) — the input-token column grew about
+1.5× for that reason. Net effect on a 20-turn interview: ≈ +$0.0004 on the text model. VERIFIED
+(counts) / PARTIALLY VERIFIED (dollars).
 
 The weak-candidate script is the most expensive because it asks for help and a solution: every
 rung of help is a model call by design (the brief requires help to be honoured). Even so it stays
@@ -53,9 +61,9 @@ around **$0.001–0.003 per 10 turns** on gpt-4o-mini with realistic case length
 
 | Channel (20-turn mixed interview, estimate) | Brain (text model + assessor) | Transcription | Speech out | Total (est.) |
 |---|---|---|---|---|
-| TEXT | ≈ $0.001–0.002 | — | — | ≈ $0.002 |
-| STT (Whisper transport) | ≈ $0.001–0.002 | ~2.7 min candidate audio: Groq $0.002 / whisper-1 $0.016 / live-transcribe $0.046 | tts-1, ~1,100 chars: ≈ $0.017 | ≈ $0.02–0.07 |
-| REALTIME VOICE | ≈ $0.001–0.002 | whisper-1 (realtime input transcription) ≈ $0.016 | gpt-realtime audio out, 10 lines ≈ $0.088 (+ ≈ $0.00002 text-in for the line instructions) | ≈ $0.10 |
+| TEXT | ≈ $0.0015–0.0025 | — | — | ≈ $0.002 |
+| STT (Whisper transport) | ≈ $0.0015–0.0025 | ~2.7 min candidate audio: Groq $0.002 / whisper-1 $0.016 / live-transcribe $0.046 | tts-1, ~1,100 chars: ≈ $0.017 | ≈ $0.02–0.07 |
+| REALTIME VOICE | ≈ $0.0015–0.0025 | whisper-1 (realtime input transcription) ≈ $0.016 | gpt-realtime audio out, 10 lines ≈ $0.10 (+ ≈ $0.00002 text-in for the line instructions) | ≈ $0.12 |
 
 Two design choices cut speech cost directly:
 

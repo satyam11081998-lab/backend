@@ -51,7 +51,7 @@ silence artefacts never become turns; reconnect replay does not duplicate the re
 report carries T1..T4 and never text; short numeric turns and yes/no are turns, not noise. Part of
 the 19/19 frontend unit run (with 7 STT tests). **VERIFIED.**
 
-### 3.2 Browser end-to-end (`qa/e2e-voice/run.cjs`) — 24/24 PASS (re-run 2026-09-30 on the rebased branches)
+### 3.2 Browser end-to-end (`qa/e2e-voice/run.cjs`) — 24/24 PASS (re-run 2026-10-01: 6 consecutive runs, 24/24 each)
 Real headless Chromium (`chrome-headless-shell` 141.0.7390.37) with a fake microphone
 (`--use-file-for-fake-audio-capture` on a generated speech WAV), the real
 `VoiceInterviewRealtime` code bundled with esbuild, a **mock realtime peer** built on `werift`
@@ -71,6 +71,7 @@ scripted model.
 | barge-in: client sends `response.cancel` + `output_audio_buffer.clear` | PASS |
 | barge-in round trip (speech_started sent by the mock → response.cancel received by the mock), **N = 30**: P50 267 / P90 270 / P95 277 ms | PASS — loopback through werift's pure-JS SCTP stack; excludes audio devices, network and the provider. Not a production number. |
 | client reaction (event received → `response.cancel` sent), **N = 30**: P50 0.0 / P90 0.1 / P95 0.2 ms; every one of the 30 lines cancelled | PASS |
+| harness note (2026-10-01): the mock peer sends no interviewer audio and used to end each response ~0.25 s in, so on a busy box the client's silence detector sometimes (correctly) decided a line had finished before the scripted interruption arrived (28–29/30 in 3 of 6 runs). The mock now holds `response.done` open during the interruption loop, as a real provider streaming a long line would; 6/6 runs then measured 30/30 | fixed (harness) |
 | held line: nothing spoken over a talking candidate; stale line dropped for the newer turn | PASS |
 | telemetry: per-turn T1/T2 and interruption reports received; no transcript text in any record | PASS |
 | no uncaught page errors | PASS |

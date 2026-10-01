@@ -98,3 +98,26 @@ python -m pytest -q tests/test_interviewer_brain_regression.py      # 47 passed
 python -m tests.test_v11_voice_integration                          # flag OFF path
 cd ../consilio && node --require ./qa/ts-register.cjs --test qa/voice/*.test.cjs
 ```
+
+## 7. 2026-10-01: contextual presence (function first, language second)
+
+Change: a finished structure, an "is my approach okay?", a hypothesis with a floor-yield and a
+long finished step in voice no longer get a stock line ("Okay. Take it from there.", "That works.
+Go ahead.", "Okay." / "Right."). The policy chooses one of three functions
+(`REFLECT_PROGRESS`, `ACKNOWLEDGE_AND_CONTINUE`, `ACKNOWLEDGE_AND_ORIENT`); the model words it from a
+JSON control packet; the validator rejects stock, unrelated or unverified lines (one
+regeneration, then the plain hand-back). Fixed lines remain for context-free beats.
+
+| Turn | Before (2026-09-30 branch) | After |
+|---|---|---|
+| "I'd split by urban and rural, then income, then ownership. That's my structure." | HAND_BACK "Okay. Take it from there." | REFLECT_PROGRESS, model-worded from their branches |
+| "Is my structure okay?" with the assessor unavailable | VALIDATE "That works. Go ahead." (a verdict nothing had checked) | ACKNOWLEDGE_AND_CONTINUE, no verdict allowed |
+| long finished step, voice | ACKNOWLEDGE "Okay." / "Right." / "Mm-hm." | ACKNOWLEDGE_AND_CONTINUE from their content; "it holds" only for arithmetic the checker verified |
+| "So that's the urban side." (their structure on record) | NO_OUTPUT | ACKNOWLEDGE_AND_ORIENT: names the next part of their plan |
+| "Shall I proceed?", "50%", "let me think" | "Yes, go ahead." / silence / silence | unchanged |
+
+Invariant 7 now reads: silence and **fixed** presence never touch meters; a contextual beat makes
+one model call (two if regenerated), logged like any model call. All other invariants and A–L are
+unchanged and still pass (375 tests). VERIFIED (scripted model); wording quality with a live model
+UNVERIFIED.
+

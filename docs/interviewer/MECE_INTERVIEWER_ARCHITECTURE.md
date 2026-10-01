@@ -26,9 +26,9 @@ decides; the provider layer talks to models. Tests drive the brain with in-memor
 | `policy.py` | State estimation, Gate A, Gate B, assistance ladder, question budget | none |
 | `assessor.py` | Optional small-model JSON judgement for step-completing analytic turns, and for bare results that look like a dropped/added zero (`numbers.scale_slip` trigger); time-boxed; failure is reported, never silently turned into a fake reply | optional, small |
 | `state_machine.py` | Transition validation and normalisation, loop guards (repeated hint / repair / question / presence), phase tracking | none |
-| `presence.py` | Presence wording chosen from the turn's context (no rotation, no hashing) | none |
-| `prompting.py` | Compact per-move prompts: role, case, state, move, explicit task, allowed behaviour | none |
-| `validate.py` | Output validation: praise, refusal/interrogation phrases, leakage, markdown, question budget, repetition; `SentenceGate` for streaming | none |
+| `presence.py` | Fixed presence wording for context-free beats (floor-yields, recovery, numbers), chosen from the turn's context (no rotation, no hashing); also the plain fallback for contextual beats | none |
+| `prompting.py` | One JSON **interviewer control packet** per model-worded turn: `response_function`, `objective`, `candidate_turn` (type, state, stage, numbers stated), `verification` (checked, `may_say_correct`, verified claims), `permissions` (questions, hint, correction, solution, new case facts), `generation` (medium, length, style, must reference the candidate), `session`, `memory` (recent functions, lines, questions), and for orienting the candidate's own plan | none |
+| `validate.py` | Output validation: praise, refusal/interrogation phrases, leakage (incl. packet field names), markdown, question budget, repetition; for contextual beats also unverified correctness claims, stock acknowledgements, lines unrelated to the candidate's words; `SentenceGate` for streaming | none |
 | `providers.py` | Provider adapter (OpenAI/Groq/Gemini-compatible clients via `services.ai_providers`), timeouts, one failover, usage logging for real model calls | yes |
 | `responder.py` | Generate → validate → at most one regeneration (non-stream) → error if still invalid | yes |
 | `dedupe.py` | `TurnLedger`: (attempt_id, turn_id) → one decision; concurrent duplicates wait for the first | none |
@@ -86,7 +86,8 @@ for one attempt are serialised (`keyed_lock`).
 | Outcome | attempt_messages | ai_usage_log | SSE / JSON |
 |---|---|---|---|
 | NO_OUTPUT | user row only | none | `silence` + `done{message_id:null, silent:true}` / `lane:"SILENCE", say:null` |
-| PRESENCE | user + assistant row | none | tokens + `done{message_id}` / `lane:"PRESENCE", say` |
+| PRESENCE (fixed) | user + assistant row | none | tokens + `done{message_id}` / `lane:"PRESENCE", say` |
+| PRESENCE (contextual) | user + assistant row | one row per real model call (≤ 2) | same; on model failure the plain hand-back, telemetry `error_type=<type>:fallback` |
 | SUBSTANTIVE | user + assistant row | one row per real model call (+ assessor row if called) | tokens / `lane:"SUBSTANTIVE", say` |
 | Error | user row only | failed call rows | `error` / HTTP 502 |
 Realtime rows are written by `/realtime-turn` with an idempotency key (`client_turn_id`:
@@ -109,6 +110,7 @@ partial unique index.
 |---|---|
 | Provider error / timeout on a substantive move | one failover hop; then `event: error` / HTTP 502. User row kept (as before). |
 | Model returns empty or only invalid sentences | one regeneration (voice) / error (text stream); never silence, never canned content |
+| Model fails / returns a stock or unrelated line on a contextual presence beat | one regeneration, then the plain deterministic hand-back (it carries no case content, so nothing is invented); recorded as `<type>:fallback` |
 | Assessor timeout/error | decision falls back to the deterministic result; `error_type=assessor_*` in telemetry |
 | Duplicate turn id | replay stored result; no second decision, no second row |
 | Voice partial | NO_OUTPUT, state untouched |

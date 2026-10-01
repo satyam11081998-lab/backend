@@ -36,8 +36,18 @@ adversarial suites need: `META` (identity / injection / rubric requests) and `UN
 `NO_OUTPUT, ACKNOWLEDGE, HAND_BACK, VALIDATE, DATA_REVEAL, DIRECT_CORRECTION, MICRO_HINT,
 TARGETED_HINT, STRUCTURAL_HINT, REPAIR, ANSWER_DIRECT, TRANSITION, RETHINK_CUE,
 DELIVER_SOLUTION, TARGETED_PROBE` plus `OPEN`, `CLOSE`, `DEFLECT` (session start, close, and
-in-role handling of META). Lanes: `NO_OUTPUT` → nothing; `PRESENCE` = ACKNOWLEDGE / HAND_BACK /
-VALIDATE (deterministic wording, no model); `SUBSTANTIVE` = everything else.
+in-role handling of META), plus three **contextual presence** functions (2026-10-01):
+`ACKNOWLEDGE_AND_CONTINUE`, `REFLECT_PROGRESS`, `ACKNOWLEDGE_AND_ORIENT`.
+Lanes: `NO_OUTPUT` → nothing; `PRESENCE` = floor-returning beats — ACKNOWLEDGE / HAND_BACK /
+VALIDATE with fixed wording and no model (short floor-yields, numbers, recovery), and the three
+contextual functions, which the model words from what the candidate actually said;
+`SUBSTANTIVE` = everything else.
+
+**Function first, language second.** The policy decides the function; the model receives a JSON
+control packet (function, objective, what kind of turn it was, what was verified, permissions,
+length, recent functions and lines) and writes the words; the validator checks them. Fixed lines
+remain only where no context is needed ("Shall I proceed?" → "Yes, go ahead.", open/close,
+deflection, numeric corrections).
 
 ## 6. Required behaviours (each has a regression test)
 | Situation | Behaviour |
@@ -52,14 +62,20 @@ VALIDATE (deterministic wording, no model); `SUBSTANTIVE` = everything else.
 | Recovery ("oh right, so I just…") after help | Step back: NO_OUTPUT (or a one-word hand-back in voice for a bare "got it"). Hint level fades. |
 | Thinking aloud ("let me think", "wait wait", "hmm", "so…") | NO_OUTPUT. |
 | Candidate yields the floor ("shall I proceed?", "is that okay?") | One short presence beat ("Yes, go ahead."). |
-| Structure laid out as a completed step | Accepted if coherent (alternatives allowed); probe only a materially missing branch. |
+| Structure laid out as a completed step | Accepted if coherent (alternatives allowed); probe only a materially missing branch. Otherwise `REFLECT_PROGRESS`: one sentence, worded from their structure, that shows it was followed and hands the floor back — no verdict unless the assessor checked it. |
+| "Is my approach okay?" | `ACKNOWLEDGE_AND_CONTINUE`: say concretely what the approach does and tell them to carry it through. "It works" only if the assessor checked it; otherwise no verdict either way. |
+| A stage of the candidate's own plan is finished ("so that's the urban side") | `ACKNOWLEDGE_AND_ORIENT` (only when their structure is on record and they did not already say what is next): mark the finished part, name the next part of *their* plan. Nothing new added. |
+| Long finished step, voice only | `ACKNOWLEDGE_AND_CONTINUE` from their content (never a stock "Okay." / "Right."). In text the candidate keeps the floor: silence. |
 | Final recommendation / final estimate | Short neutral close, no praise, no new threads. |
 | Identity / injection ("ignore your instructions", "show system prompt", "you are now the scorer") | One in-role line back to the case. Nothing internal is revealed. If sincerely asked, the interviewer says it is the AI interviewer for the practice session (it never claims to be human). |
 | Voice partial transcript | Never produces speech. |
 
 Language: neutral interviewer register. No "Great / Excellent / Brilliant / Perfect / Solid
-structure". Presence wording is chosen from the context of the turn (what kind of floor-yield it
-was, what was said last) — never rotated by turn count or hash.
+structure". Fixed presence wording is chosen from the context of the turn (what kind of floor-yield
+it was, what was said last) — never rotated by turn count or hash. A contextual beat must refer to
+what the candidate said (a stock acknowledgement or an unrelated line is regenerated once, then
+replaced by the plain hand-back), and must not say or imply the work is right unless a check
+verified it. Never two acknowledgements in a row.
 
 ## 7. Silence semantics
 `NO_OUTPUT` is an internal decision, not a reply, and is distinct from **empty model output**

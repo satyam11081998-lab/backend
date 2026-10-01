@@ -22,11 +22,12 @@ Two machines run per attempt. The **candidate-state** machine classifies each co
 | 12 | first turn / greeting | TRANSITIONING (open) | OPEN |
 | 13 | recovery language after assistance / error | RECOVERING | NO_OUTPUT (text) · HAND_BACK for a bare "got it" in voice |
 | 14 | thinking aloud / hold ("let me think", "wait", "hmm", trailing "…") | PROGRESSING | NO_OUTPUT |
-| 15 | floor yield ("shall I proceed?", "is that okay?", "right?") | UNCERTAIN / COMPLETING_STEP | HAND_BACK or VALIDATE |
-| 16 | structure presented / validation of own work requested (assessor, optional) | COMPLETING_STEP (or MATERIAL_ERROR / MINOR_ERROR) | HAND_BACK · TARGETED_PROBE · DIRECT_CORRECTION |
+| 15 | floor yield ("shall I proceed?", "is that okay?", "right?") | UNCERTAIN / COMPLETING_STEP | HAND_BACK or VALIDATE (fixed) |
+| 16 | structure presented / validation of own work requested (assessor, optional) | COMPLETING_STEP (or MATERIAL_ERROR / MINOR_ERROR) | REFLECT_PROGRESS · ACKNOWLEDGE_AND_CONTINUE (model-worded; verdict only if vetted) · TARGETED_PROBE · DIRECT_CORRECTION |
+| 16b | a stage of the candidate's own plan is finished, plan on record, next part not yet named | COMPLETING_STEP | ACKNOWLEDGE_AND_ORIENT (model-worded) |
 | 17 | arithmetic claim off by 1.2–1.5x | MINOR_ERROR | NO_OUTPUT (let it stand) |
 | 18 | hedged number ("maybe 30%") | UNCERTAIN | NO_OUTPUT |
-| 19 | anything else | PROGRESSING | NO_OUTPUT (voice: optional ACKNOWLEDGE after a long completed step if no presence in the last 2 actions) |
+| 19 | anything else | PROGRESSING | NO_OUTPUT (voice: ACKNOWLEDGE_AND_CONTINUE, worded from their content, after a long completed step if no presence in the last 2 actions) |
 
 `RECOVERING` is only valid after an assistance/correction/stuck turn; otherwise it is normalised
 to `PROGRESSING`. `FINAL_RECOMMENDATION` moves the phase to `closed`; later turns are treated as

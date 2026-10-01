@@ -1,6 +1,6 @@
 # MECE Interviewer — Latency Report
 
-Date: 2026-09-30.
+Date: 2026-10-01 (overhead and load re-measured after the contextual-presence change).
 
 **Headline: no end-to-end latency against the real providers was measured.** This environment
 has no route to api.openai.com / Groq / Supabase and no keys, so every number that involves a
@@ -35,9 +35,9 @@ case, zero-latency fake model (so "model" rows time only the decision, not gener
 
 | channel | NO_OUTPUT P50 / P90 / P95 (ms) | PRESENCE | SUBSTANTIVE fixed (correction) | SUBSTANTIVE model (hint; decision only) |
 |---|---|---|---|---|
-| text | 0.34 / 0.38 / 0.41 | 0.27 / 0.30 / 0.30 | 0.39 / 0.41 / 0.43 | 0.30 / 0.32 / 0.33 |
-| stt | 0.34 / 0.36 / 0.37 | 0.26 / 0.29 / 0.29 | 0.38 / 0.42 / 0.45 | 0.30 / 0.36 / 0.44 |
-| voice | 0.34 / 0.40 / 0.47 | 0.26 / 0.30 / 0.38 | 0.39 / 0.46 / 0.52 | 0.30 / 0.33 / 0.34 |
+| text | 0.34 / 0.38 / 0.39 | 0.26 / 0.29 / 0.30 | 0.38 / 0.42 / 0.44 | 0.30 / 0.34 / 0.37 |
+| stt | 0.34 / 0.37 / 0.38 | 0.26 / 0.28 / 0.29 | 0.38 / 0.41 / 0.44 | 0.29 / 0.32 / 0.34 |
+| voice | 0.34 / 0.36 / 0.38 | 0.26 / 0.29 / 0.30 | 0.39 / 0.56 / 0.65 | 0.30 / 0.35 / 0.39 |
 
 The decision is deterministic and sub-millisecond; it is not a latency factor. (The optional
 assessor is a model call, time-boxed at 2.5 s text / 1.2 s voice, and runs only on
@@ -50,14 +50,14 @@ C9 counting, dedupe, brain, validation, persistence queue).
 
 | route / condition | P50 / P90 / P95 (ms) |
 |---|---|
-| `/messages` NO_OUTPUT → `event: silence` | 4.01 / 4.63 / 4.87 |
-| `/messages` PRESENCE → first token | 3.94 / 4.32 / 4.38 |
-| `/messages` correction → first token | 4.29 / 4.73 / 4.75 |
-| `/messages` hint → first token (zero-latency model) | 4.12 / 4.52 / 4.71 |
-| `/voice-decision` NO_OUTPUT | 3.14 / 3.42 / 3.45 |
-| `/voice-decision` PRESENCE | 3.10 / 3.43 / 3.50 |
-| `/voice-decision` correction | 3.30 / 3.76 / 4.50 |
-| `/voice-decision` hint (zero-latency model) | 3.33 / 3.58 / 3.68 |
+| `/messages` NO_OUTPUT → `event: silence` | 4.31 / 5.07 / 5.42 |
+| `/messages` fixed PRESENCE → first token | 3.85 / 4.20 / 4.30 |
+| `/messages` correction → first token | 4.21 / 4.67 / 4.73 |
+| `/messages` hint → first token (zero-latency model) | 4.35 / 4.75 / 4.89 |
+| `/voice-decision` NO_OUTPUT | 3.11 / 3.54 / 3.67 |
+| `/voice-decision` fixed PRESENCE | 3.10 / 3.38 / 3.52 |
+| `/voice-decision` correction | 3.23 / 3.54 / 3.93 |
+| `/voice-decision` hint (zero-latency model) | 3.53 / 4.02 / 4.50 |
 
 In production add: network RTT, the Supabase reads the route already did before this change
 (attempt, case, transcript, budget — unchanged), and the model's time to first token on the
@@ -89,6 +89,14 @@ fake model, fake TTS on loopback. **Not STT latency.**
 | decision (T2−T1) | browser→Render→browser RTT + DB reads + (substantive) model call | same | same |
 | speak (T4−T3) | realtime TTFB for an out-of-band response | `/speak` TTS TTFB | — |
 | NO_OUTPUT / presence | no model call; presence spoken directly | same | same |
+
+Added on 2026-10-01: contextual presence beats (a finished structure, "is my approach okay?", a
+long finished step in voice) are now model-worded instead of instant. Those beats wait for one
+model call (two if the first draft is stock or unrelated) before they are shown or spoken - in
+voice roughly a model's time-to-complete for one short sentence, typically sub-second to ~1.5 s
+(UNVERIFIED; measure with the telemetry below). Fixed beats ("Yes, go ahead.") stay instant, and
+silence still answers in milliseconds. A provider failure on such a beat costs at most the timeout
+before the plain hand-back is used.
 
 Removed from the critical path compared with the baseline: the serial contextual-assessor model
 call V11 made before turns containing "?" or starting with an interrogative (F7) — the brain calls

@@ -73,6 +73,13 @@ notify pgrst, 'reload schema';
 Run the code revert (Stage D) or keep the flag OFF first; the backend tolerates the column being
 absent (plain-insert fallback), so the order is not critical.
 
+### Stage F — only the contextual-presence change (2026-10-01)
+It lives in one commit on the branch ("feat(interviewer): contextual presence…"). To go back to the
+fixed presence lines while keeping the rest of the brain: `git revert <that commit>` (it touches
+`services/interviewer/{types,policy,classify,presence,prompting,responder,validate,engine}.py`,
+`tests/interviewer_fakes.py` and adds `tests/test_interviewer_brain_contextual.py`). No data or
+migration is involved.
+
 ## 4. What is NOT rolled back by the flag
 - `services/copilot/engine/prompts_interview.py`: the unreachable static "EXAMINE, DO NOT TEACH /
   NO HINTS" prompt was replaced by a fail-closed stub (invariant 9). Reachable only if
