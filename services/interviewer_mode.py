@@ -42,6 +42,7 @@ ALLOW_QUESTIONS: Dict[str, bool] = {
     "MICRO_HINT": False,
     "CORRECT_AND_CONTINUE": False,
     "REPAIR_AND_RESET": False,
+    "CONTINUE_AS_AGREED": True,
 }
 
 Q_BUDGET: Dict[str, int] = {k: (1 if v else 0) for k, v in ALLOW_QUESTIONS.items()}
@@ -129,6 +130,11 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
     "VALIDATE_AND_HAND_BACK": (
         "The candidate just adjusted their reasoning. Acknowledge the specific adjustment in a few "
         "words and hand the floor back. Do not certify the result as correct. No question."),
+    "CONTINUE_AS_AGREED": (
+        "Your last line asked or proposed something and the candidate just said yes / go ahead. Carry "
+        "on with exactly what you proposed (set out the context, give the data you offered, or move to "
+        "the step you named) in one to three short sentences. Do not ask them to confirm again. At most "
+        "one question, and only if it hands the next move to them."),
 }
 
 # V12 function -> the V10.2 instruction it inherits (unchanged behaviour).

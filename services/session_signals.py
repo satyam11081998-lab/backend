@@ -308,6 +308,20 @@ def _similar(a: str, b: str) -> bool:
         return True
     return difflib.SequenceMatcher(None, a, b).ratio() > 0.9
 
+# A short go-ahead / agreement ("Yes.", "Go ahead", "Sure, carry on", and the
+# common ASR slip "Do ahead"). Never a question, never a request for data.
+_GO_AHEAD_RE = re.compile(
+    r"^(?:(?:yes|yeah|yep|yup|ya|sure|ok|okay|alright|all right|right|fine|cool|great|perfect|correct|"
+    r"exactly|agreed|got it|understood|makes sense|sounds good|that works|let'?s do it)[\s,.!]*)*"
+    r"(?:(?:please\s+)?(?:go|do|carry|move)\s+(?:ahead|on)|proceed|continue|let'?s\s+(?:go|proceed|continue|start|begin)"
+    r"|go for it|please do)?[\s,.!]*$")
+
+
+def is_go_ahead(text: str) -> bool:
+    t = _norm(text)
+    return bool(t) and "?" not in t and len(t.split()) <= 6 and bool(_GO_AHEAD_RE.match(t))
+
+
 def detect_intent(text: str) -> Dict[str, Any]:
     t = _norm(text)
     
@@ -315,7 +329,7 @@ def detect_intent(text: str) -> Dict[str, Any]:
     stripped_t = re.sub(r"^(so|and|but|then|well|now|actually|basically)\s+", "", t)
     first_word = stripped_t.split(" ", 1)[0] if stripped_t else ""
     
-    is_q = ("?" in t) or (first_word in _INTERROGATIVE)
+    is_q = (("?" in t) or (first_word in _INTERROGATIVE)) and not is_go_ahead(text)
     is_sol = _has_any(t, _SOLUTION) or t in _EXACT_SOLUTION
     
     flags = {
@@ -395,8 +409,11 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     
     # V12: punctuation-insensitive ("Okay." / "Yes," from typing or ASR are affirmations too).
     words = re.findall(r"[a-z0-9']+", new_norm)
-    is_affirmation_only = (len(words) > 0 and len(words) <= 3 and not re.search(r"\d", new_norm)
-                           and any(w in _AFFIRMATION_WORDS for w in words))
+    is_affirmation_only = ((len(words) > 0 and len(words) <= 3 and not re.search(r"\d", new_norm)
+                            and any(w in _AFFIRMATION_WORDS for w in words)) or is_go_ahead(new_user_message))
+    # The interviewer's last line asked or proposed something ("Shall we proceed
+    # with that?"): a go-ahead now means "carry on with it", not "I'm working".
+    last_assistant_asked = bool(asst) and asst[-1].rstrip().endswith("?")
 
     recent_assistant_turns = asst[-4:] if len(asst) > 0 else []
     
@@ -533,6 +550,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "recent_functions": recent_functions,
         "last_function": last_function,
         "candidate_plan": _latest_plan(transcript),
+        "last_assistant_asked": last_assistant_asked,
     }
 
 

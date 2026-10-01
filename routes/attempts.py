@@ -42,6 +42,7 @@ from services.interview_engine import (
 )
 from services.session_signals import compute_signals
 from services.interviewer_decision import update_session_state, detect_violations
+from prompts.voice_renderer import strip_say_label
 from services.badge_awarder import award_badges_for_submission
 from services.case_figures import pop_figures, bank_figures
 from services.ai_usage import assert_daily_budget, log_realtime_usage
@@ -1148,6 +1149,7 @@ def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id
     # been spent at the far end, and refusing the write would lose the
     # transcript while keeping the cost. Spend is metered below instead.
     role = body.role if body.role in ("user", "assistant") else "user"
+    content = strip_say_label(body.content) if role == "assistant" else body.content
 
     count_res = _unwrap(r_count)
     total = getattr(count_res, "count", None) or len(count_res.data or [])
@@ -1172,7 +1174,7 @@ def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id
                 "attempt_id": attempt_id,
                 "role": role,
                 "kind": "voice",
-                "content": body.content,
+                "content": content,
                 "is_clarification": clar_count > 0,
             }
         )

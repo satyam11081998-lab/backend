@@ -182,6 +182,28 @@ os.environ.pop("INTERVIEWER_CONTEXTUAL_PRESENCE")
 sig, d = decide(REAL_PLAN)
 check("... and back on by default", d["function"] == "ACKNOWLEDGE_AND_CONTINUE", d)
 
+# REAL (2026-10-01 22:34, owner's phone): "Hi." -> interviewer proposed a structure and asked
+# "Shall we proceed with that structure?" -> "Yes." -> "Do ahead." (ASR for "Go ahead") got the
+# stock "The data confirms that." because "do" was read as a question word -> DATA_REVEAL.
+PROPOSED = [{"role": "user", "content": "Hi."},
+            {"role": "assistant", "content": "In a typical case, we'd usually start by exploring the context and "
+                                             "defining the objective. Shall we proceed with that structure?"}]
+for text in ("Yes.", "Do ahead.", "Go ahead", "Yes, go ahead.", "Sure, carry on", "okay"):
+    for ch in ("text", "voice"):
+        sig, d = decide(text, history=PROPOSED, channel=ch)
+        check(f"[{ch}] {text!r} after the interviewer proposed something -> CONTINUE_AS_AGREED (model-worded)",
+              d["function"] == "CONTINUE_AS_AGREED" and d["render"] == "model", d)
+sig, d = decide("Do ahead.", history=PROPOSED)
+check("'Do ahead.' is never a question or a data request", not sig["is_scope_question"] and d["function"] != "DATA_REVEAL", d)
+for text, fn in [("Do you know the population?", "ANSWER_DIRECT"), ("Is it okay", "ANSWER_DIRECT"),
+                 ("Yes but what is the population?", "ANSWER_DIRECT"), ("Can you help me here?", "MICRO_HINT")]:
+    sig, d = decide(text, history=PROPOSED)
+    check(f"real questions keep their route: {text!r} -> {fn}", d["function"] == fn, d)
+sig, d = decide("Yes.", history=[{"role": "user", "content": "Hi."}, {"role": "assistant", "content": "Let's begin."}])
+check("'Yes.' after a statement (nothing proposed) -> plain hand-back", d["function"] == "HAND_BACK", d)
+from services.interviewer_decision import _MODE_FALLBACK  # noqa: E402
+check("the nonsense fallback 'The data confirms that.' is gone", "confirms that" not in _MODE_FALLBACK["DATA_REVEAL"])
+
 # Property over the 50 behaviour scenarios: the V10.2 gate decision is preserved.
 try:
     from tools.eval_interviewer_behavior import SCENARIOS
@@ -461,6 +483,28 @@ rows = [w[2] for w in DB.writes if w[0] == "insert" and w[2].get("role") == "ass
 check("/messages: contextual beat streamed and persisted as the assistant row",
       r.status_code == 200 and "event: done" in r.text and rows and rows[0]["content"].startswith("You've set the cost base"), r.text[-200:])
 check("C9 counting untouched (count_clarifications on the real plan)", count_clarifications(REAL_PLAN, "text") == 0)
+
+print()
+print("=" * 72)
+print("5. VOICE PROTOCOL LABEL")
+print("=" * 72)
+from prompts.voice_renderer import strip_say_label  # noqa: E402
+check("strip 'SAY:' label", strip_say_label("SAY: That's an interesting perspective.") == "That's an interesting perspective.")
+check("strip repeated / lowercase label", strip_say_label("say: SAY:  Go ahead.") == "Go ahead.")
+check("ordinary 'Say,' sentence untouched", strip_say_label("Say, what about costs?") == "Say, what about costs?")
+DB = FakeDB(PROFIT_CASE)
+r = client.post("/attempts/a1/realtime-turn", json={"role": "assistant", "content": "SAY: The data confirms that."}, headers=H)
+rows = [w[2] for w in DB.writes if w[0] == "insert" and w[2].get("role") == "assistant"]
+check("/realtime-turn never stores the label", r.status_code == 200 and rows and rows[-1]["content"] == "The data confirms that.", rows)
+r = client.post("/attempts/a1/realtime-turn", json={"role": "user", "content": "SAY: hello"}, headers=H)
+rows = [w[2] for w in DB.writes if w[0] == "insert" and w[2].get("role") == "user"]
+check("... candidate text is stored exactly as spoken", rows and rows[-1]["content"] == "SAY: hello")
+LLM.replies, LLM.calls = ["Start from the cost lines that change."], []
+out, ctl, calls = run("Can you help me here?", history=PROFIT_CASE + [
+    {"role": "user", "content": "Hi"}, {"role": "assistant", "content": "SAY: Let's look at the margin."}])
+sent = [m["content"] for m in calls[0]["messages"] if m["role"] == "assistant"]
+check("the interviewer model never sees an old 'SAY:' line (it would copy the pattern)",
+      sent and not any(c.startswith("SAY:") for c in sent), sent)
 
 print()
 if _fail:

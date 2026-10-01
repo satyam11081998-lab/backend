@@ -35,6 +35,7 @@ from services.interviewer_decision import (
     CONTEXTUAL_PRESENCE, scrub_control_leak, StreamLeakGuard,
 )
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
+from prompts.voice_renderer import strip_say_label
 
 load_dotenv()
 
@@ -76,6 +77,10 @@ def _build_adaptive_messages(case_content, case_type, transcript, new_user_messa
     block = (head
              + "\n\n" + build_learning_block(
                  (prior_state or {}).get("profile"), signals, outcome))
+    # Voice lines saved before the label fix may start with "SAY:"; the model
+    # must never see (and copy) that protocol label.
+    transcript = [dict(t, content=strip_say_label(t.get("content") or "")) if t.get("role") == "assistant" else t
+                  for t in transcript]
     return build_adaptive_interviewer_messages(
         case_content=case_content,
         case_type=case_type,

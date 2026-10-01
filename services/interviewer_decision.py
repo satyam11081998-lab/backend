@@ -247,7 +247,7 @@ RESPONSE_FUNCTIONS = (
     "ACKNOWLEDGE_AND_ORIENT", "REFLECT_PROGRESS", "VALIDATE_AND_HAND_BACK",
     "TARGETED_QUESTION", "SANITY_CHECK", "MICRO_HINT", "CORRECT_AND_CONTINUE",
     "REPAIR_AND_RESET", "ANSWER_DIRECT", "DATA_REVEAL", "DELIVER_SOLUTION",
-    "TRANSITION", "OPEN", "CLOSE", "DEFLECT_META", "NOISE",
+    "TRANSITION", "OPEN", "CLOSE", "DEFLECT_META", "NOISE", "CONTINUE_AS_AGREED",
 )
 FAST_FUNCTIONS = frozenset({"SHORT_ACK", "HAND_BACK"})
 CONTEXTUAL_PRESENCE = frozenset({
@@ -338,6 +338,13 @@ def _decide_response(signals: Dict[str, Any]) -> Dict[str, Any]:
     lane, mode, reason = evaluate_intervention_gate(signals or {})
     sig = signals or {}
 
+    # "Shall we proceed with that?" -> "Yes, go ahead.": the interviewer carries on
+    # with what it proposed (model-worded). Help, solution, meta, close etc. above
+    # in the gate still win; a voice partial is still silent.
+    if (sig.get("is_affirmation_only") and sig.get("last_assistant_asked")
+            and not sig.get("is_voice_partial") and lane != "SUBSTANTIVE"):
+        return _decision("SUBSTANTIVE", "TRANSITION", "CONTINUE_AS_AGREED", "go_ahead_after_question")
+
     if lane == "SILENCE":
         return _decision(lane, mode, "NO_OUTPUT", reason)
 
@@ -402,6 +409,7 @@ _OBJECTIVE = {
     "CLOSE": "close the case",
     "DEFLECT_META": "stay in role and return to the case",
     "NOISE": "ask the candidate to restate a garbled turn",
+    "CONTINUE_AS_AGREED": "the candidate agreed to what you just proposed or asked: carry on with exactly that",
 }
 _STRONG = {"MICRO_HINT", "CORRECT_AND_CONTINUE", "REPAIR_AND_RESET", "DELIVER_SOLUTION"}
 _MODERATE = {"TARGETED_QUESTION", "SANITY_CHECK", "ANSWER_DIRECT", "DATA_REVEAL",
@@ -835,7 +843,7 @@ _SOLICIT_RE = re.compile(
 _MODE_FALLBACK = {
     "CLOSE": "Good — that's a reasonable place to close the case.",
     "DELIVER_SOLUTION": "In short: work the cost side first, then tie it back to the profit impact.",
-    "DATA_REVEAL": "The data confirms that.",
+    "DATA_REVEAL": "Carry on with your next step.",
     "CORRECT_MATERIAL": "Check the denominator.",
     "HINT": "Consider a different structural approach here.",
     "REPAIR": "Let's step back and look at the broader picture.",
