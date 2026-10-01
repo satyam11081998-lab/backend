@@ -13,7 +13,7 @@ from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance
 from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS
-from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions, VOICE_TOOLS
+from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions, VOICE_TOOLS, normalize_level
 from services.voice_coach import voice_interviewer_mode, voice_state
 from prompts.voice_renderer import strip_say_label
 
@@ -114,9 +114,12 @@ def build_turn_detection(create_response: bool = False, eagerness: Optional[str]
 
 
 class RealtimeSessionRequest(BaseModel):
-    """`case_id` lets us build the interviewer instructions server-side."""
+    """`case_id` lets us build the interviewer instructions server-side.
+    `level` (easy | medium | hard) is the difficulty the candidate picked; absent ->
+    the case's own difficulty."""
     case_id: str
     attempt_id: Optional[str] = None
+    level: Optional[str] = None
 
 
 @router.post("/session")
@@ -207,6 +210,7 @@ async def create_realtime_session(
     interviewer = voice_interviewer_mode(uid, getattr(user_obj, "email", None))
     tools_cfg: dict = {}
     coach_on = False
+    level, resume = None, False
     if interviewer == "model_led":
         # The model IS the interviewer and nothing sits between the candidate and
         # its reply: everything it needs is in this one prompt - the case on top,
@@ -228,11 +232,13 @@ async def create_realtime_session(
             except Exception as e:  # noqa: BLE001 -- context is a nicety, never a blocker
                 print(f"[realtime] attempt context not read: {type(e).__name__}")
         coach_on = os.getenv("VOICE_COACH", "off").strip().lower() in ("1", "on", "true", "yes")
+        level = normalize_level(body.level, row.get("difficulty"))
+        resume = bool(history)
         instructions = build_voice_interviewer_instructions(
             llm_case_content(row), row.get("type") or "", notes if coach_on else None,
             hint=row.get("hint"), solution=row.get("solution"),
             transcript=[dict(m, content=strip_say_label(m.get("content") or "")) for m in history],
-            market=case_market(row))
+            market=case_market(row), level=level)
         if os.getenv("VOICE_TOOLS", "off").strip().lower() in ("1", "on", "true", "yes"):
             tools_cfg = {"tools": VOICE_TOOLS, "tool_choice": "auto"}
     else:
@@ -330,6 +336,8 @@ async def create_realtime_session(
             # is off unless VOICE_COACH=on (it is async, but the prompt does the work).
             "open_first": model_led,
             "coach": bool(model_led and coach_on),
+            "level": level,
+            "resume": resume,
         }
 
     except HTTPException:

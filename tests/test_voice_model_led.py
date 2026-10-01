@@ -282,6 +282,38 @@ rt.httpx = types.SimpleNamespace(AsyncClient=_FakeAsyncClient)
 
 print()
 print("=" * 72)
+print("2a. OPENING, RESUME AND DIFFICULTY")
+print("=" * 72)
+from prompts.voice_interviewer_playbook import normalize_level  # noqa: E402
+fresh = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate")
+check("fresh call: the case is on screen - do not explain it, ask them to read it and give their approach",
+      "already on the candidate's screen" in fresh and "Do NOT explain, read out or summarise it" in fresh
+      and "RESUMING" not in fresh)
+out, sess = mint_with_history()
+check("reopening voice with saved turns RESUMES (no restart, no re-explaining)",
+      out.get("resume") is True and "You are RESUMING this interview" in sess["instructions"]
+      and "already on the candidate's screen" not in sess["instructions"])
+out, sess = mint_with_history(history=[])
+check("first voice call on an attempt is fresh", out.get("resume") is False and "RESUMING" not in sess["instructions"])
+check("level defaults to the case's own difficulty", out.get("level") == "medium" and "DIFFICULTY: MEDIUM" in sess["instructions"])
+check("normalize_level: picked level wins, else case difficulty, else medium",
+      (normalize_level("HARD", "easy"), normalize_level(None, "easy"), normalize_level("x", None)) == ("hard", "easy", "medium"))
+for lvl, marker in (("easy", "DIFFICULTY: EASY"), ("hard", "DIFFICULTY: HARD")):
+    os.environ.pop("VOICE_INTERVIEWER", None)
+    db = FakeDB(HIST)
+    rt.get_supabase_client = lambda: db
+    o = asyncio.run(rt.create_realtime_session(rt.RealtimeSessionRequest(case_id="c1", attempt_id="a1", level=lvl),
+                                               authorization="Bearer t"))
+    ins_l = (_FakeAsyncClient.last or {}).get("session", {}).get("instructions", "")
+    check(f"level={lvl}: the prompt carries the {lvl} block, response echoes it",
+          o.get("level") == lvl and marker in ins_l and ins_l.index(marker) > ins_l.index("HOW YOU RUN THIS"))
+hard = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate", level="hard")
+easy = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate", level="easy")
+check("hard: pressure-tests, hints only on request", "Pressure-test" in hard and "only when they explicitly ask" in hard)
+check("easy: offers cues unprompted, sooner hints", "offer a cue without waiting to be asked" in easy)
+
+print()
+print("=" * 72)
 print("2b. GEMINI LIVE SESSION (the admin's current voice mode)")
 print("=" * 72)
 import routes.realtime_gemini as rtg  # noqa: E402
@@ -334,6 +366,30 @@ check("Gemini live: private notes + conversation so far (no SAY label)",
 check("Gemini live: still speech-to-speech with both transcripts streaming",
       gcfg.get("response_modalities") == ["AUDIO"] and "input_audio_transcription" in gcfg and "output_audio_transcription" in gcfg)
 check("Gemini: the prompt (with private notes) is never sent back to the browser", "instructions" not in gout)
+check("Gemini live: lowest-latency config first (no thinking pass, 500 ms end-of-turn)",
+      (gcfg.get("thinking_config") or {}).get("thinking_budget") == 0
+      and gcfg.get("realtime_input_config", {}).get("automatic_activity_detection", {}).get("silence_duration_ms") == 500)
+check("Gemini live: resume + level reported", gout.get("resume") is True and gout.get("level") == "medium")
+
+
+class _PickyTokens:
+    seen = []
+
+    def create(self, config):
+        cfg = config["live_connect_constraints"]["config"]
+        _PickyTokens.seen.append(sorted(k for k in ("thinking_config", "realtime_input_config") if k in cfg))
+        if "thinking_config" in cfg:
+            raise ValueError("unknown field thinking_config")
+        _gcap["config"] = config
+        return types.SimpleNamespace(name="auth_tokens/test")
+
+
+_fake_genai.Client = lambda api_key=None: types.SimpleNamespace(auth_tokens=_PickyTokens())
+gout2, gcfg2 = gmint()
+check("Gemini: if the no-thinking setting is rejected, the VAD-tuned config is used (voice never breaks)",
+      gout2.get("token") == "auth_tokens/test" and "thinking_config" not in gcfg2
+      and _PickyTokens.seen[:2] == [["realtime_input_config", "thinking_config"], ["realtime_input_config"]], _PickyTokens.seen)
+_fake_genai.Client = lambda api_key=None: types.SimpleNamespace(auth_tokens=_FakeTokens())
 gout, gcfg = gmint("renderer")
 check("Gemini VOICE_INTERVIEWER=renderer: old flow (voice-renderer instructions)",
       gcfg.get("system_instruction") == VOICE_RENDERER_INSTRUCTIONS and gout.get("interviewer") == "renderer")

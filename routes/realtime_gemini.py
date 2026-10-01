@@ -33,7 +33,7 @@ from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
 from services.realtime_credits import has_credit, get_balance, deduct as deduct_credit
 from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS, strip_say_label
-from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions
+from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions, normalize_level
 from services.voice_coach import voice_interviewer_mode
 
 load_dotenv()
@@ -104,6 +104,7 @@ def _resolve_live_model() -> str:
 class GeminiSessionRequest(BaseModel):
     case_id: str
     attempt_id: Optional[str] = None
+    level: Optional[str] = None   # easy | medium | hard (absent -> the case's difficulty)
 
 
 @router.post("/session")
@@ -134,6 +135,7 @@ def create_gemini_session(
         raise HTTPException(status_code=404, detail="Case not found")
 
     interviewer = voice_interviewer_mode(uid, getattr(user_obj, "email", None))
+    level, resume = None, False
     if interviewer == "model_led":
         # LIVE (default): Gemini IS the interviewer and answers the candidate in its
         # own voice straight away. Everything it needs is pinned into the session
@@ -152,9 +154,12 @@ def create_gemini_session(
                                for m in (msgs.data or []) if m.get("role") in ("user", "assistant")]
             except Exception as e:  # noqa: BLE001 -- context is a nicety, never a blocker
                 print(f"[gemini-rt] attempt context not read: {type(e).__name__}")
+        level = normalize_level(body.level, row.get("difficulty"))
+        resume = bool(history)
         instructions = build_voice_interviewer_instructions(
             llm_case_content(row), row.get("type") or "", None,
-            hint=row.get("hint"), solution=row.get("solution"), transcript=history, market=case_market(row))
+            hint=row.get("hint"), solution=row.get("solution"), transcript=history, market=case_market(row),
+            level=level)
     else:
         # RENDERER (VOICE_INTERVIEWER=renderer): Gemini is only the interviewer's
         # VOICE: V11 decides every turn via /attempts/{id}/voice-decision and the
@@ -194,11 +199,21 @@ def create_gemini_session(
         # never breaks over a latency tweak.
         tuned = dict(constraints_config)
         tuned["realtime_input_config"] = {"automatic_activity_detection": {"silence_duration_ms": 500}}
-        try:
-            tok = _mint(tuned)
-        except Exception as e:
-            print(f"[gemini-rt] VAD-tuned config rejected ({e}); minting plain config")
-            tok = _mint(constraints_config)
+        # Fastest first: no "thinking" pass before speaking (native-audio models
+        # think by default, which adds a pause before every reply). Each step down
+        # drops one tweak, so voice never breaks over a latency setting.
+        fast = dict(tuned)
+        fast["thinking_config"] = {"thinking_budget": 0}
+        tok = None
+        for label, cfg in (("fast", fast), ("vad-tuned", tuned), ("plain", constraints_config)):
+            try:
+                tok = _mint(cfg)
+                print(f"[gemini-rt] session config: {label} (model {model_id})")
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"[gemini-rt] {label} config rejected ({str(e)[:160]})")
+        if tok is None:
+            raise HTTPException(status_code=502, detail="Could not start the voice session.")
 
         token_name = getattr(tok, "name", None)
         if not token_name:
@@ -221,6 +236,8 @@ def create_gemini_session(
             # "renderer" = V11 decides each turn and Gemini says the line.
             "interviewer": interviewer,
             "open_first": interviewer == "model_led",
+            "level": level,
+            "resume": resume,
         }
     except HTTPException:
         raise

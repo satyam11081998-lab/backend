@@ -44,7 +44,28 @@ saves both transcripts in speaking order (`lib/voice/gemini-live.ts`), stops the
 barge-in, and applies the same answer guardrail (cut, then steer once the cut turn ends).
 
 Unchanged: transcript saving (`/realtime-turn`, same rows for scoring), C9 counting, credits and
-metering, scoring and the results page. Gemini and the standard (pipeline) voice are not affected.
+metering, scoring and the results page. The standard (pipeline) voice mode is not affected.
+
+## Opening, resume and difficulty
+
+- **Fresh call:** the case is already on the candidate's screen, so the interviewer does not explain
+  it - it greets, points to the case, and asks for their approach (it explains only if asked).
+- **Coming back** (ended voice, reopened it; or switched from chat): the session prompt carries the
+  saved conversation and the interviewer RESUMES from where it was - no new greeting, no restart.
+- **Easy / Medium / Hard** picker in the voice header (remembered per browser; default = the case's
+  own difficulty). Easy = coaching (cues offered unprompted, earlier hints, frameworks named);
+  Medium = the standard playbook; Hard = tough final round (rare affirmation, pressure-testing,
+  "so what?", minimal hints only on request, sanity check required). Changing it reconnects the
+  call with the new style and resumes.
+
+## Latency and transcripts
+
+- Gemini Live sessions ask for no "thinking" pass before speaking and a 500 ms end-of-turn
+  (each tweak falls back automatically if Google rejects it). The browser console prints the
+  model, level and resume flag (`[gemini] interviewer: live ...`).
+- The model answers from the audio itself; transcripts stream alongside and never hold a reply up.
+- A reply whose end Gemini never reports is closed after 2.5 s of quiet, so the transcript and the
+  saved turns never stall; a save that hangs is skipped after 10 s so later saves still go through.
 
 ## Switches (Render env; restart, no deploy)
 
