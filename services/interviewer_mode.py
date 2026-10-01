@@ -1,6 +1,6 @@
 """
 Modality Router and Instruction generation.
-V10.1: Tightened ANSWER_DIRECT instruction to prevent solution leakage.
+V10.2: Tightened DELIVER_SOLUTION to prevent massive info dumps when requested.
 """
 from __future__ import annotations
 from typing import Any, Dict, Tuple
@@ -32,6 +32,7 @@ Q_BUDGET: Dict[str, int] = {k: (1 if v else 0) for k, v in ALLOW_QUESTIONS.items
 
 
 def get_modality_instruction(mode: str, policy: str, new_message: str, signals: Dict[str, Any] = None) -> str:
+    """Returns the explicit generation boundary for Deep Lane LLM modalities."""
     if signals is None:
         signals = {}
 
@@ -74,8 +75,8 @@ def get_modality_instruction(mode: str, policy: str, new_message: str, signals: 
                 "Do not solve the next analytical step for them. Stop.")
                 
     if mode == "DELIVER_SOLUTION":
-        return ("Provide the necessary solution, recommendation, or structural spine. "
-                "Be concise. Do not deflect with another question. Stop.")
+        return ("The candidate asked for the solution/approach. Provide ONLY the immediate next step, hint, or structural spine. "
+                "DO NOT break down the entire step-by-step final solution. Give them a direction to work with and stop. Be extremely concise.")
                 
     if mode == "OPEN":
         return "Kick the case off. Set the prompt in <=2 short lines, then ask ONE clean opening question."

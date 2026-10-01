@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user_id, get_verified_user, is_guest_user
 from services.access_guard import assert_can_attempt, effective_tier
-from services.markets import case_market, intl_daily_ids, market_today, llm_case_content
+from services.markets import case_market, india_daily_ids, intl_daily_ids, market_today, llm_case_content
 from services.rate_limit import check_rate_limit
 from services.limits import MESSAGE_MAX_CHARS, RECOMMENDATION_MAX_CHARS
 from services.interview_engine import (
@@ -1551,20 +1551,8 @@ def submit_attempt(
             daily_date_val = us_today
     elif is_first_attempt:
         try:
-            sched = (
-                supabase.table("daily_schedule")
-                .select("case_id, guesstimate_code")
-                .eq("scheduled_date", today_ist)
-                .limit(1)
-                .execute()
-            )
-            srow = (sched.data or [None])[0]
-            daily_ids = set()
-            if srow:
-                if srow.get("case_id"):
-                    daily_ids.add(srow["case_id"])
-                if srow.get("guesstimate_code"):
-                    daily_ids.add(srow["guesstimate_code"])
+            # Same pair the access gate and the dashboard use (on/before today).
+            daily_ids = india_daily_ids(supabase, today_ist, exact=False)
             if attempt["case_id"] in daily_ids:
                 counted_for_daily = True
                 daily_date_val = today_ist

@@ -1,7 +1,7 @@
 """
 Control-tag parsing, streaming strip, Contextual Assessor, and Intervention Gate.
-Implements V10.1: Safely routing imperatives to Deep Lane and cleanly falling back 
-to contextual PROBEs or HAND_BACKs to keep case momentum natural.
+Implements V10.2: Safely routing imperatives to Deep Lane and cleanly falling back 
+to contextual PROBEs or HAND_BACKs.
 """
 from __future__ import annotations
 

@@ -122,6 +122,42 @@ def intl_daily_ids(supabase, market: str = "US", date_str: Optional[str] = None,
     return ids
 
 
+def india_daily_row(supabase, date_str: Optional[str] = None, exact: bool = True) -> Optional[dict]:
+    """India's daily_schedule row (case_id, guesstimate_code, scheduled_date).
+
+    exact=True  → only the row for `date_str` (default: today in IST).
+    exact=False → the most recent row on/before that date. This is what the
+                  frontend shows (lib/daily-server.ts, lib/access.ts): the India
+                  cron is scheduled for 00:01 IST but GitHub runs it hours late,
+                  so between IST midnight and the cron the dashboard offers
+                  yesterday's pair, and the gate must treat it as the daily too.
+    Never raises: any read error → None.
+    """
+    day = date_str or market_today("IN")
+    try:
+        q = supabase.table("daily_schedule").select("case_id, guesstimate_code, scheduled_date")
+        if exact:
+            q = q.eq("scheduled_date", day)
+        else:
+            q = q.lte("scheduled_date", day).order("scheduled_date", desc=True)
+        res = q.limit(1).execute()
+        return (res.data or [None])[0] if res and res.data else None
+    except Exception:
+        return None
+
+
+def india_daily_ids(supabase, date_str: Optional[str] = None, exact: bool = True) -> Set[str]:
+    """Case refs of India's daily pair (guesstimate_code may be an id OR a short code)."""
+    row = india_daily_row(supabase, date_str, exact)
+    ids: Set[str] = set()
+    if row:
+        if row.get("case_id"):
+            ids.add(row["case_id"])
+        if row.get("guesstimate_code"):
+            ids.add(row["guesstimate_code"])
+    return ids
+
+
 # ── The gate ────────────────────────────────────────────────────────────────
 
 def _is_admin(supabase, user_id: str) -> bool:

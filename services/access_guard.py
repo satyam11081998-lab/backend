@@ -19,6 +19,7 @@ from fastapi import HTTPException
 
 from services.markets import (
     assert_market_access,
+    india_daily_ids,
     intl_daily_ids,
     market_today,
     market_day_start_iso,
@@ -177,18 +178,14 @@ def assert_can_attempt(supabase, user_id: str, case: dict) -> None:
     if tier == "pro":
         return
 
-    # today's daily schedule (case_id + guesstimate case id)
-    sched = supabase.table("daily_schedule").select(
-        "case_id, guesstimate_code"
-    ).eq("scheduled_date", today).limit(1).execute()
-    srow = (sched.data or [None])[0] if sched and sched.data else None
-    daily_ids = set()
-    if srow:
-        if srow.get("case_id"):
-            daily_ids.add(srow["case_id"])
-        if srow.get("guesstimate_code"):
-            daily_ids.add(srow["guesstimate_code"])
-    is_daily = case_id in daily_ids
+    # Today's daily pair: the most recent schedule row on/before today (IST),
+    # the same pair the dashboard offers. It was an exact-date match, so between
+    # IST midnight and the (late-running) India cron a guest who clicked the
+    # dashboard's case got "Sign up free to practise beyond today's case" and a
+    # free user burned their one-time extra on it (fixed 2026-10-01).
+    daily_ids = india_daily_ids(supabase, today, exact=False)
+    case_code = case.get("code")
+    is_daily = case_id in daily_ids or (bool(case_code) and case_code in daily_ids)
 
     # first attempt vs re-attempt
     prior = supabase.table("case_attempts").select("id").eq(
