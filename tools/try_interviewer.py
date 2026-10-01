@@ -22,7 +22,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+    # override=True: the backend's .env wins over an old OPENAI_API_KEY left in the
+    # Windows/user environment (load_dotenv never replaces an existing variable otherwise).
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+                override=True)
 except Exception:  # noqa: BLE001
     pass
 os.environ["ADAPTIVE_INTERVIEWER"] = "true"
