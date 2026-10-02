@@ -221,10 +221,11 @@ td = sess["audio"]["input"]["turn_detection"]
 ins = sess["instructions"]
 check("default session is model-led: the model answers by itself, barge-in kept",
       out.get("interviewer") == "model_led" and td["create_response"] is True and td["interrupt_response"] is True, td)
-check("model-led: replies are not held back (semantic_vad eagerness medium by default)", td.get("eagerness") == "medium", td)
+check("model-led: replies come fast (semantic_vad eagerness high by default)", td.get("eagerness") == "high", td)
 check("model-led: NO tools by default (a tool call is a round trip = lag)", "tools" not in sess, sess.get("tools"))
-check("model-led: streaming transcription model by default (live transcript)",
-      sess["audio"]["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe", sess["audio"]["input"]["transcription"])
+check("model-led: streaming transcription model, in English (no Devanagari for Indian English)",
+      sess["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe", "language": "en"},
+      sess["audio"]["input"]["transcription"])
 check("model-led: the interviewer opens the call; per-turn coach off",
       out.get("open_first") is True and out.get("coach") is False, out)
 check("prompt: the case sits on top", ins.startswith("=== THE CASE") and CASE_CONTENT in ins.split("===")[2])
@@ -238,9 +239,16 @@ check("prompt: coach notes are NOT added when the coach is off", "They asked for
 check("prompt: playbook sits below the case", ins.index("=== THE CASE") < ins.index("=== HOW YOU RUN THIS"))
 for phrase in ("HOW A STRUCTURED THINKER WORKS A CASE", "MECE", "Guesstimate / market sizing", "Profitability",
                "Market entry", "Sanity-check", "Pick up THEIR words", "question can come without a question mark",
-               "Do NOT question every step", "at most ONE question", "real talk", "CUE", "FRAMEWORK", "ANALOGY",
-               "results page", "Never say \"that's for you to figure out\"", "Natural Indian English"):
+               "Do NOT question every step", "at most ONE question", "CUE", "FRAMEWORK", "ANALOGY",
+               "results page", "Never say \"that's for you to figure out\"", "Natural Indian English",
+               # what a human interviewer does (2026-10-02 feedback)
+               "SAY ONLY WHAT THIS MOMENT NEEDS", "Never apologise or say sorry", "\"Are you sure about that?\"",
+               "food for thought", "Not a question back at them", "never the same question again",
+               "on the right track", "Most of your turns are under fifteen words", "never say you \"can't\"",
+               "Never read it out, restate it or summarise it", "it is not a turn"):
     check(f"playbook states: {phrase!r}", phrase in ins)
+check("playbook: no refusal script and no apology wording to copy",
+      "I can't give you" not in ins and "I apologize" not in ins)
 os.environ["VOICE_COACH"] = "on"
 out, sess = mint_with_history(state={"voice": {"coach_notes": ["They asked for help: call get_hint."]}})
 check("VOICE_COACH=on: coach notes join the prompt and the client is told to coach",
@@ -251,7 +259,7 @@ out, sess = mint_with_history()
 check("VOICE_TOOLS=on: hint/answer tools offered (opt-in)", [t["name"] for t in sess.get("tools", [])] == ["get_hint", "answer_request"])
 os.environ.pop("VOICE_TOOLS")
 us = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate", market="US")
-check("US cases: American English, dollars", "Natural American English" in us and "lakh" not in us.split("TALKING IN REAL TIME")[1].split("\n")[3])
+check("US cases: American English, dollars", "Natural American English" in us and "lakh, crore" not in us)
 
 
 class _RejectThenOk:
@@ -292,7 +300,7 @@ check("fresh call: the case is on screen - do not explain it, ask them to read i
 out, sess = mint_with_history()
 check("reopening voice with saved turns RESUMES (no restart, no re-explaining)",
       out.get("resume") is True and "You are RESUMING this interview" in sess["instructions"]
-      and "already on the candidate's screen" not in sess["instructions"])
+      and "Greet them in a few words" not in sess["instructions"])
 out, sess = mint_with_history(history=[])
 check("first voice call on an attempt is fresh", out.get("resume") is False and "RESUMING" not in sess["instructions"])
 check("level defaults to the case's own difficulty", out.get("level") == "medium" and "DIFFICULTY: MEDIUM" in sess["instructions"])
@@ -311,6 +319,17 @@ hard = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate", level="
 easy = build_voice_interviewer_instructions(CASE_CONTENT, "guesstimate", level="easy")
 check("hard: pressure-tests, hints only on request", "Pressure-test" in hard and "only when they explicitly ask" in hard)
 check("easy: offers cues unprompted, sooner hints", "offer a cue without waiting to be asked" in easy)
+brief = ("Hello! Our company is a well-established regional player in Gujarat's traditional namkeen market, with "
+         "Rs 100 crores in annual revenue. How would you like to structure your approach?")
+hist_ro = [{"role": "user", "content": "I'd focus on general trade."},
+           {"role": "assistant", "content": "Hello! Our company is a well-established"},
+           {"role": "assistant", "content": "Yes, general trade first makes sense for a mass brand."}]
+ro = build_voice_interviewer_instructions(brief, "growth", transcript=hist_ro)
+check("history: an interviewer line that read the brief aloud is replaced (never copied again)",
+      "INTERVIEWER: Hello! Our company" not in ro and "INTERVIEWER: (read the case brief aloud - never do this again)" in ro
+      and "INTERVIEWER: Yes, general trade first makes sense" in ro and "CANDIDATE: I'd focus on general trade." in ro)
+check("prompt: the brief may be in the client's voice - those are not lines to read",
+      "written in the client's voice" in ro and "not lines for you to read" in ro)
 
 print()
 print("=" * 72)
@@ -341,6 +360,7 @@ rtg.get_ai_input_quota = lambda sb, uid: {"tier": "pro"}
 rtg.has_credit = lambda *a, **k: True
 rtg.get_balance = lambda *a, **k: {"total_remaining": 10}
 rtg.log_ai_usage = lambda **k: None
+_REAL_RESOLVE = rtg._resolve_live_model
 rtg._resolve_live_model = lambda: "fake-live"
 
 
@@ -363,13 +383,59 @@ check("Gemini live: the session prompt is the playbook with the case on top",
       gins.startswith("=== THE CASE") and CASE_CONTENT in gins and "HOW A STRUCTURED THINKER" in gins)
 check("Gemini live: private notes + conversation so far (no SAY label)",
       SOLUTION in gins and "CANDIDATE: Hi, I'd like to start" in gins and "SAY:" not in gins)
-check("Gemini live: still speech-to-speech with both transcripts streaming",
+check("Gemini live: still speech-to-speech with both transcripts (saved, never in front of a reply)",
       gcfg.get("response_modalities") == ["AUDIO"] and "input_audio_transcription" in gcfg and "output_audio_transcription" in gcfg)
+check("Gemini: candidate transcript pinned to English (en-IN for Indian cases)",
+      gcfg.get("input_audio_transcription") == {"language_codes": ["en-IN"]}, gcfg.get("input_audio_transcription"))
 check("Gemini: the prompt (with private notes) is never sent back to the browser", "instructions" not in gout)
-check("Gemini live: lowest-latency config first (no thinking pass, 500 ms end-of-turn)",
-      (gcfg.get("thinking_config") or {}).get("thinking_budget") == 0
-      and gcfg.get("realtime_input_config", {}).get("automatic_activity_detection", {}).get("silence_duration_ms") == 500)
+aad = gcfg.get("realtime_input_config", {}).get("automatic_activity_detection", {})
+check("Gemini live: fastest config first (quick end-of-turn, echo/noise-resistant start)",
+      aad == {"start_of_speech_sensitivity": "START_SENSITIVITY_LOW", "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+              "prefix_padding_ms": 200, "silence_duration_ms": 500} and gout.get("tier") == 0 and gout.get("tiers") == 3, aad)
+check("Gemini 3.x live: no thinking setting (those models reject it)", "thinking_config" not in gcfg)
 check("Gemini live: resume + level reported", gout.get("resume") is True and gout.get("level") == "medium")
+
+# 2.5 native audio thinks by default: the fast config turns that off.
+rtg._resolve_live_model = lambda: "gemini-2.5-flash-native-audio-preview-12-2025"
+_, gcfg25 = gmint()
+check("Gemini 2.5 native audio: no thinking pass before speaking",
+      (gcfg25.get("thinking_config") or {}).get("thinking_budget") == 0)
+rtg._resolve_live_model = lambda: "fake-live"
+
+# The browser asks for the next config when Google refuses one at setup.
+db_t = FakeDB(HIST)
+rtg.get_supabase_client = lambda: db_t
+for want_tier, has_lang, has_voice in ((1, False, True), (2, False, False), (9, False, False)):
+    o = rtg.create_gemini_session(rtg.GeminiSessionRequest(case_id="c1", attempt_id="a1", tier=want_tier),
+                                  authorization="Bearer t")
+    c = _gcap["config"]["live_connect_constraints"]["config"]
+    check(f"Gemini tier={want_tier}: a simpler config (step-down after a refused setup)",
+          o["tier"] == min(want_tier, 2) and ("language_codes" in c["input_audio_transcription"]) == has_lang
+          and ("speech_config" in c) == has_voice and c["system_instruction"].startswith("=== THE CASE"), (o["tier"], sorted(c)))
+
+# Model choice: the newest general live model on the key (3.8 Live is Google's
+# low-latency default), never translate/transcribe/extended-thinking variants.
+_saved_list, _saved_resolve = rtg._list_live_models, rtg._resolve_live_model
+rtg._resolve_live_model = _REAL_RESOLVE
+os.environ.pop("GEMINI_LIVE_MODEL", None)
+for listed, want in (
+        (["gemini-2.5-flash-native-audio-preview-12-2025", "gemini-3.1-flash-live-preview", "gemini-3.8-live",
+          "gemini-3.8-live-extended-thinking", "gemini-3.5-live-translate-preview", "gemini-3.5-transcribe-live"],
+         "gemini-3.8-live"),
+        (["gemini-2.5-flash-native-audio-preview-09-2025", "gemini-3.1-flash-live-preview"], "gemini-3.1-flash-live-preview"),
+        (["gemini-live-2.5-flash-preview", "gemini-2.5-flash-native-audio-preview-09-2025",
+          "gemini-2.5-flash-native-audio-preview-12-2025"], "gemini-2.5-flash-native-audio-preview-12-2025")):
+    rtg._MODEL_CACHE["model"] = None
+    rtg._list_live_models = lambda listed=listed: listed
+    check(f"model choice: {want} from {len(listed)} listed", rtg._resolve_live_model() == want, rtg._resolve_live_model())
+rtg._MODEL_CACHE["model"] = None
+os.environ["GEMINI_LIVE_MODEL"] = "gemini-2.5-flash-native-audio-preview-12-2025"
+rtg._list_live_models = lambda: ["gemini-3.8-live", "gemini-2.5-flash-native-audio-preview-12-2025"]
+check("model choice: GEMINI_LIVE_MODEL still wins when it is available",
+      rtg._resolve_live_model() == "gemini-2.5-flash-native-audio-preview-12-2025")
+os.environ.pop("GEMINI_LIVE_MODEL")
+rtg._MODEL_CACHE["model"] = None
+rtg._list_live_models, rtg._resolve_live_model = _saved_list, _saved_resolve
 
 
 class _PickyTokens:
@@ -377,18 +443,19 @@ class _PickyTokens:
 
     def create(self, config):
         cfg = config["live_connect_constraints"]["config"]
-        _PickyTokens.seen.append(sorted(k for k in ("thinking_config", "realtime_input_config") if k in cfg))
-        if "thinking_config" in cfg:
-            raise ValueError("unknown field thinking_config")
+        _PickyTokens.seen.append(bool(cfg["input_audio_transcription"]))
+        if cfg["input_audio_transcription"]:
+            raise ValueError("unknown field language_codes")
         _gcap["config"] = config
         return types.SimpleNamespace(name="auth_tokens/test")
 
 
 _fake_genai.Client = lambda api_key=None: types.SimpleNamespace(auth_tokens=_PickyTokens())
 gout2, gcfg2 = gmint()
-check("Gemini: if the no-thinking setting is rejected, the VAD-tuned config is used (voice never breaks)",
-      gout2.get("token") == "auth_tokens/test" and "thinking_config" not in gcfg2
-      and _PickyTokens.seen[:2] == [["realtime_input_config", "thinking_config"], ["realtime_input_config"]], _PickyTokens.seen)
+check("Gemini: if a fast setting is rejected at mint, the next config is used (voice never breaks)",
+      gout2.get("token") == "auth_tokens/test" and gout2.get("tier") == 1
+      and gcfg2.get("realtime_input_config") == {"automatic_activity_detection": {"silence_duration_ms": 500}}
+      and _PickyTokens.seen[:2] == [True, False], _PickyTokens.seen)
 _fake_genai.Client = lambda api_key=None: types.SimpleNamespace(auth_tokens=_FakeTokens())
 gout, gcfg = gmint("renderer")
 check("Gemini VOICE_INTERVIEWER=renderer: old flow (voice-renderer instructions)",

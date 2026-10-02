@@ -182,7 +182,10 @@ def build_app(mock_url: str, gemini_ws: str = "ws://127.0.0.1:8768") -> FastAPI:
     def gemini_cfg():
         cfg = ((_GEMINI.get("last_config") or {}).get("live_connect_constraints") or {}).get("config") or {}
         return {"system_instruction": cfg.get("system_instruction"),
-                "response_modalities": cfg.get("response_modalities")}
+                "response_modalities": cfg.get("response_modalities"),
+                "input_audio_transcription": cfg.get("input_audio_transcription"),
+                "realtime_input_config": cfg.get("realtime_input_config"),
+                "has_voice": "speech_config" in cfg}
 
     @app.get("/__e2e/db")
     def dump():

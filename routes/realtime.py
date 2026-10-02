@@ -76,10 +76,11 @@ REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1400"))
 
 
 # Model-led sessions answer by themselves, so how long semantic_vad waits after
-# the candidate stops IS the reply latency. "medium" is OpenAI's default (and
-# ChatGPT-voice-like); "low" waits longest (more room for thinking pauses);
-# "high" answers fastest.
-REALTIME_MODEL_LED_EAGERNESS = os.getenv("REALTIME_MODEL_LED_EAGERNESS", "medium")
+# the candidate stops IS the reply latency. "high" answers fastest (waits at most
+# ~2 s on a trailing-off sentence; "medium" waits up to ~4 s, which candidates
+# felt as lag); "low" waits longest. A reply that lands mid-thought is just a
+# short go-ahead - the playbook tells the interviewer to keep those to a word.
+REALTIME_MODEL_LED_EAGERNESS = os.getenv("REALTIME_MODEL_LED_EAGERNESS", "high")
 
 
 def build_turn_detection(create_response: bool = False, eagerness: Optional[str] = None) -> dict:
@@ -270,7 +271,9 @@ async def create_realtime_session(
                     "turn_detection": build_turn_detection(
                         create_response=model_led,
                         eagerness=(REALTIME_MODEL_LED_EAGERNESS if model_led else None)),
-                    "transcription": {"model": transcribe_model},
+                    # English transcript (Indian English is otherwise often written
+                    # in Devanagari); runs alongside, never in front of a reply.
+                    "transcription": {"model": transcribe_model, "language": "en"},
                 },
                 "output": {"voice": REALTIME_VOICE},
             },

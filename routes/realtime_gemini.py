@@ -18,6 +18,7 @@ V11-decides-every-turn flow.
 """
 
 import os
+import re
 import time
 import datetime
 from typing import Optional
@@ -72,10 +73,27 @@ def _list_live_models() -> list:
         return []
 
 
+# Live models that are not a general voice agent (or are slower by design).
+_NOT_AN_AGENT = ("translate", "transcribe", "extended-thinking", "tts", "image", "embedding")
+
+
+def _live_rank(name: str):
+    """Newest general live model first (gemini-3.8-live > 3.1 flash live > 2.5
+    native audio ...); stable before preview; None = never auto-pick."""
+    n = name.lower()
+    if any(s in n for s in _NOT_AN_AGENT):
+        return None
+    m = re.search(r"gemini-(?:live-)?(\d+(?:\.\d+)?)", n)
+    ver = float(m.group(1)) if m else 0.0
+    return (ver, "preview" not in n and "exp" not in n, "native-audio" in n, n)
+
+
 def _resolve_live_model() -> str:
     """Pick a valid Live model for this key. Honors GEMINI_LIVE_MODEL when it is
-    set AND actually available; otherwise auto-selects (native-audio > flash-live
-    > flash). Cached for an hour. Never raises."""
+    set AND actually available; otherwise the newest general live model on the key
+    (gemini-3.8-live is Google's low-latency default since Sept 2026; the 2.5
+    native-audio previews are legacy and capacity-managed). Cached for an hour.
+    Never raises."""
     import time as _t
     now = _t.time()
     if _MODEL_CACHE["model"] and (now - _MODEL_CACHE["ts"]) < _MODEL_TTL:
@@ -86,25 +104,54 @@ def _resolve_live_model() -> str:
     if env and (env in live or not live):
         chosen = env
     if not chosen and live:
-        for pref in ("native-audio", "flash-live", "-live-", "flash", "live"):
-            hit = next((n for n in live if pref in n), None)
-            if hit:
-                chosen = hit
-                break
-        if not chosen:
-            chosen = live[0]
+        ranked = [(r, n) for n in live if (r := _live_rank(n)) is not None]
+        chosen = max(ranked)[1] if ranked else live[0]
     if not chosen:
-        chosen = env or "gemini-2.5-flash-native-audio-preview-12-2025"
+        chosen = env or "gemini-3.8-live"
     _MODEL_CACHE["model"] = chosen
     _MODEL_CACHE["ts"] = now
     print(f"[gemini-rt] resolved live model: {chosen} ({len(live)} live models available)")
     return chosen
 
 
+def _session_configs(model_id: str, instructions: str, market: str) -> list:
+    """Session configs, fastest first. Each step down drops tweaks, so voice never
+    breaks over a latency or transcription setting: the mint falls back on a
+    rejected config, and the browser asks for the next one (`tier`) if Google
+    refuses a session at setup.
+
+    0 fast:  English transcription (no Devanagari for Indian English), quick
+             end-of-turn (high end sensitivity, 500 ms), harder to trigger by echo
+             or noise (low start sensitivity, 200 ms of speech), and no thinking
+             pass on the models that think by default (2.5 native audio).
+    1 tuned: plain transcription, 500 ms end-of-turn.
+    2 plain: the bare minimum (no voice or VAD settings)."""
+    plain = {
+        "response_modalities": ["AUDIO"],
+        "system_instruction": instructions,
+        "input_audio_transcription": {},
+        "output_audio_transcription": {},
+    }
+    voiced = dict(plain, speech_config={"voice_config": {"prebuilt_voice_config": {"voice_name": GEMINI_LIVE_VOICE}}})
+    tuned = dict(voiced, realtime_input_config={"automatic_activity_detection": {"silence_duration_ms": 500}})
+    fast = dict(voiced)
+    fast["input_audio_transcription"] = {"language_codes": ["en-US" if (market or "").upper() == "US" else "en-IN"]}
+    fast["realtime_input_config"] = {"automatic_activity_detection": {
+        "start_of_speech_sensitivity": "START_SENSITIVITY_LOW",
+        "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+        "prefix_padding_ms": 200,
+        "silence_duration_ms": 500,
+    }}
+    if "native-audio" in model_id or "gemini-2.5" in model_id:
+        fast["thinking_config"] = {"thinking_budget": 0}  # 3.x live models reject thinking settings
+    return [("fast", fast), ("tuned", tuned), ("plain", plain)]
+
+
 class GeminiSessionRequest(BaseModel):
     case_id: str
     attempt_id: Optional[str] = None
     level: Optional[str] = None   # easy | medium | hard (absent -> the case's difficulty)
+    tier: int = 0                 # session config to start from (the browser steps down if Google refuses one)
 
 
 @router.post("/session")
@@ -136,12 +183,17 @@ def create_gemini_session(
 
     interviewer = voice_interviewer_mode(uid, getattr(user_obj, "email", None))
     level, resume = None, False
+    try:
+        from services.markets import case_market
+        market = case_market(case.data[0])
+    except Exception:  # noqa: BLE001 -- the market only picks the transcription language
+        market = "IN"
     if interviewer == "model_led":
         # LIVE (default): Gemini IS the interviewer and answers the candidate in its
         # own voice straight away. Everything it needs is pinned into the session
         # here: the case on top, private notes (hint + model solution), the
         # conversation so far (chat -> voice), and the structured-thinking playbook.
-        from services.markets import llm_case_content, case_market
+        from services.markets import llm_case_content
         row = case.data[0]
         history = []
         if body.attempt_id:
@@ -158,7 +210,7 @@ def create_gemini_session(
         resume = bool(history)
         instructions = build_voice_interviewer_instructions(
             llm_case_content(row), row.get("type") or "", None,
-            hint=row.get("hint"), solution=row.get("solution"), transcript=history, market=case_market(row),
+            hint=row.get("hint"), solution=row.get("solution"), transcript=history, market=market,
             level=level)
     else:
         # RENDERER (VOICE_INTERVIEWER=renderer): Gemini is only the interviewer's
@@ -173,13 +225,8 @@ def create_gemini_session(
     # the model, voice, modality, voice-renderer instructions and transcription, so the
     # browser sends only a minimal setup and none of it is client-tamperable.
     model_id = _resolve_live_model()
-    constraints_config = {
-        "response_modalities": ["AUDIO"],
-        "system_instruction": instructions,
-        "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": GEMINI_LIVE_VOICE}}},
-        "input_audio_transcription": {},
-        "output_audio_transcription": {},
-    }
+    configs = _session_configs(model_id, instructions, market)
+    start = max(0, min(int(body.tier or 0), len(configs) - 1))
     try:
         t0 = time.time()
         from google import genai  # lazy import: keeps its cost off every other route
@@ -193,21 +240,11 @@ def create_gemini_session(
                 "live_connect_constraints": {"model": model_id, "config": cfg},
             })
 
-        # Tighter turn-taking: shorten how long Gemini waits after the candidate
-        # stops speaking before it replies (default is long -> the "5-6s" lag).
-        # If the field is ever rejected, fall back to the plain config so voice
-        # never breaks over a latency tweak.
-        tuned = dict(constraints_config)
-        tuned["realtime_input_config"] = {"automatic_activity_detection": {"silence_duration_ms": 500}}
-        # Fastest first: no "thinking" pass before speaking (native-audio models
-        # think by default, which adds a pause before every reply). Each step down
-        # drops one tweak, so voice never breaks over a latency setting.
-        fast = dict(tuned)
-        fast["thinking_config"] = {"thinking_budget": 0}
-        tok = None
-        for label, cfg in (("fast", fast), ("vad-tuned", tuned), ("plain", constraints_config)):
+        tok, tier = None, start
+        for i in range(start, len(configs)):
+            label, cfg = configs[i]
             try:
-                tok = _mint(cfg)
+                tok, tier = _mint(cfg), i
                 print(f"[gemini-rt] session config: {label} (model {model_id})")
                 break
             except Exception as e:  # noqa: BLE001
@@ -219,7 +256,7 @@ def create_gemini_session(
         if not token_name:
             raise HTTPException(status_code=502, detail="Voice session token missing.")
         log_ai_usage(
-            user_id=uid, endpoint="/realtime-gemini/session", model=GEMINI_LIVE_MODEL,
+            user_id=uid, endpoint="/realtime-gemini/session", model=model_id,
             audio_minutes=0, latency_ms=int((time.time() - t0) * 1000), success=True,
             meta={"case_id": body.case_id, "attempt_id": body.attempt_id, "interviewer": interviewer},
         )
@@ -238,6 +275,10 @@ def create_gemini_session(
             "open_first": interviewer == "model_led",
             "level": level,
             "resume": resume,
+            # Which config this session uses; if Google refuses it at setup the
+            # browser asks again with tier + 1 (until tiers - 1).
+            "tier": tier,
+            "tiers": len(configs),
         }
     except HTTPException:
         raise
