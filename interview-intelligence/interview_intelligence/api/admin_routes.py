@@ -150,6 +150,55 @@ def patch_config(body: ConfigPatch, p: Principal = Depends(principal)):
         return {"flags": flags.all_flags(db)}
 
 
+# ---------------------------------------------------------------- AI routing ----------------
+def _routing_view(db) -> dict:
+    from ..ai import routing
+    from ..config import get_settings
+    flags.all_flags(db)  # refresh the cache routing reads
+    s = get_settings()
+    configured = {"openai": bool(s.openai_api_key), "gemini": bool(s.gemini_api_key), "groq": bool(s.groq_api_key),
+                  "anthropic": bool(s.anthropic_api_key)}
+    env = routing._overrides_from_env()
+    stages = []
+    for pid, (label, default) in routing.STAGES.items():
+        chain = routing.chain_for(pid, "")
+        stages.append({"id": pid, "label": label, "default": default, "current": routing.stage_preset(pid),
+                       "env_override": pid in env,
+                       "chain": [{"provider": t.provider, "model": t.model,
+                                  "configured": configured.get(t.provider, t.provider == "simulated")} for t in chain]})
+    return {"stages": stages, "presets": routing.PRESET_LABELS, "providers": configured, "gemini_model": s.gemini_model}
+
+
+@router.get("/ai-routing")
+def get_ai_routing(p: Principal = Depends(principal)):
+    with unit() as db:
+        admin(db, p)
+        return _routing_view(db)
+
+
+class RoutingPatch(BaseModel):
+    values: dict  # {stage id: preset | "default"}
+
+
+@router.patch("/ai-routing")
+def patch_ai_routing(body: RoutingPatch, p: Principal = Depends(principal)):
+    with unit() as db:
+        actor = admin(db, p)
+        current = dict(flags.flag(db, "ai.routes") or {})
+        for k, v in (body.values or {}).items():
+            if v in (None, "", "default"):
+                current.pop(k, None)
+            else:
+                current[k] = v
+        try:
+            v = flags.set_flag(db, "ai.routes", current, actor=actor.email)
+        except (ValueError, TypeError) as e:
+            raise Unprocessable(f"Invalid routing: {e}", code="bad_routing")
+        audit(db, "config.ai_routes", actor_user_id=actor.id, actor_email=actor.email, target_type="config",
+              meta={"ai.routes": v})
+        return _routing_view(db)
+
+
 def _pct(vals, q):
     if not vals:
         return None

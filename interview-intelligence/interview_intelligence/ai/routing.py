@@ -100,6 +100,63 @@ def _defaults() -> Dict[str, List[Target]]:
     }
 
 
+# ---- per-stage routing (owner decision 2026-10-02) ---------------------------------------
+# Light work (reading documents, classifying, checking a plan) goes to Gemini's free tier with
+# OpenAI as the automatic fallback (a 429 or an outage is never fatal). Anything that needs
+# real judgement — analysing answers, the live interviewer, evidence, scoring, feedback — goes
+# to OpenAI. Admins change any stage in Admin -> Interview Intelligence -> AI routing
+# (system_config `ai.routes`); II_MODEL_ROUTES (env) still wins over everything.
+PRESET_LABELS = {
+    "gemini": "Gemini (free tier), OpenAI if busy",
+    "openai_fast": "OpenAI fast",
+    "openai_strong": "OpenAI strong",
+    "groq": "Groq (fast, cheap), OpenAI if busy",
+}
+
+STAGES: Dict[str, Tuple[str, str]] = {  # prompt id -> (label, default preset)
+    "cv_parser": ("Read and parse the resume", "gemini"),
+    "jd_parser": ("Read and parse the job description", "gemini"),
+    "role_classifier": ("Identify the role family", "gemini"),
+    "blueprint_qa": ("Check the interview plan", "gemini"),
+    "competency_mapper": ("Decide which competencies to test", "openai_strong"),
+    "rubric_builder": ("Write the scoring rubrics", "openai_strong"),
+    "question_generator": ("Write tailored questions", "openai_strong"),
+    "turn_analyzer": ("Analyse each answer during the interview", "openai_fast"),
+    "interviewer": ("Phrase the interviewer's next line", "openai_fast"),
+    "evidence_extractor": ("Pull evidence out of the answers", "openai_strong"),
+    "competency_evaluator": ("Score each competency", "openai_strong"),
+    "assessment_qa": ("Double-check the scoring", "openai_fast"),
+    "feedback_writer": ("Write the feedback and report", "openai_strong"),
+    "feedback_qa": ("Double-check the feedback", "openai_fast"),
+}
+
+
+def preset_chain(name: str) -> List[Target]:
+    s = get_settings()
+    if name == "gemini":
+        return [Target("gemini", s.gemini_model), Target("openai", s.model_fast)]
+    if name == "groq":
+        return [Target("groq", "llama-3.3-70b-versatile"), Target("openai", s.model_fast)]
+    if name == "openai_fast":
+        return [Target(s.provider_fast, s.model_fast)] + (
+            [Target("openai", s.model_fast)] if s.provider_fast != "openai" else [])
+    if name == "openai_strong":
+        return [Target(s.provider_strong, s.model_strong), Target("openai", s.model_fast)]
+    return []
+
+
+def stage_preset(prompt_id: str) -> Optional[str]:
+    """The preset a stage runs on now: the admin's choice, else the built-in default."""
+    if prompt_id not in STAGES:
+        return None
+    try:
+        from ..access import flags
+        chosen = (flags.peek("ai.routes") or {}).get(prompt_id)
+    except Exception:  # noqa: BLE001 - routing must never fail over a settings read
+        chosen = None
+    return chosen if chosen in PRESET_LABELS else STAGES[prompt_id][1]
+
+
 def _overrides_from_env() -> Dict[str, List[Target]]:
     raw = get_settings().model_routes_json
     if not raw:
@@ -111,9 +168,18 @@ def _overrides_from_env() -> Dict[str, List[Target]]:
         return {}
 
 
-def resolve(prompt_id: str, route: str) -> List[Tuple[InterviewAIProvider, str]]:
+def chain_for(prompt_id: str, route: str) -> List[Target]:
     env = _overrides_from_env()
-    chain = env.get(prompt_id) or env.get(route) or _defaults().get(route, [])
+    if env.get(prompt_id) or env.get(route):
+        return env.get(prompt_id) or env.get(route) or []
+    preset = stage_preset(prompt_id)
+    if preset:
+        return preset_chain(preset)
+    return _defaults().get(route, [])
+
+
+def resolve(prompt_id: str, route: str) -> List[Tuple[InterviewAIProvider, str]]:
+    chain = chain_for(prompt_id, route)
     out: List[Tuple[InterviewAIProvider, str]] = []
     for t in chain:
         p = get_provider(t.provider)

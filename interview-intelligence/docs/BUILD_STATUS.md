@@ -32,6 +32,49 @@ Host-mode compromises (accepted to avoid a paid instance):
 * Run II's tests from inside `interview-intelligence/` (its `tests` package would clash with
   the backend's if pytest were run from the backend root).
 
+## 0b. Voice call stability, Gemini Live, per-step model routing (fourth pass, 2026-10-02)
+
+* **Echo fix.** On laptop speakers the interviewer's own voice leaked into the mic, cut the
+  interviewer off mid-sentence (OpenAI's server-side interruption) and could be sent as an
+  answer. Server-side interruption is now off (`interrupt_response: false`, Gemini
+  `NO_INTERRUPTION`); the browser cuts in only when the words heard are not the line's own
+  (two or more foreign words, ≥ a third of what was heard), and drops near-exact echoes of the
+  last line (fuzzy, ≥ 85 % of words) for 8 s after it ends. OpenAI lines are spoken with
+  `input: []` — out of the conversation context, so a line costs the same at minute 40 as at
+  minute 1 and the model never answers the candidate.
+* **Cost guards.** One answer is capped at 5 minutes (warning at 4:30, then it is sent and the
+  interview moves on). Silence ladder per question: nudge at 1 min, "are you still there?" at
+  3, pause + hang-up at 4. Two minutes on another tab (or a locked phone) = pause + hang-up. A
+  break closes the voice line and releases the mic; "Resume" redials. Nothing streams or is
+  billed while paused.
+* **Gemini Live** as a third engine (`voice.engine` = realtime | gemini | standard, Admin →
+  Settings). II mints a constrained ephemeral token (model, voice, instructions, transcription,
+  no-interruption and a 3 000-token sliding context window pinned server-side; 4 config tiers,
+  the browser steps down if Google refuses one at setup). Lines go as `SAY: …`; only the reply
+  to a SAY is played, Gemini's own answers are discarded and a SAY waits until one is over; a
+  guard cuts a reply that goes off script and asks once more. Mic audio streams only while the
+  candidate talks (local VAD + 600 ms pre-roll, `audioStreamEnd` after). Google's ~10-minute
+  connection limit and network drops redial the same engine (3 per 2 minutes, then standard).
+  Metered per minute (`II_GEMINI_LIVE_PRICES`), inside the daily budget.
+* **Per-step model routing** (Admin → AI routing; flag `ai.routes`; `II_MODEL_ROUTES` still
+  wins). Defaults: resume/JD parsing, role family and plan check on Gemini (free tier), OpenAI
+  as fallback; competency mapping, rubrics, questions, answer analysis, interviewer, evidence,
+  scoring and feedback on OpenAI. Free-tier caveat: Google may use free-tier content to improve
+  its products; documents are PII-redacted first (contact details, protected attributes), names
+  and employers are not.
+
+| Gate (fourth pass) | Result |
+|---|---|
+| II suite, Postgres 16 (backend-pinned venv and newer) | 287 passed |
+| II suite, SQLite | 286 passed, 1 skipped |
+| Voice node tests (conductor, OpenAI transport, Gemini transport) | 47 / 47 |
+| Frontend `tsc --noEmit` (device) / `next build` (copy) | exit 0 / OK |
+| Browser, Gemini call vs a local fake Gemini Live socket | token config pinned (voice, no-interruption, window); opening line sent verbatim as SAY; 2 spoken answers reached II as `kind=voice`; no ack sent; no SAY while Gemini's own answer was open; mic streamed only in speech stretches; break closed the socket and metered usage; resume redialled; a dropped socket redialled by itself and the interview continued; admin AI-routing tab change + reset |
+| Browser, OpenAI live call vs mock WebRTC peer | lines sent with `input: []`; echo of the line did not cut in or become an answer; a sound alone did not cut in; real words did (cancel + clear); 20 responses metered |
+| Browser, standard voice (fake mic) | 2 voice answers, typed answer, mute, break/resume, end |
+| Browser, 2 minutes on a hidden tab | interview paused (server status `paused`), line closed |
+| NOT verified | real Gemini Live / OpenAI audio (first heard on the live site); Gemini free-tier concurrency limits |
+
 ## 1. Verification run on 2026-10-02
 
 | Gate | Result |
@@ -140,9 +183,8 @@ Host-mode compromises (accepted to avoid a paid instance):
    before scaling out. (In host mode the backend must keep running a single worker process.)
 10. **Employer mode** is not built (the data model keeps candidate preparation separate from
     any hiring decision).
-11. **No user-facing navigation link yet.** The pages exist at `/interview-intelligence`;
-    the app nav is untouched so nothing changes for users during the preview. Add the link at
-    launch.
+11. **Navigation link** ("More → Interview Intelligence") is shown only to accounts II lets in
+    (admins, test users, and Pro once `ii.enabled_for_pro` is on), checked on every page load.
 12. Legacy `.doc` parsing is best-effort; users are asked to re-save as PDF/DOCX when it fails.
 
 ## 4. Known compromises

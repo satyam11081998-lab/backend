@@ -104,6 +104,9 @@ class Settings:
     model_strong: str = "gpt-4o"
     provider_fast: str = "openai"
     provider_strong: str = "openai"
+    # Gemini text model for the light stages (shared with the backend's GEMINI_MODEL: Google
+    # retires names without notice, one rename should fix every caller).
+    gemini_model: str = "gemini-3.6-flash"
     ai_timeout_s: float = 45.0
     # Live voice (OpenAI Realtime). The model only VOICES the lines II decides.
     realtime_model: str = "gpt-realtime-2.1"
@@ -188,6 +191,7 @@ def load_settings() -> Settings:
         model_strong=_env("II_MODEL_STRONG", "gpt-4o"),
         provider_fast=_env("II_PROVIDER_FAST", "openai"),
         provider_strong=_env("II_PROVIDER_STRONG", "openai"),
+        gemini_model=_env("II_GEMINI_MODEL") or _env("GEMINI_MODEL") or "gemini-3.6-flash",
         ai_timeout_s=_float("II_AI_TIMEOUT_S", 45.0),
         realtime_model=_env("II_REALTIME_MODEL") or _env("REALTIME_MODEL") or "gpt-realtime-2.1",
         realtime_transcribe_model=_env("II_REALTIME_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe") or "gpt-4o-mini-transcribe",

@@ -145,6 +145,30 @@ def record_live_usage(*, user_id: Optional[uuid.UUID], interview_id: uuid.UUID, 
     return cost
 
 
+# Gemini Live is priced per minute of audio (estimate; override II_GEMINI_LIVE_PRICES='{"in":..,"out":..}').
+GEMINI_LIVE_PER_MIN = {"in": 0.005, "out": 0.018}
+
+
+def record_voice_minutes(*, user_id: Optional[uuid.UUID], interview_id: uuid.UUID, provider: str, model: str,
+                         minutes_in: float, minutes_out: float) -> float:
+    """Meter minute-priced live voice (Gemini). Like record_live_usage: daily budget only."""
+    import os
+    prices = dict(GEMINI_LIVE_PER_MIN)
+    try:
+        raw = os.environ.get("II_GEMINI_LIVE_PRICES", "").strip()
+        if raw:
+            prices.update({k: float(v) for k, v in json.loads(raw).items() if k in prices})
+    except (ValueError, TypeError, AttributeError):
+        pass
+    cost = round(minutes_in * prices["in"] + minutes_out * prices["out"], 6)
+    _record(user_id=user_id, session_id=None, stage="live_voice", provider=provider, model=model,
+            prompt_id="live_voice.minutes", prompt_version="", schema_version="", input_tokens=0, output_tokens=0,
+            cost_usd=cost, latency_ms=0, status="ok", attempt=1, error="",
+            validation={"interview_id": str(interview_id), "minutes_connected": round(minutes_in, 3),
+                        "minutes_spoken": round(minutes_out, 3)})
+    return cost
+
+
 def pending_cost(session_id: Optional[uuid.UUID]) -> float:
     bucket = _collector.get() or []
     return sum(float(r.data.get("cost_usd") or 0) for r in bucket

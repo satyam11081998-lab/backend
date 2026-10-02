@@ -109,8 +109,9 @@ def test_live_call_secret_is_minted_server_side(client, openai_key):
     assert sent["url"].endswith("/realtime/client_secrets") and sent["headers"]["Authorization"] == "Bearer sk-test"
     sess = sent["json"]["session"]
     td = sess["audio"]["input"]["turn_detection"]
-    # II decides every line: the speech model never replies by itself; barge-in stays on.
-    assert td["type"] == "semantic_vad" and td["create_response"] is False and td["interrupt_response"] is True
+    # II decides every line: the speech model never replies by itself, and never cuts itself off
+    # on echo (the browser does the barge-in, only for words that are not the interviewer's own).
+    assert td["type"] == "semantic_vad" and td["create_response"] is False and td["interrupt_response"] is False
     assert sess["audio"]["input"]["transcription"]["language"] == "en"
     # The voice gets no interview content: no CV, JD, role, rubric or plan.
     assert "Brand" not in sess["instructions"] and "Priya" not in sess["instructions"]
@@ -208,3 +209,91 @@ def test_realtime_cost_is_bounded_and_tolerant():
     assert huge <= 2_000_000 * 64 / 1e6  # clamped
     legacy, _ = realtime_cost_usd({"input_tokens": 1000, "output_tokens": 1000})
     assert legacy > 0
+
+
+# ---------------------------------------------------------------- Gemini Live ---------------
+@pytest.fixture
+def gemini(monkeypatch):
+    """Gemini voice with Google stubbed out: model listing and token minting are faked."""
+    from interview_intelligence import config as cfg
+    from interview_intelligence.voice import routes as vr
+    minted = []
+    state = {"reject": 0, "import_error": False}
+
+    def fake_mint(key, model_id, conf):
+        if state["import_error"]:
+            raise ImportError("no google-genai")
+        if state["reject"] > 0:
+            state["reject"] -= 1
+            raise RuntimeError("config rejected")
+        minted.append({"key": key, "model": model_id, "config": conf})
+        return f"auth_tokens/tok{len(minted)}"
+
+    monkeypatch.setattr(vr, "_mint_gemini_token", fake_mint)
+    monkeypatch.setattr(vr, "_list_gemini_live_models", lambda key: ["gemini-2.5-flash-native-audio", "gemini-3.8-live",
+                                                                     "gemini-3.8-live-translate"])
+    vr._gemini_model_cache.update(model=None, ts=0.0)
+    yield {"on": lambda: cfg.set_settings_for_tests(make_settings(gemini_api_key="g-test")), "minted": minted,
+           "state": state}
+    cfg.set_settings_for_tests(make_settings())
+    vr._gemini_model_cache.update(model=None, ts=0.0)
+
+
+def test_gemini_call_is_minted_with_pinned_config(client, gemini):
+    enable_pro(client)
+    c = Candidate(client)
+    sid = c.ready_session(duration_minutes=15)
+    gemini["on"]()
+    r = client.post("/v1/voice/gemini", json={"session_id": sid, "voice": "cedar"}, headers=c.h)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "live_off"  # engine is OpenAI by default
+    _cfg(client, {"voice.engine": "gemini"})
+    r = client.post("/v1/voice/gemini", json={"session_id": sid, "voice": "cedar"}, headers=c.h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ws_url"].endswith("BidiGenerateContentConstrained?access_token=auth_tokens/tok1")
+    assert body["model"] == "models/gemini-3.8-live", "newest general live model; translate variant skipped"
+    assert body["voice"] == "Charon" and body["tier"] == 0 and body["tiers"] == 4
+    conf = gemini["minted"][0]["config"]
+    assert conf["realtime_input_config"]["activity_handling"] == "NO_INTERRUPTION"  # never cuts itself off on echo
+    assert conf["context_window_compression"]["sliding_window"]["target_tokens"] <= 4000  # flat cost per turn
+    assert "SAY:" in conf["system_instruction"] and "Never reply to the candidate" in conf["system_instruction"]
+    assert "Brand" not in conf["system_instruction"]  # no interview content in the voice
+    assert conf["speech_config"]["voice_config"]["prebuilt_voice_config"]["voice_name"] == "Charon"
+
+
+def test_gemini_call_steps_down_and_falls_back(client, gemini):
+    enable_pro(client)
+    _cfg(client, {"voice.engine": "gemini"})
+    c = Candidate(client)
+    sid = c.ready_session(duration_minutes=15)
+    r = client.post("/v1/voice/gemini", json={"session_id": sid}, headers=c.h)
+    assert r.status_code == 503 and r.json()["error"]["code"] == "live_unconfigured"
+    gemini["on"]()
+    gemini["state"]["reject"] = 1
+    r = client.post("/v1/voice/gemini", json={"session_id": sid}, headers=c.h)
+    assert r.status_code == 200 and r.json()["tier"] == 1, r.text
+    gemini["state"]["reject"] = 5
+    r = client.post("/v1/voice/gemini", json={"session_id": sid}, headers=c.h)
+    assert r.status_code == 503 and r.json()["error"]["code"] == "live_failed"
+    gemini["state"].update(reject=0, import_error=True)
+    r = client.post("/v1/voice/gemini", json={"session_id": sid}, headers=c.h)
+    assert r.status_code == 503 and r.json()["error"]["code"] == "gemini_unavailable"
+    other = Candidate(client, email="other@example.invalid")
+    gemini["state"]["import_error"] = False
+    assert client.post("/v1/voice/gemini", json={"session_id": sid}, headers=other.h).status_code == 404
+
+
+def test_gemini_minutes_are_metered(client, gemini):
+    enable_pro(client)
+    c = Candidate(client)
+    sid = c.ready_session(duration_minutes=15)
+    r = client.post("/v1/voice/gemini/usage", json={"session_id": sid, "seconds_connected": 120, "seconds_spoken": 60},
+                    headers=c.h)
+    assert r.status_code == 204, r.text
+    with db_session() as db:
+        run = db.execute(select(ModelRun).where(ModelRun.stage == "live_voice")).scalar_one()
+    assert run.provider == "gemini" and abs(float(run.cost_usd) - round(2 * 0.005 + 1 * 0.018, 6)) < 1e-9
+    r = client.post("/v1/voice/gemini/usage", json={"session_id": sid, "seconds_connected": 10 ** 9}, headers=c.h)
+    with db_session() as db:
+        costs = sorted(float(x.cost_usd) for x in db.execute(select(ModelRun).where(ModelRun.stage == "live_voice")).scalars())
+    assert costs[-1] <= 10 * 0.005 + 1e-9, "a single report is clamped to 10 minutes"

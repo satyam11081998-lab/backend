@@ -83,6 +83,7 @@ def _reset_state():
     crypto.reset_for_tests()
     routing.reset_for_tests()
     rate_limit.reset_for_tests()
+    flags.reset_cache()
     flags.invalidate()
     runner.reset_budget_cache()
     from interview_intelligence.voice import routes as voice_routes

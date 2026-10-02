@@ -31,6 +31,9 @@ def defaults() -> Dict[str, Any]:
         # candidate speaking + ~$0.08/min of the interviewer speaking); standard = record ->
         # transcribe -> speak (cheaper, a second or two slower per turn, no talk-over).
         "voice.engine": "realtime",
+        # Per-stage AI routing chosen in the admin (prompt id -> preset). Empty = built-in
+        # defaults: Gemini for reading documents, OpenAI for judgement (ai/routing.py).
+        "ai.routes": {},
         "company_intel.enabled": True,
         "company_intel.web_research": False,
         "technical.advanced_mode": True,
@@ -52,7 +55,7 @@ _TYPES = {
     k: (bool if isinstance(v, bool) else type(v))
     for k, v in {
         "ii.enabled": True, "ii.enabled_for_pro": False, "admin.test_access": True,
-        "voice.enabled": True, "voice.engine": "realtime", "company_intel.enabled": True,
+        "voice.enabled": True, "voice.engine": "realtime", "ai.routes": {}, "company_intel.enabled": True,
         "company_intel.web_research": False,
         "technical.advanced_mode": True, "technical.coding_exercises": False, "ocr.enabled": False,
         "drive.export_reports": True, "limits.max_active_sessions": 2, "limits.max_sessions_per_day": 5,
@@ -62,7 +65,7 @@ _TYPES = {
 }
 
 # String flags take one of a fixed set of values.
-ENUMS: Dict[str, tuple] = {"voice.engine": ("realtime", "standard")}
+ENUMS: Dict[str, tuple] = {"voice.engine": ("realtime", "gemini", "standard")}
 
 _cache: Dict[str, Any] = {"ts": 0.0, "data": {}}
 _lock = threading.Lock()
@@ -75,6 +78,12 @@ def on_change(fn) -> None:
     """Call `fn()` whenever a flag changes (e.g. to drop a cache derived from flags)."""
     if fn not in _listeners:
         _listeners.append(fn)
+
+
+def reset_cache() -> None:
+    """Tests: forget loaded overrides entirely (invalidate() keeps them for peek())."""
+    with _lock:
+        _cache.update(ts=0.0, data={})
 
 
 def invalidate() -> None:
@@ -98,6 +107,17 @@ def _load_overrides(db: Session) -> Dict[str, Any]:
         _cache["data"] = data
         _cache["ts"] = now
     return data
+
+
+def peek(key: str) -> Any:
+    """A flag's value WITHOUT a database read: the last loaded override, else the default.
+    For hot paths that hold no session (model routing). Fresh within CACHE_TTL_S of any request
+    that read flags, and immediately after an admin change in this process (set_flag)."""
+    with _lock:
+        data = dict(_cache["data"])
+    if key in data and data[key] is not None:
+        return data[key]
+    return defaults().get(key)
 
 
 def all_flags(db: Session) -> Dict[str, Any]:
@@ -140,6 +160,24 @@ def coerce(key: str, value: Any) -> Any:
         if allowed and v not in allowed:
             raise ValueError("expected one of: " + ", ".join(allowed))
         return v
+    if t is dict:
+        if key == "ai.routes":
+            from ..ai.routing import PRESET_LABELS, STAGES
+            if not isinstance(value, dict):
+                raise ValueError("expected {stage: preset}")
+            out = {}
+            for k, v in value.items():
+                if k not in STAGES:
+                    raise ValueError(f"unknown stage: {k}")
+                if v in (None, "", "default"):
+                    continue
+                if v not in PRESET_LABELS:
+                    raise ValueError(f"unknown preset for {k}: {v}")
+                out[k] = v
+            return out
+        if not isinstance(value, dict):
+            raise ValueError("expected an object")
+        return value
     if t is list:
         if not isinstance(value, list) or not all(isinstance(x, int) and 5 <= x <= 90 for x in value):
             raise ValueError("expected a list of minutes between 5 and 90")
@@ -157,5 +195,7 @@ def set_flag(db: Session, key: str, value: Any, *, actor: str) -> Any:
         row.updated_by = actor
         row.updated_at = utcnow()
     db.flush()
+    with _lock:  # visible to peek() at once, before the next full reload
+        _cache["data"] = {**_cache["data"], key: v}
     invalidate()
     return v
