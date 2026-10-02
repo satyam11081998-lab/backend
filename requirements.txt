@@ -74,3 +74,10 @@ google-genai>=1.0.0
 # rolls over at America/New_York midnight). Pure Python; a no-op where the OS
 # already ships /usr/share/zoneinfo, a guarantee where it does not.
 tzdata==2025.2
+
+# Interview Intelligence (./interview-intelligence, mounted at /ii). Imported lazily on the
+# first /ii call, so these cost no memory until II is used.
+SQLAlchemy==2.1.1
+psycopg[binary]==3.3.6
+python-docx==1.2.0
+olefile==0.47

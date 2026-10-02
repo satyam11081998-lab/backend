@@ -98,3 +98,8 @@ from routes import broadcast as _broadcast
 app.include_router(_broadcast.router)
 from routes import voice_coach as _voice_coach
 app.include_router(_voice_coach.router)
+
+# Interview Intelligence: its own package in ./interview-intelligence, mounted at /ii.
+# Dormant until II_DATABASE_URL is set; nothing of it loads until the first /ii call.
+from routes import interview_intelligence as _interview_intelligence
+_interview_intelligence.mount_interview_intelligence(app)

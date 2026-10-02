@@ -1,0 +1,1902 @@
+{
+ "version": "tax-2",
+ "notes": "Families are data. 'defaults' are starting weights; the competency mapper adds JD-specific and role-specific (rs:) competencies. 'functional_areas' are EXAMPLES for the mapper, never a closed universe. 'section_bias' multiplies mode section weights. 'report_dimensions' are the Level-1 categories shown for this family.",
+ "families": [
+  {
+   "id": "consulting",
+   "name": "Consulting",
+   "aliases": [
+    "management consultant",
+    "strategy consultant",
+    "business analyst consulting",
+    "associate consultant",
+    "engagement manager",
+    "consulting analyst",
+    "business consultant",
+    "consultant"
+   ],
+   "technical": false,
+   "defaults": {
+    "case_structuring": "critical",
+    "structured_thinking": "high",
+    "quantitative_reasoning": "high",
+    "synthesis_recommendation": "high",
+    "commercial_judgment": "high",
+    "communication": "high",
+    "stakeholder_management": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "profitability",
+    "market entry",
+    "growth strategy",
+    "pricing",
+    "M&A",
+    "operations improvement",
+    "market sizing"
+   ],
+   "case_types": [
+    "profitability",
+    "market_entry",
+    "growth",
+    "pricing",
+    "market_sizing",
+    "operations"
+   ],
+   "section_bias": {
+    "case": 2.0,
+    "functional": 0.6,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 0.8
+   },
+   "report_dimensions": {
+    "Problem structuring": [
+     "case_structuring",
+     "structured_thinking",
+     "problem_solving"
+    ],
+    "Quantitative & analytical": [
+     "quantitative_reasoning",
+     "analytical_reasoning",
+     "market_sizing_estimation"
+    ],
+    "Business judgment": [
+     "commercial_judgment",
+     "strategic_thinking"
+    ],
+    "Communication & synthesis": [
+     "communication",
+     "synthesis_recommendation"
+    ],
+    "Ownership & leadership": [
+     "ownership",
+     "leadership",
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "strategy",
+   "name": "Strategy / Corporate strategy",
+   "aliases": [
+    "strategy manager",
+    "corporate strategy",
+    "strategic planning",
+    "chief of staff",
+    "strategy",
+    "strategy analyst",
+    "founder's office",
+    "founders office",
+    "founder office"
+   ],
+   "technical": false,
+   "defaults": {
+    "strategic_thinking": "critical",
+    "commercial_judgment": "high",
+    "analytical_reasoning": "high",
+    "structured_thinking": "high",
+    "synthesis_recommendation": "high",
+    "stakeholder_management": "medium",
+    "role_company_understanding": "medium"
+   },
+   "functional_areas": [
+    "portfolio strategy",
+    "competitive analysis",
+    "business planning",
+    "M&A screening",
+    "OKRs"
+   ],
+   "case_types": [
+    "growth",
+    "market_entry",
+    "portfolio"
+   ],
+   "section_bias": {
+    "case": 1.4,
+    "functional": 1.0,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Strategic thinking": [
+     "strategic_thinking",
+     "commercial_judgment"
+    ],
+    "Analysis": [
+     "analytical_reasoning",
+     "quantitative_reasoning"
+    ],
+    "Structure & synthesis": [
+     "structured_thinking",
+     "synthesis_recommendation",
+     "communication"
+    ],
+    "Influence": [
+     "stakeholder_management",
+     "leadership"
+    ]
+   }
+  },
+  {
+   "id": "finance_corporate",
+   "name": "Corporate finance / FP&A",
+   "aliases": [
+    "financial analyst",
+    "fp&a",
+    "finance manager",
+    "treasury",
+    "controller",
+    "corporate finance"
+   ],
+   "technical": false,
+   "defaults": {
+    "financial_statement_analysis": "critical",
+    "corporate_finance": "high",
+    "fpa_budgeting": "high",
+    "financial_modeling": "high",
+    "quantitative_reasoning": "high",
+    "commercial_judgment": "medium",
+    "communication": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "working capital",
+    "cost of capital",
+    "capital budgeting",
+    "variance analysis",
+    "treasury and FX",
+    "taxation basics where relevant"
+   ],
+   "case_types": [
+    "investment_decision",
+    "statement_analysis"
+   ],
+   "section_bias": {
+    "case": 0.8,
+    "functional": 2.0,
+    "technical": 0.0,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 0.8
+   },
+   "report_dimensions": {
+    "Financial knowledge": [
+     "financial_statement_analysis",
+     "corporate_finance",
+     "fpa_budgeting",
+     "accounting_audit"
+    ],
+    "Numerical reasoning": [
+     "quantitative_reasoning",
+     "financial_modeling",
+     "analytical_reasoning"
+    ],
+    "Business judgment": [
+     "commercial_judgment"
+    ],
+    "Communication & ownership": [
+     "communication",
+     "ownership",
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "finance_markets",
+   "name": "Investment banking / Markets / Equity research",
+   "aliases": [
+    "investment banking",
+    "equity research",
+    "analyst ib",
+    "markets",
+    "trader",
+    "portfolio",
+    "asset management",
+    "private equity",
+    "venture capital"
+   ],
+   "technical": false,
+   "defaults": {
+    "valuation": "critical",
+    "financial_statement_analysis": "critical",
+    "financial_modeling": "high",
+    "markets_instruments": "high",
+    "quantitative_reasoning": "high",
+    "commercial_judgment": "high",
+    "communication": "medium",
+    "motivation_role_fit": "medium"
+   },
+   "functional_areas": [
+    "DCF",
+    "multiples",
+    "M&A process",
+    "LBO basics",
+    "derivatives",
+    "fixed income",
+    "portfolio theory",
+    "pitching a stock"
+   ],
+   "case_types": [
+    "valuation",
+    "investment_decision",
+    "stock_pitch"
+   ],
+   "section_bias": {
+    "case": 1.0,
+    "functional": 2.2,
+    "technical": 0.0,
+    "behavioral": 0.8,
+    "cv": 1.0,
+    "situational": 0.6
+   },
+   "report_dimensions": {
+    "Valuation & modelling": [
+     "valuation",
+     "financial_modeling"
+    ],
+    "Accounting & statements": [
+     "financial_statement_analysis",
+     "accounting_audit"
+    ],
+    "Markets knowledge": [
+     "markets_instruments"
+    ],
+    "Numerical reasoning": [
+     "quantitative_reasoning",
+     "analytical_reasoning"
+    ],
+    "Commercial judgment": [
+     "commercial_judgment"
+    ],
+    "Motivation & communication": [
+     "motivation_role_fit",
+     "communication"
+    ]
+   }
+  },
+  {
+   "id": "finance_risk_credit",
+   "name": "Risk / Credit / Banking",
+   "aliases": [
+    "credit analyst",
+    "risk analyst",
+    "relationship manager banking",
+    "corporate banking",
+    "underwriter"
+   ],
+   "technical": false,
+   "defaults": {
+    "credit_analysis": "critical",
+    "risk_management": "high",
+    "financial_statement_analysis": "high",
+    "regulatory_compliance": "medium",
+    "quantitative_reasoning": "high",
+    "commercial_judgment": "medium",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "cash flow coverage",
+    "covenants",
+    "credit scoring",
+    "market and operational risk",
+    "Basel/RBI norms where relevant"
+   ],
+   "case_types": [
+    "credit_decision"
+   ],
+   "section_bias": {
+    "case": 0.8,
+    "functional": 2.0,
+    "technical": 0.0,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Credit & risk knowledge": [
+     "credit_analysis",
+     "risk_management",
+     "regulatory_compliance"
+    ],
+    "Financial analysis": [
+     "financial_statement_analysis",
+     "quantitative_reasoning"
+    ],
+    "Judgment": [
+     "commercial_judgment",
+     "situational_judgment"
+    ],
+    "Communication": [
+     "communication",
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "accounting_audit",
+   "name": "Accounting / Audit / Tax",
+   "aliases": [
+    "chartered accountant",
+    "auditor",
+    "accountant",
+    "tax analyst",
+    "internal audit"
+   ],
+   "technical": false,
+   "defaults": {
+    "accounting_audit": "critical",
+    "financial_statement_analysis": "high",
+    "regulatory_compliance": "high",
+    "analytical_reasoning": "medium",
+    "ownership": "medium",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "revenue recognition",
+    "accruals and provisions",
+    "Ind AS / IFRS",
+    "audit sampling",
+    "internal controls",
+    "GST/direct tax where relevant"
+   ],
+   "case_types": [
+    "statement_analysis"
+   ],
+   "section_bias": {
+    "case": 0.4,
+    "functional": 2.2,
+    "technical": 0.0,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Accounting knowledge": [
+     "accounting_audit",
+     "financial_statement_analysis"
+    ],
+    "Compliance & controls": [
+     "regulatory_compliance"
+    ],
+    "Analysis": [
+     "analytical_reasoning"
+    ],
+    "Ownership & communication": [
+     "ownership",
+     "communication"
+    ]
+   }
+  },
+  {
+   "id": "marketing",
+   "name": "Marketing / Brand",
+   "aliases": [
+    "brand manager",
+    "marketing manager",
+    "product marketing",
+    "marketing associate",
+    "brand",
+    "marketing"
+   ],
+   "technical": false,
+   "defaults": {
+    "consumer_insight": "critical",
+    "brand_management": "high",
+    "go_to_market": "high",
+    "marketing_analytics": "high",
+    "commercial_judgment": "high",
+    "communication": "medium",
+    "stakeholder_management": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "segmentation, targeting, positioning",
+    "pricing",
+    "channels",
+    "campaign evaluation",
+    "brand equity",
+    "category management",
+    "GTM"
+   ],
+   "case_types": [
+    "campaign",
+    "brand",
+    "gtm",
+    "pricing",
+    "consumer"
+   ],
+   "section_bias": {
+    "case": 1.2,
+    "functional": 1.6,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Consumer & brand": [
+     "consumer_insight",
+     "brand_management",
+     "market_research"
+    ],
+    "GTM & commercial": [
+     "go_to_market",
+     "pricing_strategy",
+     "commercial_judgment",
+     "category_management"
+    ],
+    "Marketing analytics": [
+     "marketing_analytics",
+     "analytical_reasoning",
+     "digital_performance_marketing"
+    ],
+    "Communication": [
+     "communication",
+     "stakeholder_management"
+    ],
+    "Ownership": [
+     "ownership",
+     "leadership"
+    ]
+   }
+  },
+  {
+   "id": "growth_digital_marketing",
+   "name": "Growth / Digital & performance marketing",
+   "aliases": [
+    "growth manager",
+    "performance marketing",
+    "digital marketing",
+    "crm manager",
+    "lifecycle marketing",
+    "seo",
+    "sem",
+    "social media",
+    "content marketing",
+    "paid media",
+    "growth marketing",
+    "growth"
+   ],
+   "technical": false,
+   "defaults": {
+    "growth_retention": "critical",
+    "digital_performance_marketing": "critical",
+    "marketing_analytics": "high",
+    "statistics_experimentation": "medium",
+    "consumer_insight": "medium",
+    "ownership": "medium",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "CAC/LTV",
+    "funnel optimisation",
+    "attribution",
+    "A/B testing",
+    "retention cohorts",
+    "CRM"
+   ],
+   "case_types": [
+    "growth",
+    "funnel_diagnosis"
+   ],
+   "section_bias": {
+    "case": 1.0,
+    "functional": 1.8,
+    "technical": 0.3,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 0.9
+   },
+   "report_dimensions": {
+    "Growth levers": [
+     "growth_retention",
+     "digital_performance_marketing"
+    ],
+    "Measurement": [
+     "marketing_analytics",
+     "statistics_experimentation",
+     "analytical_reasoning"
+    ],
+    "Customer understanding": [
+     "consumer_insight"
+    ],
+    "Ownership & communication": [
+     "ownership",
+     "communication"
+    ]
+   }
+  },
+  {
+   "id": "sales",
+   "name": "Sales / Trade / Distribution",
+   "aliases": [
+    "sales manager",
+    "area sales manager",
+    "territory sales",
+    "key account manager",
+    "trade marketing",
+    "sales executive",
+    "business development executive",
+    "account executive",
+    "inside sales",
+    "sales representative",
+    "sales associate",
+    "sales development",
+    "sales officer",
+    "channel sales",
+    "sales"
+   ],
+   "technical": false,
+   "defaults": {
+    "territory_channel_management": "high",
+    "sales_pipeline": "high",
+    "negotiation": "high",
+    "account_management": "medium",
+    "commercial_judgment": "high",
+    "situational_judgment": "high",
+    "ownership": "high",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "distributor management",
+    "secondary sales",
+    "beat planning",
+    "trade schemes",
+    "pipeline math",
+    "negotiation"
+   ],
+   "case_types": [
+    "territory",
+    "target_setting",
+    "negotiation",
+    "distributor_scenario"
+   ],
+   "section_bias": {
+    "case": 0.8,
+    "functional": 1.4,
+    "technical": 0.0,
+    "behavioral": 1.1,
+    "cv": 1.0,
+    "situational": 1.8
+   },
+   "report_dimensions": {
+    "Sales & distribution": [
+     "territory_channel_management",
+     "sales_pipeline",
+     "account_management"
+    ],
+    "Negotiation & commercial": [
+     "negotiation",
+     "commercial_judgment"
+    ],
+    "Situational judgment": [
+     "situational_judgment",
+     "prioritization"
+    ],
+    "Ownership & drive": [
+     "ownership",
+     "leadership"
+    ],
+    "Communication": [
+     "communication",
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "business_development",
+   "name": "Business development / Partnerships",
+   "aliases": [
+    "business development",
+    "partnerships",
+    "alliances",
+    "bd manager"
+   ],
+   "technical": false,
+   "defaults": {
+    "commercial_judgment": "critical",
+    "negotiation": "high",
+    "stakeholder_management": "high",
+    "strategic_thinking": "medium",
+    "sales_pipeline": "medium",
+    "communication": "high",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "partnership structuring",
+    "deal economics",
+    "pipeline",
+    "negotiation"
+   ],
+   "case_types": [
+    "partnership",
+    "negotiation"
+   ],
+   "section_bias": {
+    "case": 1.0,
+    "functional": 1.2,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.4
+   },
+   "report_dimensions": {
+    "Deal & commercial": [
+     "commercial_judgment",
+     "negotiation",
+     "strategic_thinking"
+    ],
+    "Pipeline": [
+     "sales_pipeline"
+    ],
+    "Influence": [
+     "stakeholder_management",
+     "communication"
+    ],
+    "Ownership": [
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "product_management",
+   "name": "Product management",
+   "aliases": [
+    "product manager",
+    "associate product manager",
+    "apm",
+    "product owner",
+    "pm"
+   ],
+   "technical": false,
+   "defaults": {
+    "product_sense": "critical",
+    "product_prioritization": "high",
+    "product_metrics": "high",
+    "product_execution": "high",
+    "analytical_reasoning": "medium",
+    "stakeholder_management": "medium",
+    "communication": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "user problems",
+    "prioritisation frameworks",
+    "metrics and experimentation",
+    "roadmapping",
+    "working with engineering"
+   ],
+   "case_types": [
+    "product_design",
+    "metric_diagnosis",
+    "prioritization",
+    "estimation"
+   ],
+   "section_bias": {
+    "case": 1.4,
+    "functional": 1.6,
+    "technical": 0.4,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 0.9
+   },
+   "report_dimensions": {
+    "Product sense": [
+     "product_sense"
+    ],
+    "Prioritisation & execution": [
+     "product_prioritization",
+     "product_execution",
+     "prioritization"
+    ],
+    "Metrics & analytics": [
+     "product_metrics",
+     "analytical_reasoning",
+     "statistics_experimentation"
+    ],
+    "Collaboration & influence": [
+     "stakeholder_management",
+     "communication",
+     "collaboration"
+    ],
+    "Ownership": [
+     "ownership",
+     "leadership"
+    ]
+   }
+  },
+  {
+   "id": "operations",
+   "name": "Operations",
+   "aliases": [
+    "operations manager",
+    "ops",
+    "plant manager",
+    "operations analyst",
+    "business operations",
+    "operations"
+   ],
+   "technical": false,
+   "defaults": {
+    "process_improvement": "critical",
+    "capacity_quality_management": "high",
+    "problem_solving": "high",
+    "analytical_reasoning": "high",
+    "prioritization": "medium",
+    "stakeholder_management": "medium",
+    "ownership": "high"
+   },
+   "functional_areas": [
+    "capacity",
+    "process mapping",
+    "cost reduction",
+    "quality",
+    "lean/six sigma"
+   ],
+   "case_types": [
+    "operations",
+    "capacity",
+    "cost"
+   ],
+   "section_bias": {
+    "case": 1.2,
+    "functional": 1.6,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.2
+   },
+   "report_dimensions": {
+    "Operations knowledge": [
+     "process_improvement",
+     "capacity_quality_management",
+     "supply_chain_planning"
+    ],
+    "Problem solving": [
+     "problem_solving",
+     "analytical_reasoning",
+     "quantitative_reasoning"
+    ],
+    "Execution": [
+     "prioritization",
+     "ownership"
+    ],
+    "People & stakeholders": [
+     "stakeholder_management",
+     "leadership"
+    ]
+   }
+  },
+  {
+   "id": "supply_chain",
+   "name": "Supply chain / Logistics",
+   "aliases": [
+    "supply chain",
+    "logistics",
+    "demand planner",
+    "scm",
+    "inventory"
+   ],
+   "technical": false,
+   "defaults": {
+    "supply_chain_planning": "critical",
+    "process_improvement": "medium",
+    "analytical_reasoning": "high",
+    "quantitative_reasoning": "high",
+    "stakeholder_management": "medium",
+    "procurement_sourcing": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "demand forecasting",
+    "inventory policy",
+    "S&OP",
+    "logistics network",
+    "service levels"
+   ],
+   "case_types": [
+    "supply_chain",
+    "inventory"
+   ],
+   "section_bias": {
+    "case": 1.0,
+    "functional": 1.8,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Supply chain knowledge": [
+     "supply_chain_planning",
+     "procurement_sourcing",
+     "process_improvement"
+    ],
+    "Analysis": [
+     "analytical_reasoning",
+     "quantitative_reasoning"
+    ],
+    "Collaboration": [
+     "stakeholder_management"
+    ],
+    "Ownership": [
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "procurement",
+   "name": "Procurement / Sourcing",
+   "aliases": [
+    "procurement",
+    "sourcing",
+    "buyer",
+    "category buyer",
+    "purchase"
+   ],
+   "technical": false,
+   "defaults": {
+    "procurement_sourcing": "critical",
+    "negotiation": "high",
+    "commercial_judgment": "high",
+    "risk_management": "medium",
+    "stakeholder_management": "medium",
+    "analytical_reasoning": "medium"
+   },
+   "functional_areas": [
+    "spend analysis",
+    "should-cost",
+    "supplier selection",
+    "contracting",
+    "supplier risk"
+   ],
+   "case_types": [
+    "sourcing",
+    "negotiation"
+   ],
+   "section_bias": {
+    "case": 0.8,
+    "functional": 1.8,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.2
+   },
+   "report_dimensions": {
+    "Sourcing knowledge": [
+     "procurement_sourcing",
+     "risk_management"
+    ],
+    "Negotiation & commercial": [
+     "negotiation",
+     "commercial_judgment"
+    ],
+    "Analysis": [
+     "analytical_reasoning"
+    ],
+    "Stakeholders": [
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "human_resources",
+   "name": "Human resources",
+   "aliases": [
+    "hr",
+    "hrbp",
+    "talent acquisition",
+    "recruiter",
+    "people partner",
+    "l&d",
+    "compensation"
+   ],
+   "technical": false,
+   "defaults": {
+    "employee_relations": "high",
+    "talent_acquisition": "high",
+    "org_development": "medium",
+    "people_analytics": "medium",
+    "stakeholder_management": "high",
+    "situational_judgment": "high",
+    "communication": "high",
+    "conflict_management": "medium"
+   },
+   "functional_areas": [
+    "hiring",
+    "employee relations and investigations",
+    "performance management",
+    "compensation",
+    "engagement and attrition",
+    "labour law awareness"
+   ],
+   "case_types": [
+    "employee_relations_scenario",
+    "attrition",
+    "hiring_plan"
+   ],
+   "section_bias": {
+    "case": 0.5,
+    "functional": 1.4,
+    "technical": 0.0,
+    "behavioral": 1.6,
+    "cv": 1.0,
+    "situational": 1.8
+   },
+   "report_dimensions": {
+    "HR knowledge": [
+     "employee_relations",
+     "talent_acquisition",
+     "org_development",
+     "compensation_benefits",
+     "people_analytics"
+    ],
+    "Judgment": [
+     "situational_judgment",
+     "conflict_management"
+    ],
+    "Influence & communication": [
+     "stakeholder_management",
+     "communication"
+    ],
+    "Ownership": [
+     "ownership",
+     "learning_reflection"
+    ]
+   }
+  },
+  {
+   "id": "general_management",
+   "name": "General management / Leadership",
+   "aliases": [
+    "general manager",
+    "business head",
+    "director",
+    "vp",
+    "head of",
+    "management trainee"
+   ],
+   "technical": false,
+   "defaults": {
+    "leadership": "critical",
+    "pnl_ownership": "high",
+    "strategic_thinking": "high",
+    "commercial_judgment": "high",
+    "stakeholder_management": "high",
+    "situational_judgment": "medium",
+    "ownership": "high",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "P&L",
+    "org building",
+    "strategy",
+    "operating rhythm"
+   ],
+   "case_types": [
+    "growth",
+    "turnaround"
+   ],
+   "section_bias": {
+    "case": 1.0,
+    "functional": 1.0,
+    "technical": 0.0,
+    "behavioral": 1.4,
+    "cv": 1.2,
+    "situational": 1.4
+   },
+   "report_dimensions": {
+    "Leadership": [
+     "leadership",
+     "stakeholder_management",
+     "conflict_management"
+    ],
+    "Business ownership": [
+     "pnl_ownership",
+     "commercial_judgment",
+     "strategic_thinking"
+    ],
+    "Judgment": [
+     "situational_judgment",
+     "prioritization"
+    ],
+    "Communication": [
+     "communication"
+    ]
+   }
+  },
+  {
+   "id": "data_analytics",
+   "name": "Data / Business analytics",
+   "aliases": [
+    "data analyst",
+    "business analyst",
+    "analytics",
+    "bi analyst",
+    "insights analyst"
+   ],
+   "technical": true,
+   "defaults": {
+    "sql_data_manipulation": "critical",
+    "analytical_reasoning": "critical",
+    "statistics_experimentation": "high",
+    "data_visualization_storytelling": "high",
+    "commercial_judgment": "medium",
+    "communication": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "SQL",
+    "dashboards",
+    "metric definition",
+    "A/B testing",
+    "business interpretation"
+   ],
+   "case_types": [
+    "metric_diagnosis",
+    "sql_scenario",
+    "analysis_plan"
+   ],
+   "section_bias": {
+    "case": 1.0,
+    "functional": 1.2,
+    "technical": 1.6,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 0.8
+   },
+   "report_dimensions": {
+    "Technical analytics": [
+     "sql_data_manipulation",
+     "statistics_experimentation"
+    ],
+    "Analytical reasoning": [
+     "analytical_reasoning",
+     "quantitative_reasoning"
+    ],
+    "Business interpretation": [
+     "commercial_judgment",
+     "data_visualization_storytelling"
+    ],
+    "Communication & ownership": [
+     "communication",
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "data_science",
+   "name": "Data science / AI-ML",
+   "aliases": [
+    "data scientist",
+    "ml engineer",
+    "machine learning",
+    "ai engineer",
+    "applied scientist"
+   ],
+   "technical": true,
+   "defaults": {
+    "machine_learning": "critical",
+    "statistics_experimentation": "high",
+    "coding_problem_solving": "high",
+    "sql_data_manipulation": "medium",
+    "data_engineering": "medium",
+    "analytical_reasoning": "high",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "model evaluation",
+    "feature engineering",
+    "experiment design",
+    "MLOps",
+    "LLM applications where relevant"
+   ],
+   "case_types": [
+    "ml_design",
+    "metric_diagnosis"
+   ],
+   "section_bias": {
+    "case": 0.8,
+    "functional": 0.8,
+    "technical": 2.2,
+    "behavioral": 0.8,
+    "cv": 1.0,
+    "situational": 0.6
+   },
+   "report_dimensions": {
+    "ML & statistics": [
+     "machine_learning",
+     "statistics_experimentation"
+    ],
+    "Engineering": [
+     "coding_problem_solving",
+     "data_engineering",
+     "sql_data_manipulation"
+    ],
+    "Problem framing": [
+     "analytical_reasoning",
+     "problem_solving",
+     "commercial_judgment"
+    ],
+    "Communication": [
+     "communication"
+    ]
+   }
+  },
+  {
+   "id": "software_engineering",
+   "name": "Software engineering",
+   "aliases": [
+    "software engineer",
+    "sde",
+    "developer",
+    "backend engineer",
+    "frontend engineer",
+    "full stack",
+    "product engineer"
+   ],
+   "technical": true,
+   "defaults": {
+    "cs_fundamentals": "high",
+    "coding_problem_solving": "critical",
+    "system_design": "high",
+    "debugging_troubleshooting": "high",
+    "software_quality": "medium",
+    "collaboration": "medium",
+    "ownership": "medium",
+    "communication": "medium"
+   },
+   "functional_areas": [
+    "data structures and algorithms",
+    "APIs",
+    "databases",
+    "concurrency",
+    "distributed systems",
+    "testing"
+   ],
+   "case_types": [
+    "system_design",
+    "debugging",
+    "algorithm_walkthrough"
+   ],
+   "section_bias": {
+    "case": 0.0,
+    "functional": 0.4,
+    "technical": 2.6,
+    "behavioral": 0.8,
+    "cv": 1.0,
+    "situational": 0.6
+   },
+   "report_dimensions": {
+    "Problem solving & coding": [
+     "coding_problem_solving",
+     "problem_solving"
+    ],
+    "CS fundamentals": [
+     "cs_fundamentals"
+    ],
+    "Architecture": [
+     "system_design"
+    ],
+    "Engineering practice": [
+     "debugging_troubleshooting",
+     "software_quality",
+     "cloud_devops"
+    ],
+    "Collaboration & ownership": [
+     "collaboration",
+     "ownership",
+     "communication"
+    ]
+   }
+  },
+  {
+   "id": "it_infrastructure",
+   "name": "IT / Infrastructure",
+   "aliases": [
+    "it",
+    "system administrator",
+    "network engineer",
+    "it support",
+    "infrastructure engineer"
+   ],
+   "technical": true,
+   "defaults": {
+    "cs_fundamentals": "high",
+    "debugging_troubleshooting": "critical",
+    "cloud_devops": "high",
+    "security_engineering": "medium",
+    "stakeholder_management": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "networking",
+    "operating systems",
+    "identity and access",
+    "incident handling",
+    "ITIL processes"
+   ],
+   "case_types": [
+    "incident",
+    "troubleshooting"
+   ],
+   "section_bias": {
+    "case": 0.0,
+    "functional": 0.8,
+    "technical": 2.2,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 1.2
+   },
+   "report_dimensions": {
+    "Technical fundamentals": [
+     "cs_fundamentals",
+     "cloud_devops"
+    ],
+    "Troubleshooting": [
+     "debugging_troubleshooting"
+    ],
+    "Security": [
+     "security_engineering"
+    ],
+    "Service & ownership": [
+     "stakeholder_management",
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "cybersecurity",
+   "name": "Cybersecurity",
+   "aliases": [
+    "security engineer",
+    "security analyst",
+    "soc analyst",
+    "pki",
+    "iam",
+    "penetration tester",
+    "grc",
+    "information security",
+    "cyber security",
+    "cybersecurity"
+   ],
+   "technical": true,
+   "defaults": {
+    "security_engineering": "critical",
+    "cs_fundamentals": "high",
+    "debugging_troubleshooting": "medium",
+    "risk_management": "medium",
+    "regulatory_compliance": "medium",
+    "communication": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "threat modelling",
+    "PKI and certificates",
+    "identity and access",
+    "incident response",
+    "network security",
+    "compliance frameworks"
+   ],
+   "case_types": [
+    "incident",
+    "threat_model"
+   ],
+   "section_bias": {
+    "case": 0.0,
+    "functional": 1.0,
+    "technical": 2.2,
+    "behavioral": 0.8,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Security depth": [
+     "security_engineering"
+    ],
+    "Technical fundamentals": [
+     "cs_fundamentals",
+     "debugging_troubleshooting"
+    ],
+    "Risk & compliance": [
+     "risk_management",
+     "regulatory_compliance"
+    ],
+    "Communication & ownership": [
+     "communication",
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "cloud_devops",
+   "name": "Cloud / DevOps / SRE",
+   "aliases": [
+    "devops",
+    "sre",
+    "cloud engineer",
+    "platform engineer",
+    "site reliability",
+    "cloud architect"
+   ],
+   "technical": true,
+   "defaults": {
+    "cloud_devops": "critical",
+    "system_design": "high",
+    "debugging_troubleshooting": "high",
+    "cs_fundamentals": "medium",
+    "security_engineering": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "IaC",
+    "CI/CD",
+    "observability",
+    "reliability",
+    "cost optimisation",
+    "containers"
+   ],
+   "case_types": [
+    "incident",
+    "system_design"
+   ],
+   "section_bias": {
+    "case": 0.0,
+    "functional": 0.6,
+    "technical": 2.4,
+    "behavioral": 0.8,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Cloud & operations": [
+     "cloud_devops",
+     "debugging_troubleshooting"
+    ],
+    "Architecture": [
+     "system_design"
+    ],
+    "Fundamentals & security": [
+     "cs_fundamentals",
+     "security_engineering"
+    ],
+    "Ownership": [
+     "ownership",
+     "collaboration"
+    ]
+   }
+  },
+  {
+   "id": "project_program_management",
+   "name": "Project / Program management",
+   "aliases": [
+    "project manager",
+    "program manager",
+    "pmo",
+    "delivery manager",
+    "scrum master"
+   ],
+   "technical": false,
+   "defaults": {
+    "planning_execution": "critical",
+    "stakeholder_management": "high",
+    "risk_management": "high",
+    "prioritization": "high",
+    "leadership": "medium",
+    "communication": "high",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "scope",
+    "schedule and dependencies",
+    "risk and issue management",
+    "governance",
+    "agile delivery"
+   ],
+   "case_types": [
+    "delivery_scenario",
+    "risk_scenario"
+   ],
+   "section_bias": {
+    "case": 0.6,
+    "functional": 1.4,
+    "technical": 0.2,
+    "behavioral": 1.2,
+    "cv": 1.0,
+    "situational": 1.6
+   },
+   "report_dimensions": {
+    "Delivery": [
+     "planning_execution",
+     "prioritization",
+     "risk_management"
+    ],
+    "Stakeholders": [
+     "stakeholder_management",
+     "communication"
+    ],
+    "Leadership": [
+     "leadership",
+     "conflict_management"
+    ],
+    "Ownership": [
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "customer_success",
+   "name": "Customer success / Account management",
+   "aliases": [
+    "customer success",
+    "csm",
+    "account manager",
+    "client servicing",
+    "customer experience"
+   ],
+   "technical": false,
+   "defaults": {
+    "customer_success": "critical",
+    "account_management": "high",
+    "stakeholder_management": "high",
+    "situational_judgment": "high",
+    "communication": "high",
+    "commercial_judgment": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "onboarding",
+    "health scoring",
+    "renewals",
+    "escalations",
+    "expansion"
+   ],
+   "case_types": [
+    "churn_scenario",
+    "escalation"
+   ],
+   "section_bias": {
+    "case": 0.4,
+    "functional": 1.2,
+    "technical": 0.2,
+    "behavioral": 1.2,
+    "cv": 1.0,
+    "situational": 1.8
+   },
+   "report_dimensions": {
+    "Customer outcomes": [
+     "customer_success",
+     "account_management"
+    ],
+    "Judgment": [
+     "situational_judgment",
+     "commercial_judgment"
+    ],
+    "Relationships": [
+     "stakeholder_management",
+     "communication",
+     "conflict_management"
+    ],
+    "Ownership": [
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "legal",
+   "name": "Legal / Compliance",
+   "aliases": [
+    "legal counsel",
+    "lawyer",
+    "compliance",
+    "contracts manager",
+    "company secretary"
+   ],
+   "technical": false,
+   "defaults": {
+    "legal_analysis": "critical",
+    "regulatory_compliance": "high",
+    "risk_management": "medium",
+    "communication": "high",
+    "stakeholder_management": "medium",
+    "situational_judgment": "high"
+   },
+   "functional_areas": [
+    "contracts",
+    "regulatory frameworks",
+    "risk-weighted advice",
+    "disputes"
+   ],
+   "case_types": [
+    "contract_scenario",
+    "compliance_scenario"
+   ],
+   "section_bias": {
+    "case": 0.4,
+    "functional": 2.0,
+    "technical": 0.0,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 1.4
+   },
+   "report_dimensions": {
+    "Legal knowledge": [
+     "legal_analysis",
+     "regulatory_compliance"
+    ],
+    "Judgment": [
+     "situational_judgment",
+     "risk_management"
+    ],
+    "Communication": [
+     "communication",
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "design",
+   "name": "Design (UX/Product design)",
+   "aliases": [
+    "ux designer",
+    "product designer",
+    "ui designer",
+    "interaction designer",
+    "ux researcher"
+   ],
+   "technical": false,
+   "defaults": {
+    "design_process": "critical",
+    "product_sense": "high",
+    "research_methodology": "medium",
+    "collaboration": "high",
+    "communication": "high",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "research",
+    "information architecture",
+    "prototyping",
+    "usability testing",
+    "design systems"
+   ],
+   "case_types": [
+    "design_challenge"
+   ],
+   "section_bias": {
+    "case": 1.2,
+    "functional": 1.6,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.2,
+    "situational": 0.8
+   },
+   "report_dimensions": {
+    "Design craft & process": [
+     "design_process",
+     "research_methodology"
+    ],
+    "Product thinking": [
+     "product_sense"
+    ],
+    "Collaboration": [
+     "collaboration",
+     "communication"
+    ],
+    "Ownership": [
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "research",
+   "name": "Research (market / scientific / policy)",
+   "aliases": [
+    "research analyst",
+    "researcher",
+    "research associate",
+    "policy analyst"
+   ],
+   "technical": false,
+   "defaults": {
+    "research_methodology": "critical",
+    "analytical_reasoning": "high",
+    "quantitative_reasoning": "medium",
+    "communication": "high",
+    "functional_knowledge": "medium",
+    "ownership": "medium"
+   },
+   "functional_areas": [
+    "study design",
+    "data analysis",
+    "literature review",
+    "reporting"
+   ],
+   "case_types": [
+    "research_design"
+   ],
+   "section_bias": {
+    "case": 0.6,
+    "functional": 1.8,
+    "technical": 0.4,
+    "behavioral": 0.9,
+    "cv": 1.0,
+    "situational": 0.8
+   },
+   "report_dimensions": {
+    "Research rigour": [
+     "research_methodology",
+     "analytical_reasoning"
+    ],
+    "Domain knowledge": [
+     "functional_knowledge"
+    ],
+    "Communication": [
+     "communication"
+    ],
+    "Ownership": [
+     "ownership"
+    ]
+   }
+  },
+  {
+   "id": "healthcare_clinical",
+   "name": "Healthcare (clinical & operations)",
+   "aliases": [
+    "hospital operations",
+    "clinical",
+    "healthcare manager",
+    "medical",
+    "nurse manager"
+   ],
+   "technical": false,
+   "defaults": {
+    "clinical_domain_knowledge": "critical",
+    "situational_judgment": "critical",
+    "regulatory_compliance": "medium",
+    "process_improvement": "medium",
+    "communication": "high",
+    "stakeholder_management": "medium"
+   },
+   "functional_areas": [
+    "patient safety",
+    "clinical workflows",
+    "quality accreditation",
+    "hospital operations"
+   ],
+   "case_types": [
+    "patient_safety_scenario",
+    "operations"
+   ],
+   "section_bias": {
+    "case": 0.6,
+    "functional": 1.6,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.8
+   },
+   "report_dimensions": {
+    "Clinical / domain": [
+     "clinical_domain_knowledge",
+     "regulatory_compliance"
+    ],
+    "Judgment": [
+     "situational_judgment"
+    ],
+    "Operations": [
+     "process_improvement"
+    ],
+    "Communication": [
+     "communication",
+     "stakeholder_management"
+    ]
+   }
+  },
+  {
+   "id": "pharma_life_sciences",
+   "name": "Pharma / Life sciences",
+   "aliases": [
+    "medical representative",
+    "pharma marketing",
+    "regulatory affairs",
+    "clinical research",
+    "medical affairs",
+    "clinical research associate",
+    "clinical trial"
+   ],
+   "technical": false,
+   "defaults": {
+    "clinical_domain_knowledge": "critical",
+    "regulatory_compliance": "high",
+    "commercial_judgment": "medium",
+    "stakeholder_management": "high",
+    "communication": "high",
+    "situational_judgment": "medium"
+   },
+   "functional_areas": [
+    "drug development phases",
+    "regulatory pathways",
+    "HCP engagement",
+    "pharmacovigilance",
+    "market access"
+   ],
+   "case_types": [
+    "launch",
+    "compliance_scenario"
+   ],
+   "section_bias": {
+    "case": 0.8,
+    "functional": 1.8,
+    "technical": 0.0,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.2
+   },
+   "report_dimensions": {
+    "Domain knowledge": [
+     "clinical_domain_knowledge",
+     "regulatory_compliance"
+    ],
+    "Commercial": [
+     "commercial_judgment"
+    ],
+    "Stakeholders": [
+     "stakeholder_management",
+     "communication"
+    ],
+    "Judgment": [
+     "situational_judgment"
+    ]
+   }
+  },
+  {
+   "id": "other",
+   "name": "Other / emerging role",
+   "aliases": [],
+   "technical": false,
+   "defaults": {
+    "functional_knowledge": "high",
+    "problem_solving": "high",
+    "communication": "medium",
+    "ownership": "medium",
+    "situational_judgment": "medium",
+    "motivation_role_fit": "medium"
+   },
+   "functional_areas": [],
+   "case_types": [],
+   "section_bias": {
+    "case": 0.6,
+    "functional": 1.4,
+    "technical": 0.6,
+    "behavioral": 1.0,
+    "cv": 1.0,
+    "situational": 1.0
+   },
+   "report_dimensions": {
+    "Role knowledge": [
+     "functional_knowledge",
+     "technical_depth"
+    ],
+    "Problem solving": [
+     "problem_solving",
+     "analytical_reasoning"
+    ],
+    "Judgment": [
+     "situational_judgment",
+     "commercial_judgment"
+    ],
+    "Communication & ownership": [
+     "communication",
+     "ownership"
+    ]
+   }
+  }
+ ],
+ "industries": [
+  {
+   "id": "fmcg",
+   "name": "FMCG / Consumer goods"
+  },
+  {
+   "id": "retail",
+   "name": "Retail"
+  },
+  {
+   "id": "ecommerce",
+   "name": "E-commerce / Quick commerce"
+  },
+  {
+   "id": "manufacturing",
+   "name": "Manufacturing / Industrials"
+  },
+  {
+   "id": "bfsi",
+   "name": "Banking, financial services & insurance"
+  },
+  {
+   "id": "fintech",
+   "name": "Fintech"
+  },
+  {
+   "id": "consulting_services",
+   "name": "Consulting / Professional services"
+  },
+  {
+   "id": "technology",
+   "name": "Technology / SaaS"
+  },
+  {
+   "id": "it_services",
+   "name": "IT services"
+  },
+  {
+   "id": "healthcare",
+   "name": "Healthcare providers"
+  },
+  {
+   "id": "pharma",
+   "name": "Pharma / Life sciences"
+  },
+  {
+   "id": "real_estate",
+   "name": "Real estate / Construction"
+  },
+  {
+   "id": "media",
+   "name": "Media / Entertainment"
+  },
+  {
+   "id": "telecom",
+   "name": "Telecom"
+  },
+  {
+   "id": "energy",
+   "name": "Energy / Utilities"
+  },
+  {
+   "id": "automotive",
+   "name": "Automotive / Mobility"
+  },
+  {
+   "id": "logistics",
+   "name": "Logistics"
+  },
+  {
+   "id": "education",
+   "name": "Education / Edtech"
+  },
+  {
+   "id": "public_sector",
+   "name": "Public sector / Development"
+  },
+  {
+   "id": "hospitality",
+   "name": "Hospitality / Travel"
+  }
+ ]
+}
