@@ -209,11 +209,12 @@ def start(db: Session, user_id: uuid.UUID, session_id: uuid.UUID) -> dict:
     first = S.item(bp, state["queues"][S.section_ids(bp)[0]][0])
     ex = _open_exchange(db, sess, state, first)
     action = Action("OPEN", qid=first["qid"])
-    text, used = speak(action, ctx=_ctx(sess), bp=bp, question_text=first["text"], last_answer="", memory_refs=[],
-                       recent_openers=[])
+    text, used, guard = speak(action, ctx=_ctx(sess), bp=bp, question_text=first["text"], last_answer="",
+                              memory_refs=[], recent_openers=[], grounding=[first["text"]])
     m = _msg(db, sess, role="interviewer", content=text, exchange_id=ex.id, action="OPEN",
-             meta={"qid": first["qid"], "used_model": used})
+             meta={"qid": first["qid"], "used_model": used, **({"guard": guard} if guard else {})})
     state["recent_openers"].append(opener_of(text))
+    state["lines"] = [{"x": str(ex.id), "a": "OPEN", "t": truncate(text, 500)}]
     _event(db, sess, "decision", {"turn": 0, **action.to_event()})
     _save_state(st, state)
     return {"messages": [_public_message(m)], "session": session_progress(sess, state, bp)}
@@ -224,6 +225,41 @@ def resume_view(db: Session, sess: InterviewSession, state: dict, bp: dict) -> d
                       .order_by(InterviewMessage.seq)).scalars().all()
     return {"messages": [_public_message(m) for m in msgs if m.role != "system"],
             "session": session_progress(sess, state, bp)}
+
+
+SAID_KEEP = 16000  # characters of the candidate's own words kept as grounding for the interviewer
+LINES_KEEP = 60
+
+
+def _lines(state: dict) -> list:
+    return state.setdefault("lines", [])
+
+
+_PREFACES = ("Welcome back. Let's pick up where we left off.", "That's fine, we can leave that one.", "Sure.",
+             "Fair question. Any example that fits works — what I'm asking is:", "Let me put it another way.")
+
+
+def _last_line(state: dict, exchange_id: Optional[str], bp: Optional[dict] = None) -> str:
+    """What the interviewer last asked in this exchange, without greetings or transitions — the
+    thing a candidate wants repeated or clarified."""
+    from .interviewer import TRANSITIONS
+    for ln in reversed(_lines(state)):
+        if ln.get("x") != exchange_id or ln.get("a") in ("WAIT", "PAUSE"):
+            continue
+        if ln.get("a") in ("ASK", "OPEN") and bp is not None:
+            cur = state.get("current") or {}
+            planned = (S.item(bp, cur.get("qid")) or {}).get("text", "") if cur.get("qid") else ""
+            if planned:
+                return planned
+        text = ln.get("t", "")
+        changed = True
+        while changed:
+            changed = False
+            for pre in (*_PREFACES, *TRANSITIONS.values()):
+                if text.startswith(pre.strip()):
+                    text, changed = text[len(pre.strip()):].strip(), True
+        return text
+    return ""
 
 
 def turn(db: Session, user_id: uuid.UUID, session_id: uuid.UUID, *, client_turn_id: str, content: str,
@@ -273,6 +309,8 @@ def turn(db: Session, user_id: uuid.UUID, session_id: uuid.UUID, *, client_turn_
                 meta={"intent": intent, "metrics": metrics, "injection_flags": inj, "answer_ms": answer_ms})
     if inj:
         _event(db, sess, "injection_attempt", {"turn": turn_no, "flags": inj})
+    if text:
+        state["said"] = (state.get("said", "") + "\n" + text)[-SAID_KEEP:]
 
     analysis = None
     in_closing = state["section_id"] == "closing" and state["closing"]["stage"] == "invited"
@@ -282,9 +320,17 @@ def turn(db: Session, user_id: uuid.UUID, session_id: uuid.UUID, *, client_turn_
                           memory=state["memory"], slots_context=CL.slots_context(state), probes_used=int(cur.get("probes", 0)))
         if ta is not None:
             analysis = ta.model_dump()
-            if ta.intent in ("off_topic_question", "refusal", "meta_question", "end_request", "break_request") and \
+            # The analyzer hears what the keyword rules miss — above all a clarifying question
+            # ("Do you mean in my current role?"), which must be answered, not scored and skipped.
+            if ta.intent in ("off_topic_question", "refusal", "meta_question", "end_request", "break_request",
+                             "clarification_request", "repeat_request", "thinking_pause") and \
                     len(text.split()) < 40:
-                intent = ta.intent
+                # ...but a short ANSWER misheard as an unrelated question would get the same question
+                # asked again: only a message that is actually a question can be one.
+                statement_only = ta.intent in ("off_topic_question", "meta_question") and \
+                    not intents.looks_like_question(text)
+                if not statement_only:
+                    intent = ta.intent
     if intent == "answer":
         _absorb_answer(db, sess, state, bp, cur, analysis, text)
         state["consecutive"]["non_answers"] = 0
@@ -409,14 +455,34 @@ def _apply(db: Session, sess: InterviewSession, st: InterviewState, state: dict,
     if t in ("PROBE", "CHALLENGE", "ASK") and state["memory"] and len(state["memory"]) > 2:
         memory_refs = state["memory"][-4:-1]
 
-    text, used = speak(action, ctx=_ctx(sess), bp=bp, question_text=question_text, last_answer=last_answer,
-                       memory_refs=memory_refs, recent_openers=state["recent_openers"],
-                       contradiction=contradiction_text, closing_reply=last_answer if t == "CLOSE_FINAL" else "",
-                       degraded=degraded)
+    xid = str(exchange_id) if exchange_id else None
+    # Repeating or clarifying is about the interviewer's LAST line (often a follow-up), not the main question.
+    if t in ("REPEAT", "CLARIFY_QUESTION"):
+        question_text = _last_line(state, xid, bp) or question_text
+    target_item = S.item(bp, action.qid) if t == "ASK" and action.qid else current_item
+    claim_texts = [state["claims"][c]["text"] for c in (((target_item or {}).get("selection_reason") or {})
+                                                        .get("claim_ids") or []) if c in state["claims"]]
+    exchange_lines = [ln["t"] for ln in _lines(state) if ln.get("x") == xid]
+    grounding = [question_text, (target_item or {}).get("text", ""), *exchange_lines, *claim_texts,
+                 state.get("said", ""), contradiction_text]
+    previous_questions = [ln["t"] for ln in _lines(state) if ln.get("a") in ("ASK", "OPEN") and ln.get("x") != xid]
+    previous_questions += [(S.item(bp, q) or {}).get("text", "") for q in state["asked"] if q != action.qid]
+    exchange_text = _exchange_transcript(db, xid) if t in ("PROBE", "CHALLENGE", "CLARIFY_QUESTION") else ""
+
+    text, used, guard = speak(action, ctx=_ctx(sess), bp=bp, question_text=question_text, last_answer=last_answer,
+                              memory_refs=memory_refs, recent_openers=state["recent_openers"],
+                              contradiction=contradiction_text, closing_reply=last_answer if t == "CLOSE_FINAL" else "",
+                              degraded=degraded, grounding=grounding, exchange_text=exchange_text,
+                              previous_questions=previous_questions, used_foci=cur.get("foci", []) if cur else [])
+    if t == "PROBE" and cur:
+        cur["foci"] = (cur.get("foci") or []) + [action.focus or "specificity"]
     state["recent_openers"] = (state["recent_openers"] + [opener_of(text)])[-6:]
+    state["lines"] = (_lines(state) + [{"x": xid, "a": t, "t": truncate(text, 500)}])[-LINES_KEEP:]
+    if guard:
+        _event(db, sess, "line_guard", {"action": t, "note": guard})
     m = _msg(db, sess, role="interviewer", content=text, exchange_id=exchange_id, action=t,
              meta={"qid": action.qid or cur.get("qid"), "focus": action.focus, "used_model": used,
-                   "reasons": action.reasons[:6]})
+                   "reasons": action.reasons[:6], **({"guard": guard} if guard else {})})
 
     if t == "PAUSE":
         transition(db, sess, "paused", reason="candidate requested a break")
@@ -463,7 +529,10 @@ def resume(db: Session, user_id: uuid.UUID, session_id: uuid.UUID) -> dict:
     state = st.state
     cur = state.get("current") or {}
     item = S.item(bp, cur.get("qid")) if cur.get("qid") else None
-    q = (item or {}).get("text", "")
+    # pick up exactly where it stopped: the last thing asked (often a follow-up), else the question
+    q = _last_line(state, cur.get("exchange_id"), bp) or (item or {}).get("text", "")
+    if q.lower().startswith("welcome back"):
+        q = (item or {}).get("text", "")
     text = f"Welcome back. Let's pick up where we left off. {q}" if q else "Welcome back. Let's continue."
     m = _msg(db, sess, role="interviewer", content=text, exchange_id=uuid.UUID(cur["exchange_id"]) if cur.get("exchange_id") else None,
              action="RESUME", meta={"qid": cur.get("qid")})

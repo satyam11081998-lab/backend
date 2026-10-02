@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from . import state as S
+from .grounding import overlap, same_question
 from ..interview_memory import claims as C
 
 PROBE_FOCI = ["specificity", "ownership", "reasoning", "outcome", "quantification", "reflection", "tradeoff",
@@ -56,6 +57,22 @@ def _ladder_next(state: dict, item: dict) -> Optional[str]:
     return tree[step] if step < len(tree) else None
 
 
+def repeats_asked(state: dict, bp: dict, it: dict) -> Optional[str]:
+    """The qid of an already-asked question that `it` would repeat (same question in other words,
+    or the same CV claim from a near-identical angle), else None."""
+    claims = set(((it.get("selection_reason") or {}).get("claim_ids")) or [])
+    for qid in state.get("asked", []):
+        prev = S.item(bp, qid)
+        if not prev or prev.get("qid") == it.get("qid"):
+            continue
+        if same_question(it.get("text", ""), prev.get("text", "")):
+            return qid
+        prev_claims = set(((prev.get("selection_reason") or {}).get("claim_ids")) or [])
+        if claims and claims & prev_claims and overlap(it.get("text", ""), prev.get("text", "")) >= 0.4:
+            return qid
+    return None
+
+
 def choose_next(state: dict, bp: dict) -> Action:
     """Pick the next planned item (or move section / start closing). Mutates nothing."""
     order = S.section_ids(bp)
@@ -83,6 +100,10 @@ def choose_next(state: dict, bp: dict) -> Action:
                 critical_untested = any(state["coverage"][c]["importance"] == "critical" and
                                         state["coverage"][c]["asked"] == 0 for c in comps)
                 if all_sufficient and not critical_untested and sid not in ("intro",):
+                    continue
+                dup = repeats_asked(state, bp, it)
+                if dup:
+                    reasons.append(f"skipped {qid}: repeats {dup}")
                     continue
                 candidates.append(it)
         if candidates:

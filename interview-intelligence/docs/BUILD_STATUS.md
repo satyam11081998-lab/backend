@@ -99,6 +99,38 @@ shows which of the JD's key terms the CV mentions (literal check, worded as such
 | Frontend `tsc --noEmit` (device) / `next build` (copy) | exit 0 / OK |
 | Browser (simulated models slowed to realistic step times) | CV progress rose 10 % → 39 % while reading; continued to the JD while the CV ran; JD queued behind it with a note; findings + skill chips on completion; key-term match; build steps with findings; report steps with "8 of 9" scoring detail; phone width; no console errors |
 
+## 0d. Interviewer stays with the conversation; sectioned report (sixth pass, 2026-10-02)
+
+Tester reports and their causes:
+* **"What was the segment about?" with no segment ever mentioned.** Follow-ups are written into the
+  plan before the interview (`probe_tree`) and could presuppose details; the fallback even spoke them
+  verbatim. Now every line is checked before it is spoken (`interview_engine/grounding.py`): a
+  definite reference ("the segment", "you mentioned the pilot") or a number that appears nowhere in the
+  question, the candidate's own words or the CV claim under discussion blocks the line; the planned
+  follow-up is skipped and a neutral one is used. Prompts tell the interviewer, analyser and question
+  generator not to presuppose or invent (interviewer@2, turn_analyzer@3, question_generator@2).
+* **A clarifying question was "answered" with "okay" and a new question.** The analyser recognised
+  `clarification_request` but the orchestrator ignored that intent; the keyword rules only knew a few
+  phrases. Both fixed (analyser intents honoured; short replies that are themselves questions count as
+  clarifications); the interviewer answers the candidate's question about its LAST line (often a
+  follow-up), then re-invites the same question. Clarifications are never quoted as evidence. The
+  voice call no longer says "Okay." after a question.
+* **The same question in other words.** A planned question that repeats one already asked (same
+  subject, or the same CV claim from a near-identical angle) is skipped; a follow-up that restates the
+  main question, or a line that repeats an earlier question, is replaced; neutral follow-ups rotate.
+  A short answer misheard as an "unrelated question" no longer triggers a re-ask.
+* Admin → Interviews → Inspect shows how each candidate message was heard and why each interviewer
+  line was said (and when a guard replaced it). Events `line_guard` record every replacement.
+* Report: one section at a time from a left-hand menu (Overview, Strengths and gaps, Competencies, Role
+  fit, Question by question, Interviewer's notes, CV claims, Communication, Coverage, Practice plan,
+  Transcript), previous/next links, deep links (`#questions`, `#q-X3`), a tab strip on phones.
+
+Gates: II suite 303 passed (Postgres 16, backend-pinned venv) / 302 + 1 skipped (SQLite), incl.
+`tests/test_interviewer_grounding.py` (11); voice node tests 48/48, progress 4/4 (device); device
+`tsc --noEmit` EXIT 0; `next build` OK (copy); browser walk-through of the report on desktop + phone.
+NOT verified: behaviour with the real models on live interviews (the guards are deterministic, so they
+apply whatever the model says).
+
 ## 1. Verification run on 2026-10-02
 
 | Gate | Result |

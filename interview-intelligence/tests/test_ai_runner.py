@@ -151,7 +151,7 @@ def test_simulation_is_refused_in_production():
 def test_every_prompt_is_versioned():
     v = prompt_versions()
     assert len(v) >= 14 and all(x for x in v.values())
-    assert v["turn_analyzer"] == "2"
+    assert v["turn_analyzer"] == "3"
 
 
 def test_unset_environment_fails_safe_to_production(monkeypatch):

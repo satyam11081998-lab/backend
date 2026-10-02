@@ -7,12 +7,14 @@ interview never stalls on a model failure (spec §30, §57, §78)."""
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+from dataclasses import replace
+from typing import List, Optional, Sequence
 
 from ..ai.guard import wrap_untrusted
 from ..ai.prompts import INTERVIEWER
 from ..ai.runner import RunContext, run_text
 from ..textutil import truncate
+from .grounding import same_question, ungrounded
 from .policy import Action
 
 FOCUS_FALLBACK = {
@@ -52,6 +54,8 @@ MD_RX = re.compile(r"[*_#`>]|^\s*[-•]\s+", re.MULTILINE)
 
 NEEDS_QUESTION = {"OPEN", "ASK", "PROBE", "CLARIFY_CONTRADICTION", "CHALLENGE", "REPEAT", "NUDGE", "CLOSE_INVITE",
                   "REDIRECT", "CLARIFY_QUESTION"}
+# Lines that must stay grounded in what was actually said (closing / control lines carry no claims).
+GROUNDED = {"OPEN", "ASK", "PROBE", "CHALLENGE", "CLARIFY_QUESTION", "REPEAT", "NUDGE", "REDIRECT"}
 
 
 def _clean(text: str) -> str:
@@ -97,7 +101,7 @@ def fallback(action: Action, *, question_text: str, role_title: str, minutes: in
     if t == "REPEAT":
         return f"Sure. {question_text}"
     if t == "CLARIFY_QUESTION":
-        return f"Let me put it another way. {question_text}"
+        return f"Fair question. Any example that fits works — what I'm asking is: {question_text}"
     if t == "WAIT":
         return "Of course, take your time."
     if t == "NUDGE":
@@ -136,9 +140,10 @@ def _action_brief(action: Action, *, question_text: str, item: Optional[dict], c
             extra += " The candidate is handling this well; you may make the question a touch more demanding."
         return f"ACTION: ASK the TARGET QUESTION.{extra}"
     if t == "PROBE":
-        hint = f" A useful follow-up from the plan: \"{action.probe_text}\"." if action.probe_text else ""
-        return (f"ACTION: PROBE — one follow-up focused on {action.focus}, grounded in what they just said."
-                f"{hint} Do not repeat the original question.")
+        hint = (f" A follow-up idea from the plan (use it only if it fits what they actually said): "
+                f"\"{action.probe_text}\".") if action.probe_text else ""
+        return (f"ACTION: PROBE — one follow-up focused on {action.focus}, built on THEIR words in this exchange. "
+                f"Do not mention anything they did not say.{hint} Do not repeat or rephrase the original question.")
     if t == "CLARIFY_CONTRADICTION":
         return ("ACTION: CLARIFY — neutrally point out the two statements below and ask them to reconcile. "
                 f"No accusation.\nSTATEMENTS: {contradiction}")
@@ -146,10 +151,13 @@ def _action_brief(action: Action, *, question_text: str, item: Optional[dict], c
         return (f"ACTION: CHALLENGE — professional pushback on their last answer (focus: {action.focus}). Ask for "
                 "evidence, add a realistic constraint, or force a choice. Never rude.")
     if t == "REPEAT":
-        return "ACTION: REPEAT the TARGET QUESTION, rephrased slightly, same substance."
+        return "ACTION: REPEAT the TARGET QUESTION (your last line), rephrased slightly, same substance."
     if t == "CLARIFY_QUESTION":
-        return ("ACTION: CLARIFY what the TARGET QUESTION is asking, without hinting at a good answer, then re-ask it "
-                "in simpler words.")
+        return ("ACTION: CLARIFY — instead of answering, the candidate asked about your last line (their message "
+                "below). Answer THEIR question directly in one short sentence: what you mean, which role, period or "
+                "example is fine, how much detail. If they ask whether they may answer a certain way, say yes or "
+                "point to the closest fit. Do not hint at what a good answer contains. Then invite them to answer "
+                "the TARGET QUESTION (your last line) — same question, not a new one.")
     if t == "WAIT":
         return "ACTION: WAIT — tell them to take their time, in a few words. No question needed but a question mark is fine."
     if t == "NUDGE":
@@ -173,16 +181,45 @@ def _action_brief(action: Action, *, question_text: str, item: Optional[dict], c
     return f"ACTION: {t}"
 
 
+def _focus_fallback(focus: Optional[str], used: Sequence[str]) -> str:
+    """A neutral follow-up for `focus`; one not already used in this exchange if possible."""
+    order = [focus or "specificity"] + [f for f in FOCUS_FALLBACK if f != focus]
+    for f in order:
+        if f in FOCUS_FALLBACK and f not in used:
+            return FOCUS_FALLBACK[f]
+    return FOCUS_FALLBACK.get(focus or "specificity", FOCUS_FALLBACK["specificity"])
+
+
 def speak(action: Action, *, ctx: RunContext, bp: dict, question_text: str, last_answer: str,
           memory_refs: List[dict], recent_openers: List[str], contradiction: str = "",
-          closing_reply: str = "", degraded: bool = False) -> tuple[str, bool]:
-    """Returns (utterance, used_model). Falls back deterministically on any failure."""
+          closing_reply: str = "", degraded: bool = False, grounding: Optional[Sequence[str]] = None,
+          exchange_text: str = "", previous_questions: Sequence[str] = (), used_foci: Sequence[str] = ()
+          ) -> tuple[str, bool, str]:
+    """Returns (utterance, used_model, guard_note). Falls back deterministically on any failure, and
+    whenever the line would refer to something never said, restate the question, or repeat an
+    earlier question (guard_note says which)."""
     role_title = (bp.get("role") or {}).get("title", "")
     minutes = int((bp.get("config") or {}).get("duration_minutes", 45))
+    sources = list(grounding) if grounding is not None else None
+    if sources is not None:
+        # what the interviewer itself may always talk about: the role, the company, the sections
+        role = bp.get("role") or {}
+        sources += [role_title, role.get("family_name", ""), role.get("industry", ""),
+                    str((bp.get("config") or {}).get("company_name") or ""), *TRANSITIONS.values()]
+    guard = ""
+    if action.type == "PROBE":
+        # A follow-up written into the plan before the interview may presuppose things they never said.
+        hint = action.probe_text
+        if hint and ((sources is not None and ungrounded(hint, sources)) or same_question(hint, question_text)):
+            guard = f"planned follow-up not used: {hint[:80]}"
+            hint = None
+        action = replace(action, probe_text=hint)
     fb = fallback(action, question_text=question_text, role_title=role_title, minutes=minutes,
                   contradiction=contradiction, closing_reply=closing_reply)
+    if action.type == "PROBE" and not action.probe_text:
+        fb = _focus_fallback(action.focus, used_foci)
     if degraded or action.type in ("WAIT", "PAUSE"):
-        return fb, False
+        return fb, False, guard
     persona = bp.get("persona") or {}
     cfg = bp.get("config") or {}
     parts = [
@@ -193,6 +230,9 @@ def speak(action: Action, *, ctx: RunContext, bp: dict, question_text: str, last
     ]
     if question_text and action.type not in ("CLOSE_INVITE", "CLOSE_FINAL", "END_EARLY", "PAUSE", "WAIT"):
         parts.append(f"TARGET QUESTION: {question_text}")
+    if exchange_text and action.type in ("PROBE", "CHALLENGE", "CLARIFY_QUESTION"):
+        parts.append("THIS EXCHANGE SO FAR (the only things they have said about this question):\n" +
+                     wrap_untrusted("exchange", "x", truncate(exchange_text, 3000)))
     if last_answer and action.type not in ("OPEN",):
         parts.append("CANDIDATE'S LAST MESSAGE:\n" + wrap_untrusted("answer", "last", truncate(last_answer, 1800)))
     if memory_refs:
@@ -204,9 +244,17 @@ def speak(action: Action, *, ctx: RunContext, bp: dict, question_text: str, last
     text = run_text(INTERVIEWER, "\n\n".join(parts), ctx,
                     sim_input={"action": action.to_event(), "question": question_text, "fallback": fb})
     cleaned = _clean(text)
-    if acceptable(action, cleaned):
-        return cleaned, True
-    return fb, False
+    if not acceptable(action, cleaned):
+        return fb, False, guard
+    if sources is not None and action.type in GROUNDED:
+        bad = ungrounded(cleaned, sources)
+        if bad:
+            return fb, False, "referred to something never said: " + ", ".join(bad[:3])
+    if action.type == "PROBE" and same_question(cleaned, question_text):
+        return fb, False, "the follow-up restated the question"
+    if action.type in ("ASK", "OPEN") and any(same_question(cleaned, p) for p in previous_questions if p):
+        return fb, False, "repeated an earlier question"
+    return cleaned, True, guard
 
 
 def opener_of(text: str) -> str:

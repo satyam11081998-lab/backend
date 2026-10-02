@@ -51,13 +51,19 @@ def extract(db: Session, ex: InterviewExchange) -> None:
     bp = db.execute(select(InterviewBlueprint).where(InterviewBlueprint.session_id == ex.session_id)).scalar_one()
     msgs = db.execute(select(InterviewMessage).where(InterviewMessage.exchange_id == ex.id)
                       .order_by(InterviewMessage.seq)).scalars().all()
-    cand_msgs = [m for m in msgs if m.role == "candidate" and m.content and m.content != "[skipped]"]
+    # A clarifying question, "can you repeat that?" or "give me a second" is not an answer: never evidence.
+    not_answers = {"clarification_request", "repeat_request", "thinking_pause", "meta_question", "off_topic_question",
+                   "break_request", "end_request"}
+    cand_msgs = [m for m in msgs if m.role == "candidate" and m.content and m.content != "[skipped]"
+                 and (m.meta or {}).get("intent") not in not_answers]
     if not cand_msgs:
         ex.evidence_status = "skipped"
         return
     candidate_text = "\n".join(m.content for m in cand_msgs)
-    transcript = "\n".join(f"{'INTERVIEWER' if m.role == 'interviewer' else 'CANDIDATE'} [{m.seq}]: {m.content}"
-                           for m in msgs)
+    transcript = "\n".join(
+        f"{'INTERVIEWER' if m.role == 'interviewer' else 'CANDIDATE'} [{m.seq}]"
+        f"{' (not an answer)' if m.role == 'candidate' and (m.meta or {}).get('intent') in not_answers else ''}: {m.content}"
+        for m in msgs)
     model = {c["competency_id"]: c for c in (bp.competency_model or {}).get("competencies", [])}
     cross = (bp.blueprint or {}).get("cross_cutting", [])
     allowed = [c for c in (ex.competency_ids or []) if c in model] + [c for c in cross if c in model]
