@@ -88,6 +88,8 @@ def _reset_state():
     runner.reset_budget_cache()
     from interview_intelligence.voice import routes as voice_routes
     voice_routes.reset_gate_cache()
+    from interview_intelligence.jobs import progress as live_progress
+    live_progress.reset_for_tests()
     eng = dbs.get_engine()
     if IS_PG:
         with eng.begin() as c:

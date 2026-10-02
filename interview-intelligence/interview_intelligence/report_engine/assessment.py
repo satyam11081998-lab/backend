@@ -24,6 +24,7 @@ from ..evaluation_engine.guards import band_for
 from ..evidence_engine.extractor import extract
 from ..evidence_engine.metrics import answer_metrics, session_metrics
 from ..feedback_engine.writer import write_feedback
+from ..jobs import progress
 from ..jobs.queue import enqueue, register
 from ..role_taxonomy.library import library
 from ..textutil import truncate
@@ -55,9 +56,25 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
     state = (db.execute(select(InterviewState).where(InterviewState.session_id == sess.id)).scalar_one()).state
     exchanges = list(db.execute(select(InterviewExchange).where(InterviewExchange.session_id == sess.id)
                                 .order_by(InterviewExchange.seq)).scalars())
+    key = f"report:{sess.id}"
+    pending_x = sum(1 for ex in exchanges if ex.status == "closed" and ex.evidence_status in ("pending", "failed"))
+    n_comps = len((bp_row.competency_model or {}).get("competencies", []))
+    progress.start(key, [
+        ("evidence", "Pulling the evidence out of your answers",
+         progress.eta_for(db, "evidence_extractor", calls=pending_x) if pending_x else 1.0),
+        ("score", "Scoring each skill against its guide", progress.eta_for(db, "competency_evaluator", calls=n_comps or 1)),
+        ("check", "Double-checking the scores", progress.eta_for(db, "assessment_qa")),
+        ("feedback", "Writing your feedback and practice plan",
+         progress.eta_for(db, "feedback_writer") + progress.eta_for(db, "feedback_qa")),
+        ("assemble", "Putting your report together", 1.0),
+    ])
+    progress.begin(key, "evidence")
     partial = _ensure_evidence(db, exchanges)
     db.flush()
     evidence = list(db.execute(select(EvidenceItem).where(EvidenceItem.session_id == sess.id)).scalars())
+    answered = sum(1 for ex in exchanges if ex.status == "closed")
+    progress.fact(key, f"{progress.plural(len(evidence), 'piece')} of evidence from "
+                       f"{progress.plural(answered, 'answer')}", step_id="evidence")
     messages = list(db.execute(select(InterviewMessage).where(InterviewMessage.session_id == sess.id)
                                .order_by(InterviewMessage.seq)).scalars())
     ended_early = sess.ended_reason in ENDED_EARLY
@@ -71,9 +88,12 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
     closed = [ex for ex in exchanges if ex.status == "closed"]
 
     # ---- evaluation ---------------------------------------------------------------------
+    progress.begin(key, "score")
     results: Dict[str, dict] = {}
-    for comp in model:
+    for i, comp in enumerate(model, 1):
         cid = comp["competency_id"]
+        progress.detail(key, f"{i} of {len(model)}: {comp.get('name') or cid}")
+        progress.portion(key, i - 1, len(model))
         items = by_comp.get(cid, [])
         testing = sum(1 for ex in closed if cid in (ex.competency_ids or [])) or len({str(e.exchange_id) for e in items})
         comp_flags = []
@@ -96,6 +116,11 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
                 "evidence": [{"ref": e.ref, "polarity": e.polarity, "strength": e.strength,
                               "quote": truncate(e.quote, 160)} for e in r["items"] if e.ref in r["ev"].evidence_refs]}
 
+    tested_n = sum(1 for r in results.values() if r["ev"].evidence_state != "not_sufficiently_tested")
+    progress.fact(key, progress.join([progress.plural(len(results), "skill") + " assessed",
+                                      f"{tested_n} with enough evidence to score"]), step_id="score")
+    progress.detail(key, "")
+    progress.begin(key, "check")
     findings = qa_judge(ctx, [_view(c) for c in results])
     for f in findings:
         cid = f.get("competency_id")
@@ -110,6 +135,9 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
         elif cid in results:
             results[cid]["flags"].append(f"qa:{f.get('problem')}")
 
+    reruns = sum(1 for r in results.values() if "qa_rerun" in r["flags"])
+    progress.fact(key, f"Re-scored {progress.plural(reruns, 'skill')} after a second look" if reruns
+                  else "Scores hold up", step_id="check")
     db.execute(delete(CompetencyAssessment).where(CompetencyAssessment.session_id == sess.id))
     assessments: List[dict] = []
     for cid, r in results.items():
@@ -164,6 +192,7 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
                       for ex in closed],
         "claims": [{"ref": c.claim_key, "text": c.text, "status": c.verification_status} for c in claims],
     }
+    progress.begin(key, "feedback")
     bundle, fb_report = write_feedback(ctx, payload, e_refs={e.ref for e in evidence}, x_refs=set(x_of.values()),
                                        c_refs={c.claim_key for c in claims}, metrics=metrics_map,
                                        assessments={a["competency_id"]: a for a in assessments})
@@ -179,6 +208,12 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
         for d in bundle.development_areas:
             db.add(FeedbackItem(session_id=sess.id, kind="development", category=d.category, severity=d.severity,
                                 competency_ids=d.competency_ids, title=d.title[:300], body=d.model_dump()))
+
+    if bundle:
+        progress.fact(key, progress.join([progress.plural(len(bundle.strengths), "strength"),
+                                          progress.plural(len(bundle.development_areas), "area") + " to work on"]),
+                      step_id="feedback")
+    progress.begin(key, "assemble")
 
     # ---- report ---------------------------------------------------------------------------
     report = assemble(db, sess, bp_row, state, exchanges, evidence, assessments, metrics_list, bundle, claims, partial,
@@ -199,6 +234,7 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
     if get_settings().drive_configured and flags.flag(db, "drive.export_reports"):
         enqueue(db, "drive_export_report", {"session_id": str(sess.id)}, dedupe_key=f"drive_report:{sess.id}",
                 max_attempts=6)
+    progress.finish(key)
 
 
 def _session_confidence(assessments: List[dict], ended_early: bool) -> tuple[str, List[str]]:
@@ -413,4 +449,8 @@ def handle_assess(db: Session, payload: dict) -> None:
         return
     sess.assessment_status = "processing"
     db.commit()  # make "processing" visible while the (slow) assessment runs
-    run_assessment(db, sess)
+    try:
+        run_assessment(db, sess)
+    except Exception:
+        progress.fail(f"report:{sess.id}")
+        raise

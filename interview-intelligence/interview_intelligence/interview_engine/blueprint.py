@@ -24,6 +24,7 @@ from ..competency_engine.schemas import MappedCompetency
 from ..db.models import (Claim, Document, InterviewBlueprint, InterviewExchange, InterviewSession, InterviewState,
                          utcnow)
 from ..documents.analysis import analyze
+from ..jobs import progress
 from ..jobs.queue import register
 from ..question_engine.generator import generate_for_section
 from ..question_engine.quality import problems as q_problems
@@ -285,6 +286,16 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     ctx = RunContext(user_id=sess.user_id, session_id=sess.id)
     cfg = InterviewConfig(**(sess.config or {}))
     mode = MODES[cfg.mode]
+    key = f"prep:{sess.id}"
+    progress.start(key, [
+        ("inputs", "Reading your CV and the job description", 1.0),
+        ("role", "Identifying the role and its level", progress.eta_for(db, "role_classifier")),
+        ("match", "Matching your CV to what the role needs", progress.eta_for(db, "competency_mapper")),
+        ("rubrics", "Writing a scoring guide for each skill", progress.eta_for(db, "rubric_builder")),
+        ("questions", "Writing your questions", progress.eta_for(db, "question_generator", calls=4)),
+        ("check", "Checking the plan for repeats, fairness and coverage", progress.eta_for(db, "blueprint_qa")),
+    ])
+    progress.begin(key, "inputs")
 
     cv_doc = db.get(Document, sess.cv_document_id)
     jd_doc = db.get(Document, sess.jd_document_id)
@@ -295,14 +306,27 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
         raise RuntimeError(f"{bad} analysis is not available ({cv_a.status}/{jd_a.status})")
     cv, jd = cv_a.result, jd_a.result
 
+    progress.begin(key, "role")
     rc = classify_role(jd, ctx)
     fam = lib.family(rc.primary_family)
     seniority = (jd.get("seniority") or {}).get("level") or "unknown"
     if seniority == "unknown":
         seniority = cv.get("seniority_estimate") or "unknown"
+    title_seen = (jd.get("identity") or {}).get("title") or (jd.get("identity") or {}).get("role_name") or ""
+    progress.fact(key, progress.join([title_seen, fam.name, progress.seniority_label(seniority)]), step_id="role")
 
+    progress.begin(key, "match")
     model = map_competencies(jd, cv, fam.id, cfg.mode, seniority, cfg.target_competencies, ctx)
+    fit = cv_strength_summary(model)
+    progress.fact(key, progress.join([
+        f"{progress.plural(fit['competencies_identified'], 'skill')} this role needs",
+        f"{fit['strong_in_cv']} clearly backed by your CV" if fit["strong_in_cv"] else "",
+        f"{fit['need_validation']} the interview will probe" if fit["strong_in_cv"]
+        else "the interview will explore each one"]), step_id="match")
+
+    progress.begin(key, "rubrics")
     rubrics, rubric_hash = build_rubrics(model, jd, seniority, ctx)
+    progress.fact(key, progress.plural(len(rubrics), "scoring guide"), step_id="rubrics")
 
     company = None
     if flags.flag(db, "company_intel.enabled"):
@@ -313,6 +337,8 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     avg_item_s = 150 + 60 * dv.max_probes
     plans = allocate_sections(cfg, fam.section_bias, rc.technical_role, bool(fam.case_types), bool(company_facts),
                               avg_item_s)
+    to_write = [p for p in plans if p.kind not in ("intro", "closing")]
+    progress.begin(key, "questions", eta_s=progress.eta_for(db, "question_generator", calls=len(to_write) or 1))
     present = [p.kind for p in plans if p.kind not in ("intro", "closing")]
     for m in model:
         for k in _sections_for(m, present, rc.technical_role):
@@ -371,6 +397,8 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
             continue
         comps = [model_by_id[c].model_dump() for c in p.competency_ids if c in model_by_id]
         claims_for = claims_to_investigate[:p.n_items + 1] if p.kind == "cv" else []
+        progress.detail(key, f"Section {to_write.index(p) + 1} of {len(to_write)}: {SECTION_TITLES[p.kind]}")
+        progress.portion(key, to_write.index(p), len(to_write))
         generated = generate_for_section(
             section_kind=p.kind, n=p.n_items + 1, competencies=comps, rubrics=rubrics, role=jd, seniority=seniority,
             difficulty_level=dv.level, technical_depth=dv.technical_depth, claims=claims_for,
@@ -400,6 +428,15 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     total_budget = cfg.duration_minutes * 60
     det_issues = _deterministic_qa(sections, model, total_budget, repair_log)
 
+    n_planned = sum(len(s["items"]) for s in sections if s["kind"] not in ("intro", "closing"))
+    n_sections = sum(1 for s in sections if s["kind"] not in ("intro", "closing"))
+    progress.fact(key, progress.join([f"{progress.plural(n_planned, 'question')} across "
+                                      f"{progress.plural(n_sections, 'section')}",
+                                      f"{progress.plural(len(claims_to_investigate), 'CV claim')} to verify"
+                                      if claims_to_investigate else ""]), step_id="questions")
+    progress.detail(key, "")
+    progress.begin(key, "check")
+
     # LLM QA judge on the plan; replace high-severity items from the section reserve once.
     llm_qa: dict = {"passed": True, "issues": []}
     plan_view = [{"qid": it["qid"], "section": s["kind"], "competencies": it["competency_ids"],
@@ -412,6 +449,8 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
                             BlueprintQA, ctx, sim_input={"plan": plan_view})
         llm_qa = qa.model_dump()
         bad = {i.qid for i in qa.issues if i.severity == "high" and i.qid}
+        progress.fact(key, f"Replaced {progress.plural(len(bad), 'question')} it flagged" if bad else "No problems found",
+                      step_id="check")
         for s in sections:
             for idx, it in enumerate(list(s["items"])):
                 if it["qid"] in bad and s["reserve"]:
@@ -495,6 +534,7 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     sess.company_profile_id = company.id if company else None
     sess.versions = versions()
     transition(db, sess, "ready", reason="blueprint built")
+    progress.finish(key)
 
 
 def _record_generated(db: Session, sections: List[dict], family_id: str) -> None:
@@ -544,4 +584,8 @@ def handle_prepare_session(db: Session, payload: dict) -> None:
         transition(db, sess, "analyzing", reason="building blueprint")
     # Make "analyzing" visible to the client and release the row lock during the slow build.
     db.commit()
-    build_blueprint(db, sess)
+    try:
+        build_blueprint(db, sess)
+    except Exception:
+        progress.fail(f"prep:{sid}")
+        raise

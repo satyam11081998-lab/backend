@@ -16,6 +16,7 @@ from ..cv_intelligence.schemas import CandidateProfile
 from ..db.models import Document, DocumentAnalysis, utcnow
 from ..jd_intelligence.postprocess import postprocess as jd_post
 from ..jd_intelligence.schemas import RoleProfile
+from ..jobs import progress
 from ..jobs.queue import register
 from .service import ANALYSIS_VERSION, latest_analysis, redacted_text
 
@@ -70,6 +71,10 @@ def analyze(db: Session, doc: Document) -> DocumentAnalysis:
         a.status, a.error, a.updated_at = "unreadable", "no readable text", utcnow()
         return a
     a.status = "running"
+    key = f"doc:{doc.id}"
+    prompt = CV_PARSER if doc.kind == "cv" else JD_PARSER
+    progress.start(key, [("analyse", "Understanding the document", progress.eta_for(db, prompt.id))])
+    progress.begin(key, "analyse")
     ctx = RunContext(user_id=doc.user_id)
     flags_note = ""
     if doc.injection_flags:
@@ -88,9 +93,14 @@ def analyze(db: Session, doc: Document) -> DocumentAnalysis:
             a.prompt_version = JD_PARSER.version
     except StructuredOutputError as e:
         a.status, a.error, a.updated_at = "failed", str(e)[:2000], utcnow()
+        progress.fail(key)
+        raise
+    except Exception:
+        progress.fail(key)
         raise
     a.quality = {"text_quality": doc.text_quality, "injection_flags": doc.injection_flags}
     a.status, a.error, a.updated_at = "ready", "", utcnow()
+    progress.finish(key)
     return a
 
 

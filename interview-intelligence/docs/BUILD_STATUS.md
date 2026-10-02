@@ -75,6 +75,30 @@ Host-mode compromises (accepted to avoid a paid instance):
 | Browser, 2 minutes on a hidden tab | interview paused (server status `paused`), line closed |
 | NOT verified | real Gemini Live / OpenAI audio (first heard on the live site); Gemini free-tier concurrency limits |
 
+## 0c. Live progress while the candidate waits (fifth pass, 2026-10-02)
+
+The three waits — reading the CV / JD, building the interview, writing the report — show what is
+actually happening instead of a spinner: a step list reported by the work itself
+(`jobs/progress.py`, in memory; the worker shares the API's process in host mode), real findings
+as each step ends ("2 roles, 2 organisations, 6.5 years", "9 skills this role needs, 6 clearly
+backed by your CV", "18 questions across 4 sections", "7 pieces of evidence from 6 answers") and a
+percentage. The only estimate is how far the CURRENT model call is along (median of that prompt's
+recent real runs, default if none); steps with countable parts (questions per section, skills
+scored) use the real count; the bar never passes 92 % of a step on time alone and never shows
+100 % before the work is done. No scores are shown while the report is written.
+Endpoints: `GET /v1/documents/{id}` → `progress`; `GET /v1/sessions/{id}` → `prep_progress` while
+preparing; `GET /v1/sessions/{id}/report` (202) → `progress`. No DB change. A different process
+(standalone, several workers) just has no entry and the page shows the step list as "starting".
+Frontend: the CV keeps being read in the background while the JD is added; Role understanding
+shows which of the JD's key terms the CV mentions (literal check, worded as such).
+
+| Gate (fifth pass) | Result |
+|---|---|
+| II suite, Postgres 16 (backend-pinned venv) / SQLite | 292 passed / 291 passed, 1 skipped |
+| Progress node tests / voice node tests (device) | 4 / 4, 47 / 47 |
+| Frontend `tsc --noEmit` (device) / `next build` (copy) | exit 0 / OK |
+| Browser (simulated models slowed to realistic step times) | CV progress rose 10 % → 39 % while reading; continued to the JD while the CV ran; JD queued behind it with a note; findings + skill chips on completion; key-term match; build steps with findings; report steps with "8 of 9" scoring detail; phone width; no console errors |
+
 ## 1. Verification run on 2026-10-02
 
 | Gate | Result |

@@ -16,6 +16,7 @@ from ..db.models import InterviewBlueprint, InterviewExchange, InterviewMessage,
 from ..documents import service as docs
 from ..errors import Conflict, NotFound, Unprocessable
 from ..interview_engine import orchestrator, sessions
+from ..jobs import progress as live_progress
 from ..interview_engine.lifecycle import active_sessions, find_owned, sessions_today
 from ..report_engine import history
 from .deps import principal, read_own, unit, use
@@ -96,7 +97,7 @@ def paste_document(body: PasteBody, p: Principal = Depends(principal)):
 def list_documents(kind: Optional[str] = Query(None), p: Principal = Depends(principal)):
     with unit() as db:
         user, _ = read_own(db, p)
-        return {"documents": [docs.public_view(db, d) for d in docs.list_owned(db, user.id, kind)]}
+        return {"documents": [docs.public_view(db, d, include_progress=False) for d in docs.list_owned(db, user.id, kind)]}
 
 
 @router.get("/documents/{doc_id}")
@@ -150,6 +151,8 @@ def get_session(sid: str, p: Principal = Depends(principal)):
         st = db.execute(select(InterviewState).where(InterviewState.session_id == s.id)).scalar_one_or_none()
         bp = db.execute(select(InterviewBlueprint).where(InterviewBlueprint.session_id == s.id)).scalar_one_or_none()
         out["progress"] = orchestrator.session_progress(s, st.state if st else None, bp.blueprint if bp else None)
+        if s.status in ("created", "uploading", "analyzing"):
+            out["prep_progress"] = live_progress.view(f"prep:{s.id}")
         return out
 
 
@@ -248,7 +251,8 @@ def report(sid: str, p: Principal = Depends(principal)):
             raise NotFound("Interview not found.")
         if s.assessment_status in ("pending", "processing"):
             return JSONResponse(status_code=202, content={"status": s.assessment_status,
-                                                          "message": "We're analysing your responses, evidence and role alignment."})
+                                                          "message": "We're analysing your responses, evidence and role alignment.",
+                                                          "progress": live_progress.view(f"report:{s.id}")})
         if s.assessment_status == "failed":
             return {"status": "failed", "message": "We couldn't generate this report. Your transcript is saved; "
                                                    "please contact support or retry later."}
