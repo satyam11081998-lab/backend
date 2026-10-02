@@ -128,6 +128,23 @@ def record_media_run(*, stage: str, provider: str, model: str, user_id: Optional
             latency_ms=latency_ms, status=status, attempt=1, error=error[:2000], validation=validation)
 
 
+def record_live_usage(*, user_id: Optional[uuid.UUID], interview_id: uuid.UUID, model: str, usage: dict,
+                      kind: str = "line") -> float:
+    """Meter one live-voice response (OpenAI Realtime `response.done` usage, reported by the
+    browser because the audio never passes through II). Counted in the global daily budget.
+    Deliberately NOT attached to the interview's own cost (session_id=None): the per-interview
+    cap guards the interviewer's AI, and a long spoken interview must not be cut off by it.
+    The interview id is kept in `validation` so admins can still see voice cost per interview."""
+    from .pricing import realtime_cost_usd
+    cost, tokens = realtime_cost_usd(usage if isinstance(usage, dict) else {})
+    _record(user_id=user_id, session_id=None, stage="live_voice", provider="openai", model=model,
+            prompt_id=f"live_voice.{kind}", prompt_version="", schema_version="",
+            input_tokens=tokens["audio_in"] + tokens["text_in"], output_tokens=tokens["audio_out"] + tokens["text_out"],
+            cost_usd=cost, latency_ms=0, status="ok", attempt=1, error="",
+            validation={"interview_id": str(interview_id), **tokens})
+    return cost
+
+
 def pending_cost(session_id: Optional[uuid.UUID]) -> float:
     bucket = _collector.get() or []
     return sum(float(r.data.get("cost_usd") or 0) for r in bucket

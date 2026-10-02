@@ -85,6 +85,8 @@ def _reset_state():
     rate_limit.reset_for_tests()
     flags.invalidate()
     runner.reset_budget_cache()
+    from interview_intelligence.voice import routes as voice_routes
+    voice_routes.reset_gate_cache()
     eng = dbs.get_engine()
     if IS_PG:
         with eng.begin() as c:

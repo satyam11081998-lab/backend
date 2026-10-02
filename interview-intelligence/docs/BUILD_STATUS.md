@@ -15,8 +15,8 @@ mode (signed assertion, C10) still works and is what the §1 numbers below were 
 
 | Gate (host mode) | Result |
 |---|---|
-| Offline suite incl. 11 host-mode tests, Postgres 16 | 271 passed (both the backend's pinned versions and newer ones) |
-| Offline suite, SQLite | 270 passed, 1 skipped |
+| Offline suite incl. host-mode and voice tests, Postgres 16 | 279 passed (both the backend's pinned versions and newer ones) |
+| Offline suite, SQLite | 278 passed, 1 skipped |
 | Venv built from consilio-backend's own `requirements.txt` + SQLAlchemy 2.1.1, psycopg 3.3.6, python-docx 1.2.0, olefile 0.47 (Python 3.13) | resolves without conflicts; suite as above |
 | Real backend `main.py` with II mounted, II on Postgres as `ii_service` after the migration | backend routes unchanged; II not imported at start-up; dormant → 503; identity errors; single CORS header; admin grants a test user; full interview → report via the background worker; cross-user 404; admin 200 / non-admin 403 |
 
@@ -92,7 +92,18 @@ Host-mode compromises (accepted to avoid a paid instance):
   (comparable points only), recurring patterns, targeted re-attempt, transcript.
 * Google Drive storage: opaque per-user folders created once, crash-safe dedupe, retries,
   non-retryable failures surfaced, admin retry, delete propagation, report export.
-* Turn-based voice (record → transcribe → review → send; spoken interviewer lines), flag off.
+* **Voice call (default way to take the interview).** Lobby (mic check with level meter, mic picker,
+  interviewer voice) → full-screen call: animated voiceprint orb driven by the real audio levels,
+  captions, live words while the candidate talks, mute / repeat / type an answer / break / end,
+  transcript drawer, keyboard shortcuts, screen wake lock, gentle nudge after 45 s of silence,
+  auto-pause after 4 min. Two engines, one brain: **live** (OpenAI Realtime over WebRTC; words-based
+  end of turn, barge-in, streaming transcript; the speech model only voices II's lines — auto-replies
+  off) and **standard** (own VAD → /transcribe → /turns → /speak sentence by sentence). Live falls
+  back to standard by itself; the admin picks the engine (`voice.engine`). A turn-taking conductor
+  keeps a thinking pause inside one answer, drops echoes and recogniser hallucinations, closes the
+  mic while II thinks, fills the gap with a neutral "Okay.", and sends every answer through /turns
+  with an idempotent turn id (retried on network blips).
+* Text interview restyled as a conversation thread (dictation mic, typing indicator).
 * Admin control center: test users, flags/limits, health (failure rate, AI latency p50/p95,
   cost, mode usage, top questions, evaluation anomalies, Drive sync, versions), sessions with
   audited inspection, model runs, evaluation runs, audit log.
@@ -110,8 +121,12 @@ Host-mode compromises (accepted to avoid a paid instance):
 2. **Golden labels are author drafts.** Spec §69 (independent human interviewers scoring a
    sample, agreement tracking) has not happened. The dataset is a regression and safety
    harness until reviewed.
-3. **Voice is turn-based only.** Streaming STT/TTS, barge-in and sub-second turn-taking
-   (spec §29) are not built. Voice is off by default; text always works.
+3. **Voice: live calls verified against a mock peer, not yet against OpenAI from this sandbox.**
+   Real Chromium WebRTC to a mock realtime peer (same events OpenAI sends) and the standard path
+   with a fake microphone both ran end to end; the real OpenAI Realtime voice quality and latency
+   are first heard on the live site. Turn latency = end of speech + II's turn (DB round trips
+   Oregon↔Tokyo + one or two fast-model calls), so expect ~2–5 s, covered by the spoken "Okay.".
+   Interviewer replies are not streamed token by token.
 4. **No coding sandbox.** Spec §33 executable tests are not built
    (`technical.coding_exercises` off). Technical depth is assessed through conversation.
 5. **No web research for company intelligence.** Only JD-stated facts and what the user

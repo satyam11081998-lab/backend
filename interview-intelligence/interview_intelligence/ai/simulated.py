@@ -401,7 +401,36 @@ class SimulatedProvider:
                             timeout_s=timeout_s, meta=meta).text
 
     def transcribe(self, audio, *, filename, mime, model, timeout_s):
-        return CompletionResult(text="(simulated transcript)", provider="simulated", model="simulated")
+        # A plausible spoken answer, so an offline voice walk-through moves the interview on.
+        return CompletionResult(text=("I led the relaunch of our snacks range myself. I moved thirty percent of "
+                                      "the budget to lapsed buyers and revenue grew eighteen percent in two quarters."),
+                                provider="simulated", model="simulated")
 
     def speak(self, text, *, model, voice, timeout_s):
-        return b"ID3simulated-mp3"
+        return simulated_speech(text)
+
+
+def simulated_speech(text: str) -> bytes:
+    """A real, playable WAV (soft voice-like hum, ~0.3 s per word) so the call UI, the
+    orb and sentence-by-sentence playback can be exercised offline. Never used in production."""
+    import io
+    import math
+    import struct
+    import wave
+    words = max(1, len((text or "").split()))
+    seconds = min(6.0, max(0.6, words * 0.3))
+    rate = 16000
+    n = int(seconds * rate)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = bytearray()
+        for i in range(n):
+            t = i / rate
+            env = 0.5 + 0.5 * math.sin(2 * math.pi * 3.2 * t)  # syllable-like rhythm
+            v = env * (0.6 * math.sin(2 * math.pi * 180 * t) + 0.3 * math.sin(2 * math.pi * 360 * t))
+            frames += struct.pack("<h", int(v * 6000))
+        w.writeframes(bytes(frames))
+    return buf.getvalue()

@@ -60,7 +60,8 @@ def me(p: Principal = Depends(principal)):
                        "max_sessions_per_day": f["limits.max_sessions_per_day_test"] if d.via in ("test_grant", "admin")
                        else f["limits.max_sessions_per_day"],
                        "allowed_durations": f["limits.allowed_durations"], "max_upload_mb": f["limits.max_upload_mb"]},
-            "flags": {"voice": f["voice.enabled"], "company_intel": f["company_intel.enabled"],
+            "flags": {"voice": f["voice.enabled"], "voice_engine": f.get("voice.engine", "realtime"),
+                      "company_intel": f["company_intel.enabled"],
                       "advanced_technical": f["technical.advanced_mode"]},
         }
 

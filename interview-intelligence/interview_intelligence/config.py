@@ -105,6 +105,10 @@ class Settings:
     provider_fast: str = "openai"
     provider_strong: str = "openai"
     ai_timeout_s: float = 45.0
+    # Live voice (OpenAI Realtime). The model only VOICES the lines II decides.
+    realtime_model: str = "gpt-realtime-2.1"
+    realtime_transcribe_model: str = "gpt-4o-mini-transcribe"
+    realtime_eagerness: str = "low"  # semantic VAD: low = waits through thinking pauses
 
     # Drive
     gdrive_root_folder_id: str = ""
@@ -185,6 +189,9 @@ def load_settings() -> Settings:
         provider_fast=_env("II_PROVIDER_FAST", "openai"),
         provider_strong=_env("II_PROVIDER_STRONG", "openai"),
         ai_timeout_s=_float("II_AI_TIMEOUT_S", 45.0),
+        realtime_model=_env("II_REALTIME_MODEL") or _env("REALTIME_MODEL") or "gpt-realtime-2.1",
+        realtime_transcribe_model=_env("II_REALTIME_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe") or "gpt-4o-mini-transcribe",
+        realtime_eagerness=(_env("II_REALTIME_EAGERNESS", "low") or "low").lower(),
         gdrive_root_folder_id=_env("II_GDRIVE_ROOT_FOLDER_ID"),
         gdrive_refresh_token=_env("II_GDRIVE_REFRESH_TOKEN") or _env("GOOGLE_DRIVE_REFRESH_TOKEN"),
         gdrive_client_id=_env("II_GDRIVE_CLIENT_ID") or _env("GOOGLE_DRIVE_CLIENT_ID"),

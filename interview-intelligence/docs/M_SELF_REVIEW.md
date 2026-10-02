@@ -63,5 +63,5 @@ Each finding below was reproduced, fixed, and covered by a test or recorded run.
 
 1. Real-model assessment quality and fairness are unmeasured (no keys in the build sandbox).
 2. Golden labels are author drafts; no human calibration yet.
-3. Voice is turn-based; real-time barge-in is not built.
+3. ~~Voice is turn-based; real-time barge-in is not built.~~ Fixed 2026-10-02: live voice call with barge-in (see BUILD_STATUS §2).
 4. Per-process rate limiting.

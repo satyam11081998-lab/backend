@@ -79,9 +79,11 @@ Resources owned by another user return **404** (never 403) to prevent enumeratio
 | GET | `/progress` | comparable competency trajectories + recurring weaknesses |
 | POST | `/sessions/{id}/reattempt` | `{target_competencies: [...]}` → new weakness-targeting session reusing CV/JD. 409 `not_finished` unless the source interview finished; 422 `bad_target` for ids that are neither library competencies nor `rs:` ids from the source interview |
 
-### Voice (flag `voice.enabled`)
-| POST | `/voice/transcribe` | multipart audio → `{text}` |
-| POST | `/voice/speak` | `{text}` → `audio/mpeg` |
+### Voice (flag `voice.enabled`, default on; engine `voice.engine`: realtime | standard)
+| POST | `/voice/transcribe` | multipart audio → `{text}` (standard voice) |
+| POST | `/voice/speak` | `{text, voice?}` → `audio/mpeg` (standard voice, one sentence per call) |
+| POST | `/voice/live` | `{session_id, voice?}` → `{client_secret, expires_at, model, voice, max_session_s, say_prefix}`. Mints a short-lived OpenAI Realtime secret for one running interview (ready/active/paused, owned). Session: semantic VAD, `create_response:false`, barge-in on, English transcription; instructions make the model a VOICE only. 403 `live_off` / 503 `live_unconfigured`, `live_failed`, `capacity` = use standard voice. |
+| POST | `/voice/live/usage` | `{session_id, usage, kind: line\|ack}` → 204. Meters one spoken response (counted in the daily budget, not the per-interview AI cap). |
 
 ### Admin (`is_ii_admin` only)
 | GET/POST | `/admin/access-grants` | list / add `{email, note?}` |

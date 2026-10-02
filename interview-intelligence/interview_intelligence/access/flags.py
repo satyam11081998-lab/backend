@@ -25,7 +25,12 @@ def defaults() -> Dict[str, Any]:
         "ii.enabled": True,
         "ii.enabled_for_pro": False,  # launch flag: off => only admins + test users
         "admin.test_access": True,
-        "voice.enabled": False,
+        # Voice is the main way to take an interview: on by default (text always works too).
+        "voice.enabled": True,
+        # realtime = live speech-to-speech call (OpenAI Realtime; best feel, ~$0.02/min of the
+        # candidate speaking + ~$0.08/min of the interviewer speaking); standard = record ->
+        # transcribe -> speak (cheaper, a second or two slower per turn, no talk-over).
+        "voice.engine": "realtime",
         "company_intel.enabled": True,
         "company_intel.web_research": False,
         "technical.advanced_mode": True,
@@ -47,7 +52,8 @@ _TYPES = {
     k: (bool if isinstance(v, bool) else type(v))
     for k, v in {
         "ii.enabled": True, "ii.enabled_for_pro": False, "admin.test_access": True,
-        "voice.enabled": False, "company_intel.enabled": True, "company_intel.web_research": False,
+        "voice.enabled": True, "voice.engine": "realtime", "company_intel.enabled": True,
+        "company_intel.web_research": False,
         "technical.advanced_mode": True, "technical.coding_exercises": False, "ocr.enabled": False,
         "drive.export_reports": True, "limits.max_active_sessions": 2, "limits.max_sessions_per_day": 5,
         "limits.max_sessions_per_day_test": 10, "limits.allowed_durations": [45],
@@ -55,13 +61,30 @@ _TYPES = {
     }.items()
 }
 
+# String flags take one of a fixed set of values.
+ENUMS: Dict[str, tuple] = {"voice.engine": ("realtime", "standard")}
+
 _cache: Dict[str, Any] = {"ts": 0.0, "data": {}}
 _lock = threading.Lock()
+
+
+_listeners: list = []
+
+
+def on_change(fn) -> None:
+    """Call `fn()` whenever a flag changes (e.g. to drop a cache derived from flags)."""
+    if fn not in _listeners:
+        _listeners.append(fn)
 
 
 def invalidate() -> None:
     with _lock:
         _cache["ts"] = 0.0
+    for fn in list(_listeners):
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 - a listener must never break a settings change
+            pass
 
 
 def _load_overrides(db: Session) -> Dict[str, Any]:
@@ -110,6 +133,12 @@ def coerce(key: str, value: Any) -> Any:
         v = float(value)
         if v < 0:
             raise ValueError("must be >= 0")
+        return v
+    if t is str:
+        v = str(value).strip().lower()
+        allowed = ENUMS.get(key)
+        if allowed and v not in allowed:
+            raise ValueError("expected one of: " + ", ".join(allowed))
         return v
     if t is list:
         if not isinstance(value, list) or not all(isinstance(x, int) and 5 <= x <= 90 for x in value):

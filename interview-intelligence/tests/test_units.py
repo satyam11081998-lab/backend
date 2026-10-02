@@ -70,9 +70,12 @@ def test_flag_coercion_and_validation():
 
 def test_flag_override_wins_and_cache_invalidates():
     with db_session() as db:
+        assert flags.flag(db, "voice.enabled") is True  # voice is on by default
+        flags.set_flag(db, "voice.enabled", False, actor="t")
         assert flags.flag(db, "voice.enabled") is False
-        flags.set_flag(db, "voice.enabled", True, actor="t")
-        assert flags.flag(db, "voice.enabled") is True
+        assert flags.flag(db, "voice.engine") == "realtime"
+        flags.set_flag(db, "voice.engine", "Standard", actor="t")
+        assert flags.flag(db, "voice.engine") == "standard"
         assert flags.flag(db, "technical.coding_exercises") is False, "sandbox not built: default off"
 
 

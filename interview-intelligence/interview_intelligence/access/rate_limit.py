@@ -17,7 +17,8 @@ LIMITS = {
     "turn": (40, 60.0),
     "upload": (12, 600.0),
     "session_create": (12, 3600.0),
-    "voice": (60, 60.0),
+    "voice": (90, 60.0),   # standard voice speaks sentence by sentence
+    "live": (10, 60.0),    # minting a live-call secret
     "admin": (120, 60.0),
     "read": (240, 60.0),
 }

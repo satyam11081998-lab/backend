@@ -77,6 +77,7 @@ def add_grant(body: GrantBody, p: Principal = Depends(principal)):
             if body.note:
                 g.note = body.note[:500]
         db.flush()
+        flags.invalidate()  # access changed: drop caches derived from it (voice gate)
         audit(db, "access_grant.add", actor_user_id=actor.id, actor_email=actor.email, target_type="access_grant",
               target_id=email)
         return _grant_view(g)
@@ -101,6 +102,7 @@ def patch_grant(gid: str, body: GrantPatch, p: Principal = Depends(principal)):
         if body.note is not None:
             g.note = body.note[:500]
         g.updated_at = utcnow()
+        flags.invalidate()  # access changed: drop caches derived from it (voice gate)
         audit(db, f"access_grant.{body.status or 'edit'}", actor_user_id=actor.id, actor_email=actor.email,
               target_type="access_grant", target_id=g.email_lc)
         return _grant_view(g)
@@ -113,6 +115,7 @@ def delete_grant(gid: str, p: Principal = Depends(principal)):
         g = db.get(AccessGrant, _id(gid))
         if g is None:
             raise NotFound("Grant not found.")
+        flags.invalidate()  # access changed: drop caches derived from it (voice gate)
         audit(db, "access_grant.delete", actor_user_id=actor.id, actor_email=actor.email, target_type="access_grant",
               target_id=g.email_lc)
         db.delete(g)

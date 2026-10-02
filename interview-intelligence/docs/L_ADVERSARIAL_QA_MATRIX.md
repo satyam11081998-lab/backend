@@ -64,6 +64,6 @@ The "A" column names the file and test. Everything marked A passed on 2026-10-02
 | | crash after upload before DB write | appProperties lookup, no duplicate | A `test_drive_sync::test_crash_after_upload_does_not_create_a_duplicate` |
 | | 5xx / token errors; 403 | retried; not retried + failed + admin retry | A `test_drive_sync::test_transient_errors_are_retried`, `test_permission_errors_are_not_retried_and_marked_failed` |
 | | delete; report export; not configured | | A `test_drive_sync` (3 tests) |
-| Voice | flag off; no access; bad audio; speech calls logged and costed | | A `test_voice` |
+| Voice | on by default and switchable; no access; bad audio; live secret minted server-side with auto-replies off and no interview content; foreign/finished interview refused; engine off / no key / OpenAI error → standard fallback; usage metered outside the interview cap; speech calls logged and costed | | A `test_voice`; turn-taking + live transport: consilio `qa/interview-intelligence/voice` (25 node tests); browser runs with fake mic and a mock realtime peer |
 | UI | gate for free user, admin test users + settings, setup (upload, paste, role understanding, modes, difficulty, duration, build), room, end, report, mobile | renders, no console errors from II | B (16 screenshots, handoff) |
 | | real mic / speaker permissions, Safari, accidental close mid-answer | | M |
