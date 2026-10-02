@@ -11,6 +11,16 @@ Credit-gated exactly like OpenAI realtime. Deduction is by elapsed conversation
 SECONDS (Gemini Live is priced per-minute of audio), reported by the client to
 /realtime-gemini/usage as it runs and on close.
 
+Who may start a session (2026-10-03, the same rule as routes/realtime.py):
+  guest      -> 403 "Create an account..." (the browser shows the sign-in prompt)
+  Pro        -> the monthly allowance + purchased packs; no per-session cap here
+  any other  -> the ONE-TIME free trial (services/realtime_credits.FREE_TRIAL_MIN,
+                14 min) in sessions of at most REALTIME_FREE_SESSION_SECONDS (420 s
+                = 7 min, so about two cases or guesstimates), plus the shared
+                per-network daily cap. Before this, Gemini refused every non-Pro
+                account ("Voice interview is a Pro feature") even though the trial
+                was granted, so free accounts never got their free minutes.
+
 Reached when the admin sets voice_mode = "gemini". Since 2026-10-02 the session is
 LIVE by default: Gemini is the interviewer (prompts/voice_interviewer_playbook.py)
 and answers the candidate directly; VOICE_INTERVIEWER=renderer restores the old
@@ -32,7 +42,7 @@ from services.supabase_client import get_supabase_client
 from services.auth import get_verified_user, is_guest_user
 from services.rate_limit import check_rate_limit
 from services.ai_usage import assert_daily_budget, get_ai_input_quota, log_ai_usage
-from services.realtime_credits import has_credit, get_balance, deduct as deduct_credit
+from services.realtime_credits import get_balance, deduct as deduct_credit
 from prompts.voice_renderer import VOICE_RENDERER_INSTRUCTIONS, strip_say_label
 from prompts.voice_interviewer_playbook import build_voice_interviewer_instructions, normalize_level
 from services.voice_coach import voice_interviewer_mode
@@ -46,6 +56,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.0-flash-live-001")
 GEMINI_LIVE_VOICE = os.getenv("GEMINI_LIVE_VOICE", "Puck")
 GEMINI_LIVE_PER_MIN = float(os.getenv("GEMINI_LIVE_PER_MIN", "0.04"))  # ~$/min, guardrail estimate
+# Free trial sessions: same env names and defaults as routes/realtime.py, so one
+# setting governs both voice providers.
+FREE_SESSION_SECONDS = int(os.getenv("REALTIME_FREE_SESSION_SECONDS", "420"))
+FREE_IP_PER_DAY = int(os.getenv("REALTIME_FREE_IP_PER_DAY", "10"))
 
 AUTH_TOKEN_URL = "https://generativelanguage.googleapis.com/v1beta/auth_tokens"
 WS_BASE = ("wss://generativelanguage.googleapis.com/ws/"
@@ -147,6 +161,17 @@ def _session_configs(model_id: str, instructions: str, market: str) -> list:
     return [("fast", fast), ("tuned", tuned), ("plain", plain)]
 
 
+def free_session_cap(tier: str, total_remaining_min: float) -> Optional[int]:
+    """Longest session (seconds) this account may run, or None for no cap (Pro).
+
+    Non-Pro: one session is at most FREE_SESSION_SECONDS and never more than the
+    trial minutes left, so the last session of the trial ends on time too."""
+    if tier == "pro":
+        return None
+    left = max(0, int(float(total_remaining_min or 0) * 60))
+    return max(0, min(FREE_SESSION_SECONDS, left))
+
+
 class GeminiSessionRequest(BaseModel):
     case_id: str
     attempt_id: Optional[str] = None
@@ -158,6 +183,7 @@ class GeminiSessionRequest(BaseModel):
 def create_gemini_session(
     body: GeminiSessionRequest,
     authorization: Optional[str] = Header(default=None),
+    x_forwarded_for: Optional[str] = Header(default=None, alias="X-Forwarded-For"),
 ):
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="Gemini voice is not configured on the server.")
@@ -169,12 +195,36 @@ def create_gemini_session(
     assert_daily_budget()
 
     quota = get_ai_input_quota(supabase, uid)
-    if quota["tier"] != "pro":
-        raise HTTPException(status_code=403, detail="Voice interview is a Pro feature.")
-    if not has_credit(supabase, uid, quota["tier"]):
+    tier = quota["tier"]
+    # Non-Pro accounts use the one-time free trial (see the module docstring).
+    # Per-network daily cap first, so one network can't cycle new accounts into
+    # unlimited trials (shared key with routes/realtime.py; advisory, in-memory).
+    if tier != "pro":
+        client_ip = (x_forwarded_for or "").split(",")[0].strip() or "unknown"
+        try:
+            check_rate_limit(f"rt_ip_day:{client_ip}", max_calls=FREE_IP_PER_DAY, window_seconds=86400)
+        except HTTPException:
+            raise HTTPException(
+                status_code=429,
+                detail="This network has reached today's free voice limit. Upgrade to Pro for more voice interview time, or try again tomorrow.",
+            )
+    balance = get_balance(supabase, uid, tier)
+    if not (balance.get("total_remaining") or 0) > 0:
+        if tier == "pro":
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of real-time interview minutes. Buy a minute pack, or use the standard voice mode — it's unlimited on Pro.",
+            )
         raise HTTPException(
             status_code=402,
-            detail="You're out of real-time interview minutes. Buy a minute pack, or use the standard voice mode — it's unlimited on Pro.",
+            detail="You've used your free voice interview minutes. Upgrade to Pro to keep talking through cases out loud.",
+        )
+    session_cap = free_session_cap(tier, balance.get("total_remaining") or 0)
+    if session_cap is not None and session_cap < 30:
+        # Less than half a minute of trial left: not worth opening a call.
+        raise HTTPException(
+            status_code=402,
+            detail="You've used your free voice interview minutes. Upgrade to Pro to keep talking through cases out loud.",
         )
 
     case = supabase.table("cases").select("*").eq("id", body.case_id).limit(1).execute()
@@ -232,10 +282,16 @@ def create_gemini_session(
         from google import genai  # lazy import: keeps its cost off every other route
         gclient = genai.Client(api_key=GEMINI_API_KEY)
 
+        # Free trial: the token outlives the session cap only by the 2-minute
+        # start window plus a margin, so a client that ignores the cap still
+        # cannot hold a free call open for half an hour. Pro keeps 30 minutes.
+        expire_after = (datetime.timedelta(seconds=session_cap + 180) if session_cap is not None
+                        else datetime.timedelta(minutes=30))
+
         def _mint(cfg):
             return gclient.auth_tokens.create(config={
                 "uses": 2,
-                "expire_time": now + datetime.timedelta(minutes=30),
+                "expire_time": now + expire_after,
                 "new_session_expire_time": now + datetime.timedelta(minutes=2),
                 "live_connect_constraints": {"model": model_id, "config": cfg},
             })
@@ -258,7 +314,8 @@ def create_gemini_session(
         log_ai_usage(
             user_id=uid, endpoint="/realtime-gemini/session", model=model_id,
             audio_minutes=0, latency_ms=int((time.time() - t0) * 1000), success=True,
-            meta={"case_id": body.case_id, "attempt_id": body.attempt_id, "interviewer": interviewer},
+            meta={"case_id": body.case_id, "attempt_id": body.attempt_id, "interviewer": interviewer,
+                  "tier": tier, "max_session_seconds": session_cap},
         )
         return {
             "token": token_name,
@@ -268,7 +325,11 @@ def create_gemini_session(
             # Exact setup the browser should send. Constraints supply the config, so
             # this stays minimal; kept here so it is tunable without a UI redeploy.
             "setup": {"model": f"models/{model_id}"},
-            "credits": get_balance(supabase, uid, quota["tier"]),
+            "credits": balance,
+            # Seconds this session may run (free trial), or None (Pro: no cap).
+            # The browser ends the call at this mark and carries it across
+            # reconnects within one voice session.
+            "max_session_seconds": session_cap,
             # "model_led" = live speech-to-speech interviewer (default);
             # "renderer" = V11 decides each turn and Gemini says the line.
             "interviewer": interviewer,
