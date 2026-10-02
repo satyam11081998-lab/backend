@@ -8,6 +8,10 @@ Broadcast targeted-practice — admin-only case/guesstimate generation for email
 
 Admin-gated (users.is_admin), rate-limited, and behind the daily-budget kill switch —
 the exact contract used by routes/seo.py and routes/coach.py.
+
+MARKETS (2026-10-02): both bodies take an optional `market` — "IN" (default, the
+behaviour before markets) or "US" (US & Europe audience: US-register material,
+saved with cases.market='US'). See services/broadcast_gen.py.
 """
 
 from typing import Any, Dict, Optional
@@ -43,11 +47,13 @@ class OptionsRequest(BaseModel):
     kind: str = "case"          # "case" | "guesstimate"
     difficulty: str = "medium"  # easy | medium | hard
     count: int = 3
+    market: str = "IN"          # "IN" | "US" ("EU" is read as "US")
 
 
 class MaterializeRequest(BaseModel):
     option: Dict[str, Any]
     topic: str = ""
+    market: Optional[str] = None  # None -> the market the option was generated for, else "IN"
 
 
 @router.post("/generate-options")
@@ -57,14 +63,15 @@ async def broadcast_generate_options(body: OptionsRequest, authorization: Option
     assert_daily_budget()  # 503 if the day's AI spend is over budget
     from services.broadcast_gen import generate_options
     try:
-        options = generate_options(body.topic, body.kind, body.difficulty, body.count)
+        options = generate_options(body.topic, body.kind, body.difficulty, body.count, body.market)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Generation failed: {type(e).__name__}")
-    return {"options": options, "kind": (body.kind or "case").lower()}
+    from services.broadcast_gen import normalize_market
+    return {"options": options, "kind": (body.kind or "case").lower(), "market": normalize_market(body.market)}
 
 
 @router.post("/materialize")
@@ -73,7 +80,7 @@ async def broadcast_materialize(body: MaterializeRequest, authorization: Optiona
     check_rate_limit(f"broadcast:save:{uid}", max_calls=30, window_seconds=60)
     from services.broadcast_gen import save_option
     try:
-        saved = save_option(get_supabase_client(), uid, body.option, body.topic)
+        saved = save_option(get_supabase_client(), uid, body.option, body.topic, body.market)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except HTTPException:

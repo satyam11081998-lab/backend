@@ -18,6 +18,19 @@ is inherited unchanged.
 
 Grounded + cost-tiered: generation routes through the `daily_content` provider
 feature (gpt-4o by default, admin-toggleable) and is metered in ai_usage_log.
+
+MARKETS (2026-10-02). Every call is for ONE content market:
+    "IN" (default) — India register (Rs/crore, Indian firms and cities). The
+                     prompts, the case-type set and the saved row are exactly
+                     what they were before markets existed.
+    "US"           — US register (US dollars, US companies and cities, American
+                     English, the US bank's nine case types). The saved row gets
+                     cases.market = 'US' (migration 0070), so US and Europe
+                     accounts can open it from the email and India accounts
+                     cannot (services/markets.assert_market_access), and the
+                     interviewer/scorer switch to the US register on their own
+                     (services/markets.llm_case_content).
+"EU" is accepted as "US": Europe accounts practise the US bank.
 """
 
 from __future__ import annotations
@@ -33,6 +46,34 @@ from services.ai_usage import log_ai_usage
 
 VALID_CASE_TYPES = {"profitability", "market_sizing", "growth"}
 VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
+# The US bank's case types (lib/us-market/labels.ts US_CASE_TYPES; all allowed by
+# the cases_type_check constraint from migration 0017). Spaces, not underscores.
+US_CASE_TYPES = (
+    "profitability", "market entry", "growth", "pricing", "m&a",
+    "operations", "cost reduction", "go to market", "competitive strategy",
+)
+_US_TYPE_ALIASES = {
+    "growth strategy": "growth",
+    "m and a": "m&a", "mergers and acquisitions": "m&a", "m&a / private equity": "m&a",
+    "private equity": "m&a", "pe": "m&a",
+    "gtm": "go to market",
+    "competitive response": "competitive strategy",
+    "cost cutting": "cost reduction",
+}
+
+
+def normalize_market(v: Optional[str]) -> str:
+    """'IN' | 'US' for a broadcast. Empty -> 'IN' (the pre-markets default);
+    'EU' -> 'US' (Europe accounts practise the US bank). Anything else is a
+    caller error, raised so a typo can never silently produce India content
+    for a US audience."""
+    x = (v or "").strip().upper()
+    if x in ("", "IN"):
+        return "IN"
+    if x in ("US", "EU"):
+        return "US"
+    raise ValueError(f"Unknown market {v!r}: use IN or US.")
 
 # Short shareable code for /p/<code> broadcast links (no ambiguous chars: no 0/O/1/l/i).
 _CODE_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
@@ -55,6 +96,12 @@ def _coerce_difficulty(v: Optional[str], default: str = "medium") -> str:
 def _coerce_case_type(v: Optional[str]) -> str:
     x = (v or "").strip().lower().replace(" ", "_").replace("-", "_")
     return x if x in VALID_CASE_TYPES else "profitability"
+
+
+def _coerce_us_case_type(v: Optional[str]) -> str:
+    x = " ".join((v or "").strip().lower().replace("_", " ").replace("-", " ").split())
+    x = _US_TYPE_ALIASES.get(x, x)
+    return x if x in US_CASE_TYPES else "profitability"
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -98,30 +145,93 @@ _GUESS_SHAPE = (
     "}]}"
 )
 
+# US register (market "US"). Same keys as the India shapes, so parsing below is shared.
+_US_FOCUS = (
+    '"focus":"a short, correctly-spelled, presentable 2-4 word label naming the REAL company or sector this targets '
+    '(extract the actual company, FIX typos and spacing, use its real styling; e.g. chick fil a -> Chick-fil-A). '
+    'NEVER echo the user phrasing verbatim."'
+)
 
-def generate_options(topic: str, kind: str, difficulty: str, count: int = 3) -> List[Dict[str, Any]]:
-    """Return N distinct DRAFT options for `topic` (unsaved). Raises ValueError on bad output."""
+_US_CASE_SHAPE = (
+    "{" + _US_FOCUS + ","
+    '"options":[{'
+    '"title":"short candidate-facing title (no real brand name unless generic)",'
+    '"type":"profitability|market entry|growth|pricing|m&a|operations|cost reduction|go to market|competitive strategy",'
+    '"difficulty":"easy|medium|hard",'
+    '"hook":"ONE line (<=90 chars) that makes a candidate want to try it; concrete, no hype",'
+    '"scenario":"3-5 sentences: situation, a CEO/PE partner/founder protagonist, the explicit decision, '
+    'and the 2-3 concrete dollar figures ($ with thousand/million/billion) the candidate needs",'
+    '"quant_ask":"one specific quantity to compute, as a sentence",'
+    '"framework_hint":"one line nudging structure without giving the answer",'
+    '"solution":"4-8 sentence worked model solution, shown AFTER submit"'
+    "}]}"
+)
+
+_US_GUESS_SHAPE = (
+    "{" + _US_FOCUS + ","
+    '"options":[{'
+    '"title":"short market sizing question",'
+    '"difficulty":"easy|medium|hard",'
+    '"hook":"ONE line (<=90 chars) that makes a candidate want to try it; concrete, no hype",'
+    '"prompt":"2-4 sentences: exactly what to estimate (units, US geography, time period), state assumptions, '
+    'choose top-down/bottom-up, segment sensibly, give a point estimate, and sanity-check",'
+    '"approach_hint":"one line on a sensible starting point without giving the answer",'
+    '"solution":"4-8 sentence worked estimation, shown AFTER submit"'
+    "}]}"
+)
+
+_US_SYSTEM = (
+    "You are an expert McKinsey/BCG/Bain interviewer writing ORIGINAL practice material for candidates "
+    "recruiting for US consulting, finance and strategy roles (MBB, Tier-2 firms, Big 4 strategy arms, "
+    "corporate strategy; MBA summer internships and full-time offers). Write in natural American English. "
+    "Quote money in US dollars ($ with thousand / million / billion; never Rs, lakh or crore). Use US "
+    "companies, sectors, states and cities, and US data anchors (about 335 million people, about 130 "
+    "million households). Output strict JSON only."
+)
+
+
+def generate_options(topic: str, kind: str, difficulty: str, count: int = 3, market: Optional[str] = "IN") -> List[Dict[str, Any]]:
+    """Return N distinct DRAFT options for `topic` (unsaved). Raises ValueError on bad output.
+
+    `market` picks the register: "IN" (default, unchanged) or "US". Every option
+    carries `market`, so the save step can refuse to file it under the other bank.
+    """
     topic = _clean(topic)
     if not topic:
         raise ValueError("Enter a topic or company to generate around.")
+    mkt = normalize_market(market)
     n = max(2, min(int(count or 3), 4))
     diff = _coerce_difficulty(difficulty, "medium")
     is_guess = (kind or "case").lower() == "guesstimate"
-    what = "GUESSTIMATE (market-sizing / estimation)" if is_guess else "case-interview scenario"
-    shape = _GUESS_SHAPE if is_guess else _CASE_SHAPE
 
-    system = (
-        "You are an expert McKinsey/BCG/Bain interviewer writing ORIGINAL, India-flavoured "
-        "(Rs/crore, Indian sectors/cities/firms) practice material for MBA placement aspirants. "
-        "Output strict JSON only."
-    )
-    user = (
-        f'Create {n} DISTINCT {what} options an aspirant could practise, all grounded in this '
-        f'topic/target: "{topic}".\nDIFFICULTY: {diff}.\n'
-        "Make the options genuinely different from one another (different angle AND mechanic), each "
-        "self-contained and freshly invented (never a real published casebook scenario). "
-        f"Return ONLY JSON of EXACTLY this shape, with {n} entries in options:\n{shape}"
-    )
+    if mkt == "US":
+        what = "MARKET SIZING question (estimation / guesstimate)" if is_guess else "case-interview scenario"
+        shape = _US_GUESS_SHAPE if is_guess else _US_CASE_SHAPE
+        system = _US_SYSTEM
+        user = (
+            f'Create {n} DISTINCT {what} options a candidate could practice, all grounded in this '
+            f'topic/target: "{topic}".\nDIFFICULTY: {diff}.\n'
+            "Make the options genuinely different from one another (different angle AND mechanic), each "
+            "self-contained and freshly invented (never a real published casebook scenario). "
+            f"Return ONLY JSON of EXACTLY this shape, with {n} entries in options:\n{shape}"
+        )
+    else:
+        # India: byte-for-byte the pre-markets prompt (tests/test_broadcast_market.py pins it).
+        what = "GUESSTIMATE (market-sizing / estimation)" if is_guess else "case-interview scenario"
+        shape = _GUESS_SHAPE if is_guess else _CASE_SHAPE
+
+        system = (
+            "You are an expert McKinsey/BCG/Bain interviewer writing ORIGINAL, India-flavoured "
+            "(Rs/crore, Indian sectors/cities/firms) practice material for MBA placement aspirants. "
+            "Output strict JSON only."
+        )
+        user = (
+            f'Create {n} DISTINCT {what} options an aspirant could practise, all grounded in this '
+            f'topic/target: "{topic}".\nDIFFICULTY: {diff}.\n'
+            "Make the options genuinely different from one another (different angle AND mechanic), each "
+            "self-contained and freshly invented (never a real published casebook scenario). "
+            f"Return ONLY JSON of EXACTLY this shape, with {n} entries in options:\n{shape}"
+        )
 
     t0 = time.time()
     resp, model, provider = chat_with_fallback(
@@ -132,9 +242,12 @@ def generate_options(topic: str, kind: str, difficulty: str, count: int = 3) -> 
         max_tokens=2600,
     )
     try:
+        meta = {"provider": provider, "kind": "guesstimate" if is_guess else "case"}
+        if mkt == "US":
+            meta["market"] = "US"
         log_ai_usage(endpoint="/broadcast/generate-options", model=model, response=resp,
                      latency_ms=int((time.time() - t0) * 1000),
-                     meta={"provider": provider, "kind": "guesstimate" if is_guess else "case"})
+                     meta=meta)
     except Exception:
         pass
 
@@ -168,7 +281,7 @@ def generate_options(topic: str, kind: str, difficulty: str, count: int = 3) -> 
             out.append({
                 "kind": "case",
                 "title": _clean(o.get("title")) or "Case",
-                "type": _coerce_case_type(o.get("type")),
+                "type": _coerce_us_case_type(o.get("type")) if mkt == "US" else _coerce_case_type(o.get("type")),
                 "difficulty": _coerce_difficulty(o.get("difficulty"), diff),
                 "hook": _clean(o.get("hook"))[:140],
                 "scenario": scenario,
@@ -180,16 +293,31 @@ def generate_options(topic: str, kind: str, difficulty: str, count: int = 3) -> 
     if not out:
         raise ValueError("The model returned options in the wrong shape; try again.")
     focus = _clean(data.get("focus"))
-    if focus:
-        for _o in out:
+    for _o in out:
+        if focus:
             _o["focus"] = focus
+        _o["market"] = mkt
     return out
 
 
-def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = "") -> Dict[str, Any]:
-    """Persist ONE chosen option as an UNLISTED case. Returns {case_id, title, type, difficulty}."""
+def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = "", market: Optional[str] = None) -> Dict[str, Any]:
+    """Persist ONE chosen option as an UNLISTED case.
+
+    Returns {case_id, code, title, type, difficulty, market}. The market is the
+    request's `market`, else the one the option was generated for, else India;
+    if the two disagree the save is refused (an India-register case filed under
+    the US bank, or the reverse, would reach the wrong audience).
+    """
     if not isinstance(option, dict):
         raise ValueError("No option to save.")
+    opt_market = option.get("market")
+    mkt = normalize_market(market if market not in (None, "") else opt_market)
+    if opt_market not in (None, "") and normalize_market(opt_market) != mkt:
+        raise ValueError(
+            f"This option was written for {'US & Europe' if normalize_market(opt_market) == 'US' else 'India'} "
+            f"users; generate a new one for {'US & Europe' if mkt == 'US' else 'India'}."
+        )
+    is_us = mkt == "US"
     is_guess = (option.get("kind") or ("guesstimate" if option.get("type") == "guesstimate" else "case")) == "guesstimate"
     diff = _coerce_difficulty(option.get("difficulty"), "medium")
 
@@ -198,7 +326,7 @@ def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = ""
         if not content:
             raise ValueError("The chosen guesstimate has no prompt.")
         row = {
-            "title": _clean(option.get("title")) or "Targeted guesstimate",
+            "title": _clean(option.get("title")) or ("Market sizing question" if is_us else "Targeted guesstimate"),
             "type": "guesstimate",
             "difficulty": diff,
             "content": content,
@@ -213,7 +341,7 @@ def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = ""
         content = f"{scenario}\n\n**Quantitative ask:** {quant}" if quant else scenario
         row = {
             "title": _clean(option.get("title")) or "Targeted case",
-            "type": _coerce_case_type(option.get("type")),
+            "type": _coerce_us_case_type(option.get("type")) if is_us else _coerce_case_type(option.get("type")),
             "difficulty": diff,
             "content": content,
             "hint": _clean(option.get("framework_hint")) or None,
@@ -228,6 +356,10 @@ def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = ""
         "generated_for": {"broadcast": True, "topic": _clean(topic)[:280],
                           "kind": "guesstimate" if is_guess else "case", "difficulty": diff},
     })
+    if is_us:
+        # India rows are inserted exactly as before (cases.market defaults to 'IN').
+        row["market"] = "US"
+        row["generated_for"]["market"] = "US"
 
     # Give the case a short code so it can be shared as mece.in/p/<code> (kept short,
     # with mece.in visible). cases.code has a FULL unique index; on the rare collision,
@@ -241,7 +373,7 @@ def save_option(supabase, admin_id: str, option: Dict[str, Any], topic: str = ""
             if not new or not new.get("id"):
                 raise ValueError("Saved the case but no id came back.")
             return {"case_id": new["id"], "code": row["code"], "title": row["title"],
-                    "type": row["type"], "difficulty": diff}
+                    "type": row["type"], "difficulty": diff, "market": mkt}
         except ValueError:
             raise
         except Exception as e:  # noqa: BLE001
