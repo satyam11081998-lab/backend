@@ -55,9 +55,13 @@ def list_grants(p: Principal = Depends(principal)):
         return {"grants": [_grant_view(g) for g in rows]}
 
 
+GRANT_TYPES = ("test", "trial", "ultra")  # full access | the free 15-minute interview | Ultra (comped)
+
+
 class GrantBody(BaseModel):
     email: str
     note: str = ""
+    grant_type: str = "test"
 
 
 @router.post("/access-grants", status_code=201)
@@ -65,15 +69,17 @@ def add_grant(body: GrantBody, p: Principal = Depends(principal)):
     email = (body.email or "").strip().lower()
     if "@" not in email or "." not in email.split("@")[-1] or len(email) > 320 or " " in email:
         raise Unprocessable("Enter a valid email address.", code="bad_email")
+    if body.grant_type not in GRANT_TYPES:
+        raise Unprocessable("grant_type must be test, trial or ultra", code="bad_grant_type")
     with unit() as db:
         actor = admin(db, p)
         g = db.execute(select(AccessGrant).where(AccessGrant.email_lc == email)).scalar_one_or_none()
         if g is None:
-            g = AccessGrant(email_lc=email, status="enabled", grant_type="test", note=body.note[:500],
+            g = AccessGrant(email_lc=email, status="enabled", grant_type=body.grant_type, note=body.note[:500],
                             granted_by=actor.email)
             db.add(g)
         else:
-            g.status, g.updated_at = "enabled", utcnow()
+            g.status, g.grant_type, g.updated_at = "enabled", body.grant_type, utcnow()
             if body.note:
                 g.note = body.note[:500]
         db.flush()
@@ -86,6 +92,7 @@ def add_grant(body: GrantBody, p: Principal = Depends(principal)):
 class GrantPatch(BaseModel):
     status: Optional[str] = None
     note: Optional[str] = None
+    grant_type: Optional[str] = None
 
 
 @router.patch("/access-grants/{gid}")
@@ -101,6 +108,10 @@ def patch_grant(gid: str, body: GrantPatch, p: Principal = Depends(principal)):
             g.status = body.status
         if body.note is not None:
             g.note = body.note[:500]
+        if body.grant_type is not None:
+            if body.grant_type not in GRANT_TYPES:
+                raise Unprocessable("grant_type must be test, trial or ultra", code="bad_grant_type")
+            g.grant_type = body.grant_type
         g.updated_at = utcnow()
         flags.invalidate()  # access changed: drop caches derived from it (voice gate)
         audit(db, f"access_grant.{body.status or 'edit'}", actor_user_id=actor.id, actor_email=actor.email,
@@ -120,6 +131,33 @@ def delete_grant(gid: str, p: Principal = Depends(principal)):
               target_id=g.email_lc)
         db.delete(g)
     return Response(status_code=204)
+
+
+@router.get("/plans")
+def admin_plans(p: Principal = Depends(principal)):
+    """Plans at a glance: the settings, who is on which plan, how the free interview converts and
+    who asked to be told when Ultra opens."""
+    from ..access import plans
+    with unit() as db:
+        admin(db, p)
+        grants = db.execute(select(AccessGrant.grant_type, func.count()).where(AccessGrant.status == "enabled")
+                            .group_by(AccessGrant.grant_type)).all()
+        by_plan = db.execute(select(InterviewSession.config, InterviewSession.started_at, InterviewSession.status)
+                             .where(InterviewSession.created_at >= utcnow() - timedelta(days=90))).all()
+        stats = {"trial": {"prepared": 0, "started": 0, "completed": 0}, "ultra": {"prepared": 0, "started": 0,
+                                                                                  "completed": 0}}
+        for cfg, started, status in by_plan:
+            plan = (cfg or {}).get("plan")
+            if plan in stats:
+                stats[plan]["prepared"] += 1
+                stats[plan]["started"] += 1 if started else 0
+                stats[plan]["completed"] += 1 if status == "completed" else 0
+        interested = db.execute(select(AuditLog).where(AuditLog.action == "plans.interest")
+                                .order_by(AuditLog.created_at.desc()).limit(50)).scalars().all()
+        return {"config": plans.config(db), "grants": {t: n for t, n in grants}, "last_90_days": stats,
+                "interest": {"ultra": plans.interest_count(db, plans.ULTRA),
+                             "recent": [{"email": a.actor_email, "at": a.created_at.isoformat(),
+                                         "via": (a.meta or {}).get("via")} for a in interested]}}
 
 
 @router.get("/config")
@@ -275,7 +313,8 @@ def admin_sessions(status: Optional[str] = Query(None), limit: int = Query(50, l
         return {"sessions": [{"id": str(s.id), "email": e, "status": s.status, "mode": s.mode,
                               "difficulty": s.difficulty, "role_title": s.role_title, "role_family": s.role_family,
                               "created_at": s.created_at.isoformat(), "assessment_status": s.assessment_status,
-                              "cost_usd": float(s.cost_usd or 0), "active_seconds": s.active_seconds}
+                              "cost_usd": float(s.cost_usd or 0), "active_seconds": s.active_seconds,
+                              "plan": (s.config or {}).get("plan") or None}
                              for s, e in rows]}
 
 
@@ -295,7 +334,8 @@ def admin_session(sid: str, p: Principal = Depends(principal)):
         runs = db.execute(select(ModelRun).where(ModelRun.session_id == s.id).order_by(ModelRun.created_at)).scalars().all()
         return {
             "session": {"id": str(s.id), "status": s.status, "config": s.config, "versions": s.versions,
-                        "cost_usd": float(s.cost_usd or 0), "ended_reason": s.ended_reason},
+                        "cost_usd": float(s.cost_usd or 0), "ended_reason": s.ended_reason,
+                        "plan_summary": s.pre_interview_summary},
             "messages": [{"seq": m.seq, "role": m.role, "content": m.content, "action": m.action, "meta": m.meta}
                          for m in msgs],
             "events": [{"type": e.type, "payload": e.payload, "at": e.created_at.isoformat()} for e in events],

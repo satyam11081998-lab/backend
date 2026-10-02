@@ -75,6 +75,19 @@ def cv_parser(si: dict) -> dict:
                 "needs_verification": True,
                 "verification_priority": 1 if (sl or re.search(r"\b(led|managed)\b", l, re.I)) else 2,
             })
+    interests: List[str] = []
+    activities: List[dict] = []
+    for l in lines:
+        low = l.lower()
+        if re.match(r"(hobbies|interests)\b", low):
+            interests += [x.strip(" .") for x in re.split(r"[,;|]", l.split(":", 1)[-1]) if x.strip(" .")][:8]
+        elif re.search(r"\b(captain|club|society|volunteer\w*|fest|marathon|olympiad|debat\w*|quiz|hackathon|"
+                       r"case competition|nss|ncc|council|secretary|finalist|winner|coordinator)\b", low) \
+                and len(activities) < 8:
+            kind = ("position_of_responsibility" if re.search(r"captain|secretary|council|coordinator|head", low)
+                    else "competition" if re.search(r"winner|finalist|competition|hackathon|olympiad|quiz", low)
+                    else "volunteering" if "volunteer" in low else "extracurricular")
+            activities.append({"id": f"A{len(activities) + 1}", "kind": kind, "text": l[:200]})
     skills_line = next((l for l in lines if l.lower().startswith("skills")), "")
     skills = [s.strip() for s in re.split(r"[,;|]", skills_line.split(":", 1)[-1]) if s.strip()][:15]
     years = re.search(r"(\d+)\+?\s+years", text, re.I)
@@ -84,7 +97,8 @@ def cv_parser(si: dict) -> dict:
                                ("experience dates", MONTHS)) if not re.search(rx, text, re.I)]
     return {"headline": lines[0][:80] if lines else "", "current_title": exp[0]["title"] if exp else "",
             "total_experience_years": yrs, "experience_basis": "stated" if yrs else "unknown",
-            "seniority_estimate": sen, "experience": exp, "claims": claims,
+            "seniority_estimate": sen, "experience": exp, "claims": claims, "activities": activities,
+            "interests": interests,
             "skills": {"technical": skills, "tools": [], "domain": [], "soft": [], "languages": []},
             "parse_quality": {"confidence": "medium", "missing_sections": missing, "notes": []}}
 
@@ -182,6 +196,8 @@ def rubric_builder(si: dict) -> dict:
 
 
 TEMPLATES = {
+    "personal": "Outside work, what do you spend your time on, and what has it taught you about {topic}?",
+    "awareness": "Pick a recent business story you've followed closely. What happened, and what does it teach you about {topic}?",
     "functional": "In this role, how would you apply {topic}? Walk me through a concrete situation where it mattered.",
     "technical": "Explain how you would approach {topic} for a system this role owns, including the main trade-offs.",
     "behavioral": "Tell me about a time you had to show {topic} under real pressure. What did you personally do?",
@@ -207,6 +223,30 @@ def question_generator(si: dict) -> dict:
                        "strong_signals": ["clear personal decisions"], "weak_signals": ["'we' throughout"],
                        "probe_tree": ["What exactly did you own?", "What was the baseline?", "How much was attributable to you?"],
                        "claim_ids": [cl.get("id")], "why_this_question": "High-priority CV claim."})
+    if section == "personal":
+        life = si.get("life") or {}
+        items = [("A:" + a.get("id", ""), a.get("text", "")) for a in life.get("activities", [])] + \
+                [(t, t) for t in life.get("interests", [])]
+        for ref, label in items[:n]:
+            qs.append({"text": f"Your CV mentions {label[:90].rstrip('.')}. How did you get into that, and what has "
+                               f"it taught you that shows up in how you work?",
+                       "archetype_id": "interest_deep_dive" if not ref.startswith("A:") else "extracurricular_leadership",
+                       "competency_ids": [comps[0]["competency_id"]] if comps else [], "question_type": "personal",
+                       "difficulty": 2, "intent": "The person behind the CV.",
+                       "expected_evidence": ["how they got into it", "a specific moment", "a lesson"],
+                       "strong_signals": ["genuine detail"], "weak_signals": ["one-line answer"],
+                       "probe_tree": ["What's the hardest thing you've done in it?", "Where does that show up at work?"],
+                       "activity_refs": [ref.replace("A:", "")], "why_this_question": "Listed on the CV."})
+    if section == "awareness":
+        for item in (si.get("news") or [])[:n]:
+            qs.append({"text": f"Recently there was news that {item.get('title', '').rstrip('.')}. What do you think "
+                               f"that means for companies in this space, and what would you do about it?",
+                       "archetype_id": "news_take", "competency_ids": [comps[0]["competency_id"]] if comps else [],
+                       "question_type": "awareness", "difficulty": 3, "intent": "Turn news into a judgement.",
+                       "expected_evidence": ["why it matters", "second-order effects", "a recommendation"],
+                       "strong_signals": ["takes a position"], "weak_signals": ["restates the headline"],
+                       "probe_tree": ["Who wins and who loses from this?", "What would change your view?"],
+                       "news_ids": [str(item.get("id"))], "why_this_question": "A recent, real development."})
     for i in range(len(qs), n):
         if not comps:
             break
@@ -216,7 +256,8 @@ def question_generator(si: dict) -> dict:
         qtype = {"cv": "cv_deep_dive", "company": "company"}.get(section, section)
         qs.append({"text": tmpl.format(topic=str(topic).lower()), "archetype_id": "", "competency_ids": [c["competency_id"]],
                    "question_type": qtype if qtype in ("behavioral", "situational", "functional", "technical", "case",
-                                                      "cv_deep_dive", "motivation", "company") else "functional",
+                                                      "cv_deep_dive", "motivation", "company", "personal",
+                                                      "awareness") else "functional",
                    "difficulty": si.get("difficulty", 3), "intent": f"Assess {c.get('name')} in context.",
                    "expected_evidence": ["concrete example", "reasoning", "outcome"],
                    "strong_signals": ["specific and reasoned"], "weak_signals": ["generic"],

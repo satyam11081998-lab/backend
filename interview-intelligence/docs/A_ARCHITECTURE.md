@@ -1,5 +1,11 @@
 # A · Architecture — MECE Interview Intelligence (II)
 
+> **Deployed in host mode (2026-10-02).** II runs inside `consilio-backend`, mounted at `/ii`
+> (`interview_intelligence/host.py`); the backend supplies identity from its own Supabase session check
+> (and, optionally, recent business headlines). The standalone service with the signed assertion
+> described below is still supported (set `NEXT_PUBLIC_II_API_URL`) but not used. The old standalone
+> repository `interview-intelligence` is superseded by `consilio-backend/interview-intelligence`.
+
 ## 1. What is being built, and where
 
 A standalone interview-assessment subsystem with its **own process, database schema,

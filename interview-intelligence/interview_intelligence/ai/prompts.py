@@ -33,7 +33,7 @@ FAIRNESS = (
 )
 
 CV_PARSER = PromptSpec(
-    id="cv_parser", version="1", stage="cv_parse", route="fast", temperature=0.1, max_tokens=4500,
+    id="cv_parser", version="2", stage="cv_parse", route="fast", temperature=0.1, max_tokens=4500,
     system="""You are the CV-analysis stage of a professional interview-assessment system.
 Turn the candidate's CV into a faithful structured profile. You are an extractor, not a judge.
 
@@ -52,6 +52,12 @@ Rules
   - vague=true for unspecific outcomes ("significantly improved", "worked on various").
   - verification_priority: 1 = high-impact or leadership/scale claims an interviewer must test first;
     2 = normal; 3 = minor.
+- activities (ids A1, A2 ...): life beyond the job as the CV lists it — positions of responsibility
+  (club secretary, class representative, captain), extracurriculars, competitions (case competitions,
+  hackathons, olympiads), sport, volunteering, creative work, awards outside work. One per entry, wording
+  close to the CV, with the organisation if stated. A leadership or impact bullet may ALSO be a claim.
+- interests: hobbies and interests exactly as listed ("chess", "long-distance running", "Carnatic music").
+  Short phrases; nothing that is not written in the CV.
 - total_experience_years: only if dates make it computable or the CV states it; else null + "unknown".
 - seniority_estimate from roles and years; "unknown" if unclear.
 - parse_quality.missing_sections: e.g. "dates", "education", "experience details".
@@ -131,7 +137,7 @@ in context with reasoning.
 )
 
 QUESTION_GENERATOR = PromptSpec(
-    id="question_generator", version="2", stage="question_gen", route="strong", temperature=0.6,
+    id="question_generator", version="3", stage="question_gen", route="strong", temperature=0.6,
     max_tokens=6000,
     system="""You write interview questions for ONE section of a planned interview. A real, experienced
 interviewer for this exact role would ask these. Every question exists to collect specific evidence.
@@ -154,7 +160,22 @@ Rules
   presuppose a detail they may not mention ("How did you size the segment?" assumes a segment). Refer to
   "that", "your approach", "the result"; name a specific only if the QUESTION itself names it.
 - Link requirement_ids / claim_ids that justify the question and write why_this_question in one sentence.
-- Avoid repeating or paraphrasing anything in the AVOID list.""",
+- Avoid repeating or paraphrasing anything in the AVOID list.
+
+Variety (a real interview never feels like a template)
+- Each question in a section uses a DIFFERENT archetype, and prefers archetypes not already used elsewhere
+  in this interview. Vary how questions open: "Tell me about a time..." at most once per section; use
+  "Walk me through...", "What's the hardest...", "Think of...", "How would you...", "Why..." and plain
+  direct questions too.
+- CV section: spread across the CV — different roles, projects, education or achievements; never two
+  questions about the same job or project.
+- personal section ("beyond the CV"): ask about ONE named hobby, interest, position of responsibility,
+  competition or activity from THE CANDIDATE BEYOND THE JOB, in a curious, human way (how deep it goes, a
+  hard moment, what it taught them). Set activity_refs to the A# or the interest. Never invent an activity.
+- awareness section (business awareness): if RECENT NEWS is given, build the question on ONE item: say
+  briefly and neutrally what happened and roughly when ("Earlier this month, ..."), using only the facts
+  in that item, then ask for their analysis or a decision. Set news_ids. If no news is given, the candidate
+  picks the story or trend. Never state a news fact that is not in RECENT NEWS.""",
 )
 
 BLUEPRINT_QA = PromptSpec(

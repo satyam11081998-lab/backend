@@ -183,14 +183,11 @@ def _public_message(m: InterviewMessage) -> dict:
 def session_progress(sess: InterviewSession, state: Optional[dict], bp: Optional[dict]) -> dict:
     out = {"status": sess.status, "ended_reason": sess.ended_reason or None}
     if state and bp:
-        sec = S.section(bp, state["section_id"]) or {}
-        planned = sum(len(s["items"]) for s in bp.get("sections", []) if s["id"] not in ("intro", "closing"))
-        asked = len([q for q in state.get("asked", []) if q])
+        # Time only: how many questions are planned, and of which kind, is the interviewer's to reveal.
         out.update({
-            "section": state["section_id"], "section_title": sec.get("title", ""),
+            "section": "closing" if state["section_id"] == "closing" else "interview",
             "elapsed_s": int(state["clock"]["active_s"]), "remaining_s": S.remaining_s(state, bp),
-            "duration_s": S.total_budget_s(bp),
-            "questions_asked": max(0, asked - 1), "questions_planned": planned,
+            "duration_s": S.total_budget_s(bp), "hard_stop_s": S.hard_cap_s(bp),
         })
     return out
 
@@ -342,7 +339,10 @@ def turn(db: Session, user_id: uuid.UUID, session_id: uuid.UUID, *, client_turn_
         if k["status"] == "raised":
             k["status"] = "clarified"
 
-    if degraded and state["section_id"] != "closing" and intent not in ("end_request", "break_request"):
+    if S.past_hard_cap(state, bp) and intent != "end_request":
+        action = Action("END_EARLY", close_exchange=True, end_reason="time_limit", preface="time",
+                        reasons=[f"time limit reached ({int(state['clock']['active_s'])}s of {S.hard_cap_s(bp)}s)"])
+    elif degraded and state["section_id"] != "closing" and intent not in ("end_request", "break_request"):
         action = Action("CLOSE_INVITE", close_exchange=True, new_section="closing", reasons=["degraded mode"])
     else:
         action = decide(state, bp, intent=intent, analysis=analysis, session_key=str(sess.id))

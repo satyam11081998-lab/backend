@@ -35,7 +35,8 @@ from ..role_taxonomy.library import library
 from ..textutil import jaccard, truncate
 from ..versions import versions
 from .lifecycle import transition
-from .modes import (MODES, SECTION_TITLES, InterviewConfig, allocate_sections, difficulty_vector, persona)
+from .modes import (BREADTH_SECTIONS, MODES, SECTION_TITLES, InterviewConfig, allocate_sections,
+                    difficulty_vector, persona)
 from .state import new_state
 
 CROSS_CUTTING = ["communication", "handling_challenge"]
@@ -90,6 +91,101 @@ def _claim_score(c: dict, flags_map: Dict[str, List[str]], linked: set) -> float
     return s
 
 
+def _diverse_claims(claims_sorted: List[dict], k: int) -> List[dict]:
+    """The top claims, spread across the CV: the best claim of each role/project first, then the
+    second-best of each, and so on — so a CV section never spends every question on one job."""
+    buckets: Dict[str, List[dict]] = {}
+    for c in claims_sorted:
+        buckets.setdefault(c.get("experience_id") or f"_{c.get('type') or 'other'}", []).append(c)
+    out: List[dict] = []
+    while len(out) < k and any(buckets.values()):
+        for key in list(buckets):
+            if buckets[key] and len(out) < k:
+                out.append(buckets[key].pop(0))
+    return out
+
+
+PERSONAL_COMPETENCIES = ["learning_reflection", "leadership", "ownership", "collaboration", "motivation_role_fit",
+                         "communication"]
+AWARENESS_COMPETENCIES = ["commercial_judgment", "strategic_thinking", "role_company_understanding",
+                          "synthesis_recommendation", "analytical_reasoning", "structured_thinking", "communication"]
+
+
+def _breadth_competencies(kind: str, model: List[MappedCompetency]) -> List[str]:
+    prefs = PERSONAL_COMPETENCIES if kind == "personal" else AWARENESS_COMPETENCIES
+    have = {m.competency_id for m in model}
+    picked = [c for c in prefs if c in have][:3]
+    return picked or [m.competency_id for m in model][:1]
+
+
+def _life(cv: dict) -> dict:
+    """Hobbies, interests and activities from the CV (personal data: never leaves this interview)."""
+    acts = [{"id": a.get("id", ""), "kind": a.get("kind", "other"), "text": truncate(a.get("text", ""), 200),
+             "organization": a.get("organization", "")} for a in (cv.get("activities") or []) if a.get("text")][:8]
+    return {"activities": acts, "interests": [truncate(str(i), 60) for i in (cv.get("interests") or []) if i][:8]}
+
+
+_NEWS_STOP = {"the", "and", "for", "with", "from", "this", "that", "into", "over", "after", "amid", "says", "said",
+              "will", "has", "have", "its", "are", "was", "new", "india", "indian", "company", "companies"}
+
+
+def _news_words(text: str) -> set:
+    import re
+    return {w for w in re.findall(r"[a-z][a-z0-9&-]{2,}", (text or "").lower()) if w not in _NEWS_STOP}
+
+
+# Business news only: an interview must never ask for a view on politics, elections, conflict or
+# religion (FAIRNESS), so political and geopolitical stories are left out before anything is asked.
+NEWS_CATEGORIES = {"", "business", "macro", "micro", "tech", "jobs", "economy", "markets", "companies", "startups"}
+_POLITICAL = None
+
+
+def _political(text: str) -> bool:
+    import re
+    global _POLITICAL
+    if _POLITICAL is None:
+        _POLITICAL = re.compile(
+            r"\b(elections?|electoral|minister|ministers|chief minister|party|parties|bjp|congress|aap|tmc|"
+            r"parliament|lok sabha|rajya sabha|assembly polls?|polls?|votes?|voting|campaign trail|war|wars|military|"
+            r"army|troops|missile|terror\w*|protests?|riots?|religio\w*|caste|communal|ceasefire|sanction\w*)\b",
+            re.IGNORECASE)
+    return bool(_POLITICAL.search(text or ""))
+
+
+def pick_news(rows: List[dict], jd: dict, fam_name: str, industry: str, *, k: int = 3) -> List[dict]:
+    """The recent business headlines most relevant to this role: overlap with the role's title,
+    function, industry and JD keywords first, the host's own newsworthiness score second. Political,
+    geopolitical and other non-business stories are never used."""
+    ident = jd.get("identity") or {}
+    role_words = _news_words(" ".join([ident.get("title", ""), ident.get("function", ""), ident.get("company", ""),
+                                       fam_name, industry,
+                                       " ".join(k.get("term", "") for k in (jd.get("keywords") or [])[:20])]))
+    scored = []
+    for i, r in enumerate(rows[:60]):
+        if str(r.get("category") or "").lower() not in NEWS_CATEGORIES:
+            continue
+        text = f"{r.get('title', '')} {r.get('summary') or r.get('description') or ''} " \
+               f"{' '.join(r.get('keywords') or [])} {r.get('category', '')}"
+        if _political(f"{r.get('title', '')} {r.get('summary') or r.get('description') or ''}"):
+            continue
+        rel = len(_news_words(text) & role_words)
+        scored.append((rel, float(r.get("score") or r.get("gd_worthiness_score") or 0), -i, r))
+    scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    out = []
+    for n, (_, _, _, r) in enumerate(scored[:k], start=1):
+        out.append({"id": f"N{n}", "title": truncate(str(r.get("title", "")), 200),
+                    "summary": truncate(str(r.get("summary") or r.get("description") or ""), 300),
+                    "source": str(r.get("source") or r.get("source_name") or "")[:60],
+                    "date": str(r.get("published_at") or "")[:10]})
+    return out
+
+
+def agenda_of(sections: List[dict]) -> List[dict]:
+    """The running order the interviewer announces at the start (kinds and rough minutes only)."""
+    return [{"kind": s["kind"], "title": s["title"], "minutes": max(1, round(s["budget_s"] / 60))}
+            for s in sections if s["kind"] not in ("intro", "closing") and s.get("items")]
+
+
 def _cv_fallback_question(claim: dict, comps: List[str]) -> PlannedQuestion:
     lib = library()
     arch = lib.archetypes["cv_claim_verification"]
@@ -119,6 +215,7 @@ def _from_generated(g, section_kind: str) -> PlannedQuestion:
         must_not_infer=g.must_not_infer or (list(arch.must_not_infer) if arch else []), probe_tree=g.probe_tree,
         expected_duration_s=arch.expected_duration_s if arch else 210,
         selection_reason=SelectionReason(requirement_ids=g.requirement_ids, claim_ids=g.claim_ids,
+                                         news_ids=g.news_ids, activity_refs=g.activity_refs,
                                          explanation=g.why_this_question),
     )
 
@@ -201,10 +298,13 @@ def _repair_coverage(sections: List[dict], model: List[MappedCompetency], model_
     REDUNDANT item — one whose competencies are all covered by other items or are not
     critical/high — using, in order: the section's reserve, a curated question, one
     generated question. Never removes the last question for another important competency,
-    never removes CV-claim questions in claim-focused modes, never changes a question's text
+    never removes CV-claim questions in claim-focused modes (nor the last one elsewhere), never touches the
+    personal or business-awareness sections, never changes a question's text
     or relabels its competencies. Gaps that cannot be placed are logged, not hidden."""
     log: List[dict] = []
-    body = [s for s in sections if s["kind"] not in ("intro", "closing")]
+    # The person beyond the CV and business awareness are there for breadth, not coverage: never
+    # traded away for another competency question.
+    body = [s for s in sections if s["kind"] not in ("intro", "closing", *BREADTH_SECTIONS)]
     if not body:
         return log
     fresh_left = [max_fresh]  # bounds extra model calls (curated lookups are free)
@@ -224,13 +324,16 @@ def _repair_coverage(sections: List[dict], model: List[MappedCompetency], model_
     def texts(exclude: dict | None = None) -> List[str]:
         return [it["text"] for s in sections for it in s["items"] if it is not exclude] + list(avoid)
 
+    def cv_left(sec: dict) -> int:
+        return sum(1 for it in sec["items"] if it.get("origin") == "cv_specific")
+
     def victim(sec: dict, cnt: Dict[str, int]) -> int | None:
         best: Tuple[int, int] | None = None
         for idx, it in enumerate(sec["items"]):
             if it.get("origin") == "fixed":
                 continue
-            if claim_focus and it.get("origin") == "cv_specific":
-                continue
+            if it.get("origin") == "cv_specific" and (claim_focus or cv_left(sec) <= 1):
+                continue  # questions on the CV are the interview's own; keep at least one in every mode
             if any(important(c) and cnt.get(c, 0) < 2 for c in it["competency_ids"]):
                 continue  # it is the only question for some important competency
             redundancy = min((cnt.get(c, 0) for c in it["competency_ids"]), default=99)
@@ -292,8 +395,8 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
         ("role", "Identifying the role and its level", progress.eta_for(db, "role_classifier")),
         ("match", "Matching your CV to what the role needs", progress.eta_for(db, "competency_mapper")),
         ("rubrics", "Writing a scoring guide for each skill", progress.eta_for(db, "rubric_builder")),
-        ("questions", "Writing your questions", progress.eta_for(db, "question_generator", calls=4)),
-        ("check", "Checking the plan for repeats, fairness and coverage", progress.eta_for(db, "blueprint_qa")),
+        ("questions", "Preparing your interviewer", progress.eta_for(db, "question_generator", calls=4)),
+        ("check", "A last check for repeats and fairness", progress.eta_for(db, "blueprint_qa")),
     ])
     progress.begin(key, "inputs")
 
@@ -318,11 +421,11 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     progress.begin(key, "match")
     model = map_competencies(jd, cv, fam.id, cfg.mode, seniority, cfg.target_competencies, ctx)
     fit = cv_strength_summary(model)
+    # What the CV and the role have in common — never what the interview will ask (that stays the
+    # interviewer's to reveal, as in a real interview).
     progress.fact(key, progress.join([
         f"{progress.plural(fit['competencies_identified'], 'skill')} this role needs",
-        f"{fit['strong_in_cv']} clearly backed by your CV" if fit["strong_in_cv"] else "",
-        f"{fit['need_validation']} the interview will probe" if fit["strong_in_cv"]
-        else "the interview will explore each one"]), step_id="match")
+        f"{fit['strong_in_cv']} clearly backed by your CV" if fit["strong_in_cv"] else ""]), step_id="match")
 
     progress.begin(key, "rubrics")
     rubrics, rubric_hash = build_rubrics(model, jd, seniority, ctx)
@@ -345,6 +448,9 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
             for p in plans:
                 if p.kind == k:
                     p.competency_ids.append(m.competency_id)
+    for p in plans:
+        if p.kind in BREADTH_SECTIONS:
+            p.competency_ids = _breadth_competencies(p.kind, model)
     # A section nobody needs gets the model's most important unassigned competencies, or is dropped.
     for p in plans:
         if p.kind not in ("intro", "closing") and not p.competency_ids:
@@ -358,7 +464,12 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     if cv_plan:
         n_claims = cv_plan.n_items if not mode.claim_focus else max(cv_plan.n_items, min(8, len(claims_sorted)))
         cv_plan.n_items = max(cv_plan.n_items, min(n_claims, len(claims_sorted)) or cv_plan.n_items)
-    claims_to_investigate = claims_sorted[:max(n_claims, 3)]
+    claims_to_investigate = _diverse_claims(claims_sorted, max(n_claims, 3))
+    life = _life(cv)
+    news: List[dict] = []
+    if any(p.kind == "awareness" for p in plans):
+        from ..host import recent_news
+        news = pick_news(recent_news(), jd, fam.name, rc.industry or "")
 
     model_by_id = {m.competency_id: m for m in model}
     avoid = _history_avoid(db, sess.user_id, sess.id)
@@ -370,6 +481,7 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     qn = 0
     role_title = (jd.get("identity") or {}).get("title") or (jd.get("identity") or {}).get("role_name") or ""
     planned_texts: List[str] = []
+    planned_archetypes: List[str] = []
 
     def add_section(kind: str, budget: int, items: List[PlannedQuestion], reserve: List[PlannedQuestion], comps: List[str]):
         nonlocal qn
@@ -397,13 +509,14 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
             continue
         comps = [model_by_id[c].model_dump() for c in p.competency_ids if c in model_by_id]
         claims_for = claims_to_investigate[:p.n_items + 1] if p.kind == "cv" else []
-        progress.detail(key, f"Section {to_write.index(p) + 1} of {len(to_write)}: {SECTION_TITLES[p.kind]}")
         progress.portion(key, to_write.index(p), len(to_write))
         generated = generate_for_section(
             section_kind=p.kind, n=p.n_items + 1, competencies=comps, rubrics=rubrics, role=jd, seniority=seniority,
             difficulty_level=dv.level, technical_depth=dv.technical_depth, claims=claims_for,
             company_facts=company_facts if p.kind in ("company", "situational") else [],
             focus_areas=cfg.focus_areas, avoid=planned_texts + avoid, ctx=ctx,
+            life=life if p.kind == "personal" else None, news=news if p.kind == "awareness" else None,
+            used_archetypes=planned_archetypes,
         ) if comps else []
         cands = [_from_generated(g, p.kind) for g in generated]
         if p.kind == "cv":
@@ -414,7 +527,9 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
                     cands.append(_cv_fallback_question(c, comp_ids))
         cands += curated_candidates(p.kind, p.competency_ids, fam.id, dv.level, seniority)
         cands = [c for c in cands if not q_problems(c.text)]
-        chosen, reserve = qsel.select(cands, p.n_items, need=need, difficulty_level=dv.level, avoid=planned_texts + avoid)
+        chosen, reserve = qsel.select(cands, p.n_items, need=need, difficulty_level=dv.level, avoid=planned_texts + avoid,
+                                      used_archetypes=planned_archetypes)
+        planned_archetypes.extend(c.archetype_id for c in chosen if c.archetype_id)
         for c in chosen:
             for cid in c.competency_ids:
                 need[cid] = need.get(cid, 0.0) * 0.45
@@ -428,12 +543,9 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
     total_budget = cfg.duration_minutes * 60
     det_issues = _deterministic_qa(sections, model, total_budget, repair_log)
 
-    n_planned = sum(len(s["items"]) for s in sections if s["kind"] not in ("intro", "closing"))
-    n_sections = sum(1 for s in sections if s["kind"] not in ("intro", "closing"))
-    progress.fact(key, progress.join([f"{progress.plural(n_planned, 'question')} across "
-                                      f"{progress.plural(n_sections, 'section')}",
-                                      f"{progress.plural(len(claims_to_investigate), 'CV claim')} to verify"
-                                      if claims_to_investigate else ""]), step_id="questions")
+    used_news = any((it.get("selection_reason") or {}).get("news_ids") for s in sections for it in s["items"])
+    progress.fact(key, "Built around your CV, the job description" + (" and this month's business news"
+                                                                       if used_news else ""), step_id="questions")
     progress.detail(key, "")
     progress.begin(key, "check")
 
@@ -449,8 +561,7 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
                             BlueprintQA, ctx, sim_input={"plan": plan_view})
         llm_qa = qa.model_dump()
         bad = {i.qid for i in qa.issues if i.severity == "high" and i.qid}
-        progress.fact(key, f"Replaced {progress.plural(len(bad), 'question')} it flagged" if bad else "No problems found",
-                      step_id="check")
+        progress.fact(key, "Done", step_id="check")
         for s in sections:
             for idx, it in enumerate(list(s["items"])):
                 if it["qid"] in bad and s["reserve"]:
@@ -497,6 +608,8 @@ def build_blueprint(db: Session, sess: InterviewSession) -> None:
                           "early_end": "candidate may end at any time; report confidence becomes limited",
                           "cost": "per-session AI cost cap switches to deterministic prompts and steers to closing"},
         "company_facts": company_facts,
+        "news": news,
+        "agenda": agenda_of(sections),
         "qa": {"deterministic": det_issues, "llm": llm_qa, "coverage_repair": repair_log},
     }
     # Re-acquire the row lock: the user may have abandoned the session while we were building.
@@ -548,8 +661,8 @@ def _record_generated(db: Session, sections: List[dict], family_id: str) -> None
     else:
         from sqlalchemy.dialects.sqlite import insert as dialect_insert
     for sec in sections:
-        if sec["kind"] in ("cv", "intro", "closing"):
-            continue
+        if sec["kind"] in ("cv", "personal", "awareness", "intro", "closing"):
+            continue  # personal data, or news that goes stale
         for it in sec["items"]:
             sr = it.get("selection_reason") or {}
             if it.get("origin") != "generated" or sr.get("claim_ids"):

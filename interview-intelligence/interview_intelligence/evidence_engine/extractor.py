@@ -38,6 +38,8 @@ APPLICABLE = {
     "motivation": ["relevance", "specificity", "clarity", "conciseness", "consistency"],
     "company": ["relevance", "business_relevance", "specificity", "reasoning", "clarity"],
     "intro": ["structure", "clarity", "conciseness", "relevance"],
+    "personal": ["relevance", "specificity", "ownership", "reflection", "clarity", "conciseness"],
+    "awareness": ["relevance", "business_relevance", "reasoning", "structure", "depth", "clarity"],
     "pressure": ["reasoning", "evidence", "clarity", "consistency"],
 }
 

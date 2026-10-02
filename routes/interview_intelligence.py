@@ -75,12 +75,42 @@ def resolve_identity(authorization: Optional[str]):
     )
 
 
+_NEWS_CACHE: dict = {"at": 0.0, "rows": []}
+_NEWS_TTL_S = 1800.0
+
+
+def recent_headlines() -> list:
+    """Recent business headlines from this backend's news pipeline (`news_headlines`, read-only),
+    for II's business-awareness question. Cached for 30 minutes; any failure -> [] (II then lets
+    the candidate pick the story). Only titles, summaries, sources and dates leave this function."""
+    import time
+    from datetime import datetime, timedelta, timezone
+    now = time.monotonic()
+    if _NEWS_CACHE["rows"] and now - _NEWS_CACHE["at"] < _NEWS_TTL_S:
+        return list(_NEWS_CACHE["rows"])
+    try:
+        from services.supabase_client import get_supabase_client
+        since = (datetime.now(timezone.utc) - timedelta(days=21)).isoformat()
+        res = (get_supabase_client().table("news_headlines")
+               .select("title, description, source_name, published_at, category, keywords, gd_worthiness_score")
+               .gte("published_at", since).order("published_at", desc=True).limit(60).execute())
+        rows = [{"title": r.get("title") or "", "summary": r.get("description") or "",
+                 "source": r.get("source_name") or "", "published_at": r.get("published_at") or "",
+                 "category": r.get("category") or "", "keywords": r.get("keywords") or [],
+                 "score": r.get("gd_worthiness_score") or 0} for r in (res.data or []) if r.get("title")]
+    except Exception:  # noqa: BLE001 — news is optional for II
+        log.warning("[interview-intelligence] recent headlines unavailable", exc_info=True)
+        rows = []
+    _NEWS_CACHE.update(at=now, rows=rows)
+    return list(rows)
+
+
 def mount_interview_intelligence(app) -> None:
     try:
         if _II_DIR not in sys.path:
             sys.path.append(_II_DIR)  # append: the backend's own modules always win
         from interview_intelligence.host import mount
-        mount(app, "/ii", resolve_identity)
+        mount(app, "/ii", resolve_identity, news=recent_headlines)
         state = "active" if os.getenv("II_DATABASE_URL", "").strip() else "dormant (II_DATABASE_URL not set)"
         print(f"[interview-intelligence] mounted at /ii — {state}")
     except Exception:  # noqa: BLE001 — II must never take the backend down

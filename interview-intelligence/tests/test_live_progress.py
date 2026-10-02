@@ -1,6 +1,7 @@
 """Live progress while the person waits: real stages reported by the work itself, real findings,
 and an honest estimate only for how far the CURRENT model call is along."""
 
+import re
 import time
 
 from interview_intelligence.jobs import progress
@@ -104,9 +105,12 @@ def test_interview_build_reports_each_stage_with_findings(client):
     v = progress.view(f"prep:{sid}")
     assert v["done"] and [x["id"] for x in v["steps"]] == ["inputs", "role", "match", "rubrics", "questions", "check"]
     facts = {x["id"]: " ".join(x["facts"]) for x in v["steps"]}
-    assert "this role needs" in facts["match"] and ("backed by your CV" in facts["match"] or "each one" in facts["match"])
-    assert "question" in facts["questions"] and "section" in facts["questions"]
-    assert facts["check"]
+    assert "this role needs" in facts["match"]
+    # what the interview will ask — how many questions, which sections, which claims — is never shown
+    assert "Built around your CV" in facts["questions"]
+    for step in ("questions", "check"):
+        assert not re.search(r"\d", facts[step]) and "section" not in facts[step].lower(), facts[step]
+    assert all(not x["detail"] for x in v["steps"]), "no 'Section 2 of 4: ...' while it builds"
     s = client.get(f"/v1/sessions/{sid}", headers=c.h).json()
     assert s["status"] == "ready" and "prep_progress" not in s
 

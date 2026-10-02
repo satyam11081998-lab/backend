@@ -15,6 +15,7 @@ This module must stay import-light: the host imports it at startup, and nothing 
 
     from interview_intelligence.host import mount
     mount(app, "/ii", resolve_identity)   # resolve_identity(authorization) -> HostIdentity
+    mount(app, "/ii", resolve_identity, news=recent_headlines)   # optional: real news for awareness questions
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 from starlette.concurrency import run_in_threadpool
 
@@ -43,8 +44,13 @@ class HostIdentity:
 
 
 Resolver = Callable[[Optional[str]], HostIdentity]
+# Optional: recent business headlines the host already collects (title, summary, source,
+# published_at, category, keywords). II only reads them to ask a business-awareness question
+# built on real news; without a provider the candidate picks the story instead.
+NewsProvider = Callable[[], List[dict]]
 
 _resolver: Optional[Resolver] = None
+_news: Optional[NewsProvider] = None
 
 
 def set_identity_resolver(fn: Optional[Resolver]) -> None:
@@ -54,6 +60,23 @@ def set_identity_resolver(fn: Optional[Resolver]) -> None:
 
 def identity_resolver() -> Optional[Resolver]:
     return _resolver
+
+
+def set_news_provider(fn: Optional[NewsProvider]) -> None:
+    global _news
+    _news = fn
+
+
+def recent_news() -> List[dict]:
+    """The host's recent headlines, or [] (no provider, or it failed — never an error)."""
+    if _news is None:
+        return []
+    try:
+        rows = _news() or []
+        return [r for r in rows if isinstance(r, dict) and r.get("title")]
+    except Exception:  # noqa: BLE001 - news is a nice-to-have; an interview never fails for it
+        log.warning("news provider failed", exc_info=True)
+        return []
 
 
 def configured() -> bool:
@@ -128,11 +151,12 @@ class LazyApp:
         await app(scope, receive, send)
 
 
-def mount(host_app, path: str, resolver: Resolver) -> LazyApp:
+def mount(host_app, path: str, resolver: Resolver, *, news: Optional[NewsProvider] = None) -> LazyApp:
     """Mount II under `path` of a FastAPI/Starlette host and stop II's workers on host shutdown."""
     os.environ.setdefault("II_WORKER_THREADS", "1")  # share the host's box politely
     os.environ.setdefault("II_DB_POOL_SIZE", "3")
     set_identity_resolver(resolver)
+    set_news_provider(news)
     lazy = LazyApp()
     host_app.mount(path, lazy)
 

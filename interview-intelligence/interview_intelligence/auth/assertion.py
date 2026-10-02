@@ -22,6 +22,8 @@ from ..errors import Forbidden, IIError, Unauthorized
 
 ALLOWED_ALGS = ["EdDSA"]  # pinned: no 'none', no HS* (key-confusion), no RS*
 ENTITLEMENT = "interview_intelligence"
+# "ultra" is not a MECE plan yet; accepted so II needs no change when it becomes one (access/plans.py).
+TIERS = {"free", "lite", "pro", "ultra"}
 CONTRACT_VERSION = 1
 
 
@@ -121,7 +123,7 @@ def verify_assertion(token: str, *, now: Optional[int] = None) -> Principal:
     except ValueError:
         raise Unauthorized(_GENERIC, code="invalid_subject")
     tier = str(claims.get("tier") or "free")
-    if tier not in {"free", "lite", "pro"}:
+    if tier not in TIERS:
         tier = "free"
     ent = claims.get("ent") or []
     if not isinstance(ent, list):
@@ -176,9 +178,9 @@ def principal_from_host(authorization: Optional[str], resolver) -> Principal:
         uid = uuid.UUID(str(ident.user_id))
     except ValueError:
         raise Unauthorized(_GENERIC, code="invalid_subject")
-    tier = ident.tier if ident.tier in {"free", "lite", "pro"} else "free"
+    tier = ident.tier if ident.tier in TIERS else "free"
     p = Principal(user_id=uid, email=(ident.email or "").strip().lower(), tier=tier,
-                  entitlements=[ENTITLEMENT] if tier == "pro" else [], mece_admin=bool(ident.is_admin),
+                  entitlements=[ENTITLEMENT] if tier in ("pro", "ultra") else [], mece_admin=bool(ident.is_admin),
                   jti=key[:16], issued_at=int(now), expires_at=int(now + HOST_CACHE_TTL_S))
     with _host_lock:
         _host_cache[key] = (now, p)

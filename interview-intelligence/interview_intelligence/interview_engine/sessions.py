@@ -10,11 +10,12 @@ from sqlalchemy.orm import Session
 
 from ..access import flags
 from ..access.audit import audit
+from ..access import plans
 from ..access.policy import AccessDecision
 from ..ai.runner import spend_today_usd
 from ..db.models import Document, InterviewSession, Report, User
 from ..documents.service import get_owned
-from ..errors import NotFound, TooMany, Unavailable, Unprocessable
+from ..errors import Conflict, NotFound, TooMany, Unavailable, Unprocessable
 from ..jobs.queue import enqueue
 from .lifecycle import assert_slot_available, lock_user, sessions_today, sweep_user
 from .modes import MODES, InterviewConfig
@@ -38,7 +39,11 @@ def create_session(db: Session, user: User, decision: AccessDecision, *, cv_docu
         cfg = InterviewConfig(**(config or {}))
     except Exception as e:  # pydantic ValidationError -> clean 422
         raise Unprocessable(f"Invalid interview settings: {e}".split("\n")[0][:300], code="bad_config")
-    if cfg.duration_minutes not in f["limits.allowed_durations"]:
+    cfg.plan = decision.via or ""
+    if decision.via == plans.TRIAL:
+        # The free interview has one length, whatever the client asked for.
+        cfg.duration_minutes = int(f["plans.trial_minutes"])
+    elif cfg.duration_minutes not in f["limits.allowed_durations"]:
         raise Unprocessable(f"Duration must be one of {f['limits.allowed_durations']} minutes.", code="bad_duration")
     if cfg.voice and not f["voice.enabled"]:
         cfg.voice = False
@@ -53,6 +58,7 @@ def create_session(db: Session, user: User, decision: AccessDecision, *, cv_docu
         raise Unavailable("Interview Intelligence has reached today's capacity. Please try again tomorrow.",
                           code="capacity")
     assert_slot_available(db, user.id, int(f["limits.max_active_sessions"]))
+    check_plan_allows(db, user.id, decision, f)
     per_day = int(f["limits.max_sessions_per_day_test"] if decision.via in ("test_grant", "admin")
                   else f["limits.max_sessions_per_day"])
     if per_day and sessions_today(db, user.id) >= per_day:
@@ -112,6 +118,36 @@ def create_session(db: Session, user: User, decision: AccessDecision, *, cv_docu
     return sess
 
 
+def check_plan_allows(db: Session, user_id: uuid.UUID, decision: AccessDecision, f: dict, *,
+                      starting: Optional[uuid.UUID] = None) -> None:
+    """Plan limits, checked when an interview is prepared and again when it starts."""
+    if decision.via == plans.TRIAL:
+        st = plans.trial_state(db, user_id)
+        if st["started"] and (starting is None or st["session_id"] != str(starting)):
+            raise Conflict("You've used your free interview. Your report stays in Interview Intelligence.",
+                           code="trial_used")
+        if starting is None and st["prepared"] >= int(f["plans.trial_max_prepared"]):
+            raise TooMany("Your free interview is already prepared. Open it from Interview Intelligence and press Start.",
+                          code="trial_prepare_limit")
+    if decision.via == plans.ULTRA:
+        cap = int(f["plans.ultra_monthly_interviews"])
+        if cap and plans.started_last_30d(db, user_id) >= cap:
+            raise TooMany(f"You've started {cap} interviews in the last 30 days, the Ultra fair-use limit. "
+                          "It frees up as older interviews pass 30 days.", code="ultra_monthly_limit")
+
+
+# What a candidate may see before the interview: the role as understood and any warnings about the
+# documents. How many questions, of which kind, in which sections, and which CV claims will be
+# tested stay with the interviewer — as in a real interview (admins see the full plan).
+CANDIDATE_SUMMARY_KEYS = ("role", "jd_quality", "jd_warnings", "cv_warnings", "company_context")
+
+
+def candidate_summary(summary: Optional[dict]) -> Optional[dict]:
+    if not summary:
+        return summary
+    return {k: summary[k] for k in CANDIDATE_SUMMARY_KEYS if k in summary}
+
+
 def view(db: Session, sess: InterviewSession, *, detail: bool = True) -> dict:
     out = {
         "id": str(sess.id), "status": sess.status, "status_reason": sess.status_reason or None,
@@ -130,7 +166,8 @@ def view(db: Session, sess: InterviewSession, *, detail: bool = True) -> dict:
         out["cv_document_id"] = str(sess.cv_document_id)
         out["jd_document_id"] = str(sess.jd_document_id)
         if sess.status not in ("created", "uploading", "analyzing", "failed"):
-            out["pre_interview_summary"] = sess.pre_interview_summary
+            out["pre_interview_summary"] = candidate_summary(sess.pre_interview_summary)
+        out["plan"] = (sess.config or {}).get("plan") or None
     return out
 
 

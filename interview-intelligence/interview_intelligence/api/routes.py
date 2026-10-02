@@ -41,27 +41,36 @@ def access(p: Principal = Depends(principal)):
     rate_limit.check(str(p.user_id), "read")
     with unit() as db:
         d = policy.decide(db, p)
-        return {"allowed": d.allowed, "via": d.via, "is_admin": d.is_admin}
+        # A used free interview keeps the menu entry: the account's report lives there.
+        nav = d.allowed
+        if not nav and d.via_hint == "trial":
+            from ..access.plans import has_history
+            nav = has_history(db, p.user_id)
+        return {"allowed": d.allowed, "via": d.via, "is_admin": d.is_admin, "nav": nav}
 
 
 @router.get("/me")
 def me(p: Principal = Depends(principal)):
+    from ..access import plans
     with unit() as db:
         user, d = read_own(db, p)
         f = flags.all_flags(db)
         act = active_sessions(db, user.id)
+        durations = [int(f["plans.trial_minutes"])] if d.via == plans.TRIAL else f["limits.allowed_durations"]
         return {
             "user": {"id": str(user.id), "email": user.email},
             "access": {"allowed": d.allowed, "via": d.via, "reason": d.reason},
             "is_admin": d.is_admin,
+            "has_history": plans.has_history(db, user.id),
+            "plan": plans.summary(db, d, user.id),
             "limits": {"max_active_sessions": f["limits.max_active_sessions"], "active_count": len(act),
                        "active_sessions": [{"id": str(s.id), "status": s.status, "role_title": s.role_title}
                                            for s in act],
                        "sessions_last_24h": sessions_today(db, user.id),
                        "max_sessions_per_day": f["limits.max_sessions_per_day_test"] if d.via in ("test_grant", "admin")
                        else f["limits.max_sessions_per_day"],
-                       "allowed_durations": f["limits.allowed_durations"], "max_upload_mb": f["limits.max_upload_mb"]},
-            "flags": {"voice": f["voice.enabled"], "voice_engine": f.get("voice.engine", "realtime"),
+                       "allowed_durations": durations, "max_upload_mb": f["limits.max_upload_mb"]},
+            "flags": {"voice": f["voice.enabled"], "voice_engine": plans.voice_engine_for(db, d),
                       "company_intel": f["company_intel.enabled"],
                       "advanced_technical": f["technical.advanced_mode"]},
         }
@@ -177,7 +186,8 @@ def room(sid: str, p: Principal = Depends(principal)):
 @router.post("/sessions/{sid}/start")
 def start(sid: str, p: Principal = Depends(principal)):
     with unit() as db:
-        user, _ = use(db, p, klass="turn")
+        user, d = use(db, p, klass="turn")
+        sessions.check_plan_allows(db, user.id, d, flags.all_flags(db), starting=_uid(sid))
         return orchestrator.start(db, user.id, _uid(sid))
 
 
@@ -301,6 +311,40 @@ def reattempt(sid: str, body: ReattemptBody, p: Principal = Depends(principal)):
         s = sessions.create_session(db, user, d, cv_document_id=src.cv_document_id, jd_document_id=src.jd_document_id,
                                     config=cfg, source_session_id=src.id)
         return sessions.view(db, s)
+
+
+# ------------------------------------------------------------------ plans ---------------
+@router.get("/plans")
+def get_plans(p: Principal = Depends(principal)):
+    """The plans page. Not public: only for people who can use Interview Intelligence (or used
+    their free interview) — everyone else gets a plain 404."""
+    from ..access import plans
+    with unit() as db:
+        user, d = read_own(db, p)
+        if not plans.visible(db, d, user.id):
+            raise NotFound("Not found.")
+        return plans.public_plans(db, d, user.id)
+
+
+class InterestBody(BaseModel):
+    plan: str = "ultra"
+
+
+@router.post("/plans/interest")
+def plan_interest(body: InterestBody, p: Principal = Depends(principal)):
+    """'Tell me when it opens' — recorded once per account, so the admin sees real demand."""
+    from ..access import plans
+    from ..access.audit import audit
+    if body.plan != plans.ULTRA:
+        raise Unprocessable("Unknown plan.", code="bad_plan")
+    with unit() as db:
+        user, d = read_own(db, p)
+        if not plans.visible(db, d, user.id):
+            raise NotFound("Not found.")
+        if not plans.already_interested(db, user.id, body.plan):
+            audit(db, "plans.interest", actor_user_id=user.id, actor_email=user.email, target_type="plan",
+                  target_id=body.plan, meta={"via": d.via})
+        return {"ok": True, "interested": True}
 
 
 @router.get("/progress")

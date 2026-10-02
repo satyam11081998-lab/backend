@@ -12,6 +12,7 @@ from typing import List, Optional
 
 from . import state as S
 from .grounding import overlap, same_question
+from .modes import BREADTH_SECTIONS
 from ..interview_memory import claims as C
 
 PROBE_FOCI = ["specificity", "ownership", "reasoning", "outcome", "quantification", "reflection", "tradeoff",
@@ -99,7 +100,7 @@ def choose_next(state: dict, bp: dict) -> Action:
                 all_sufficient = comps and all(S.sufficient(state, c) for c in comps)
                 critical_untested = any(state["coverage"][c]["importance"] == "critical" and
                                         state["coverage"][c]["asked"] == 0 for c in comps)
-                if all_sufficient and not critical_untested and sid not in ("intro",):
+                if all_sufficient and not critical_untested and sid not in ("intro", *BREADTH_SECTIONS):
                     continue
                 dup = repeats_asked(state, bp, it)
                 if dup:

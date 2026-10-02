@@ -1,8 +1,19 @@
 # J · Admin, access control and test users
 
 ## 1. Who can use II
-`allowed = flag(ii.enabled) ∧ ( is_ii_admin ∨ active_test_grant(email) ∨
-           ('interview_intelligence' ∈ assertion.ent ∧ flag(ii.enabled_for_pro)) )`
+`allowed = flag(ii.enabled) ∧ ( is_ii_admin ∨ active grant(email) of type test | ultra ∨ tier = ultra ∨
+           ('interview_intelligence' ∈ assertion.ent ∧ flag(ii.enabled_for_pro)) ∨
+           ((grant of type trial ∨ flag(plans.trial_open)) ∧ free interview not used up) )`
+
+Plans (`access/plans.py`, Admin → Plans; shown, not charged):
+* **Free interview** (`via=trial`): one per account, ever, `plans.trial_minutes` long (any requested
+  length is replaced); allowed before it starts and while it is in progress; afterwards the account is
+  read-only (its report stays). At most `plans.trial_max_prepared` interviews may be prepared before one
+  is started. Optional cheaper voice: `plans.trial_voice_engine`.
+* **Ultra** (`via=ultra`): an "ultra" grant, or tier "ultra" on the identity (no MECE plan yet; accepted
+  so nothing changes in II when it ships). Fair use: `plans.ultra_monthly_interviews` started per 30 days.
+* Plans page visibility `plans.visibility`: `access` (people with II, and accounts that used a free
+  interview) or `off` (admins only). Everyone else gets 404.
 
 * `ii.enabled` — master kill switch (admins keep access for debugging).
 * `ii.enabled_for_pro` — launch flag; **default false**, so on first deploy only admins
@@ -20,7 +31,7 @@ addresses are hard-coded anywhere in source.
 ## 3. Test users (spec §4)
 Table `access_grants (email_lc unique, status enabled|disabled, grant_type, note,
 granted_by, expires_at)`, managed from **Admin → Interview Intelligence → Test users**:
-add (email + OK), enable/disable, delete, see status. Bootstrap placeholders:
+add (email + type: Full access | Free interview | Ultra), change type, enable/disable, delete, see status. Bootstrap placeholders:
 `II_BOOTSTRAP_TEST_EMAILS=` (empty by default) — inserted once if absent, never
 re-enabling a grant an admin disabled. Every change writes an `audit_logs` row.
 
@@ -41,5 +52,7 @@ inspection is audit-logged.
 ## 6. Feature flags (`system_config`)
 `ii.enabled`, `ii.enabled_for_pro`, `voice.enabled`, `company_intel.enabled`,
 `company_intel.web_research`, `technical.advanced_mode`, `technical.coding_exercises`,
-`admin.test_access`, `limits.*`, `drive.export_reports`, `ocr.enabled`. Env provides
+`admin.test_access`, `limits.*`, `drive.export_reports`, `ocr.enabled`, `plans.*` (visibility,
+trial_open, trial_minutes, trial_max_prepared, trial_voice_engine, ultra_price_inr,
+ultra_monthly_interviews). Env provides
 defaults; DB overrides; 30 s cache.

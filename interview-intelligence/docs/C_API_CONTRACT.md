@@ -53,7 +53,9 @@ Resources owned by another user return **404** (never 403) to prevent enumeratio
 ### Identity & access
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/me` | `{user, access: {allowed, reason, via: pro\|test_grant\|admin}, limits: {max_active, active_count, sessions_today, max_per_day}, flags: {voice, company_intel}, is_admin}` |
+| GET | `/me` | `{user, access: {allowed, reason, via: admin\|test_grant\|ultra\|pro\|trial}, has_history, plan: {via, visible, trial?, ultra?}, limits: {max_active, active_count, sessions_today, max_per_day, allowed_durations (trial: [trial_minutes])}, flags: {voice, voice_engine (trial may differ), company_intel}, is_admin}` |
+| GET | `/plans` | plans page data (404 unless `plans.visible`): `{preview, currency, trial: {minutes, open_to_everyone}, ultra: {price_inr, monthly_interviews, interested}, you}` |
+| POST | `/plans/interest` | `{plan: "ultra"}` → recorded once per account (audit `plans.interest`) |
 
 ### Documents (CV / JD)
 | POST | `/documents` | multipart `file`, `kind=cv\|jd`, optional `label`. PDF/DOC/DOCX, ≤ `II_MAX_UPLOAD_MB` (5). Dedupes on `(user, kind, sha256)`. Returns document + analysis status |
@@ -101,3 +103,13 @@ Resources owned by another user return **404** (never 403) to prevent enumeratio
 II allows `https://mece.in`, `https://www.mece.in`, `http://localhost:3000` and the
 preview regex (same pattern the existing backend uses), credentials **not** required
 (bearer tokens, no cookies).
+
+### Changes in the seventh pass (2026-10-03)
+* Candidate session view: `pre_interview_summary` is reduced to `{role, jd_quality, jd_warnings,
+  cv_warnings, company_context}` — the plan (sections, counts, claims to test, not_planned) is admin-only
+  (`/admin/sessions/{id}` → `session.plan_summary`). Sessions carry `plan` (trial | ultra | …).
+* Live progress (`/sessions/{id}`, `/room`, turn responses): `{status, ended_reason, section:
+  interview|closing, elapsed_s, remaining_s, duration_s, hard_stop_s}` — `section_title`,
+  `questions_asked` and `questions_planned` are gone.
+* Start/create may answer 409 `trial_used`, 429 `trial_prepare_limit` or 429 `ultra_monthly_limit`.
+* Admin: `GET /admin/plans`; access grants take `grant_type` test | trial | ultra (POST and PATCH).

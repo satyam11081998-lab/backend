@@ -166,7 +166,7 @@ def test_nav_access_check_follows_grants_immediately(hclient):
     owner = htok(tier="free", adm=True, email="owner@example.invalid")
     tester = HostCandidate(hclient, tier="free", email="tester@example.invalid")
     r = hclient.get("/v1/access", headers=tester.h)
-    assert r.status_code == 200 and r.json() == {"allowed": False, "via": None, "is_admin": False}
+    assert r.status_code == 200 and r.json() == {"allowed": False, "via": None, "is_admin": False, "nav": False}
     with db_session() as db:
         assert db.get(User, tester.uid) is None  # looking does not register the user
     g = hclient.post("/v1/admin/access-grants", json={"email": "tester@example.invalid"}, headers=owner).json()

@@ -28,6 +28,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from ..access import flags, rate_limit
+from ..access.plans import voice_engine_for
 from ..ai.provider import ProviderError
 from ..ai.routing import resolve
 from ..ai.runner import record_live_usage, record_media_run, record_voice_minutes, spend_today_usd
@@ -181,9 +182,9 @@ def live_session(body: LiveBody, p: Principal = Depends(principal)):
     sid = _uuid(body.session_id)
     rate_limit.check(str(p.user_id), "live")
     with unit() as db:
-        user, _ = use(db, p, klass="voice")
+        user, d = use(db, p, klass="voice")
         _require_voice(db)
-        if flags.flag(db, "voice.engine") != "realtime":
+        if voice_engine_for(db, d) != "realtime":
             raise Forbidden("Live voice is switched off; using standard voice.", code="live_off")
         sess = find_owned(db, user.id, sid)
         if sess is None:
@@ -390,9 +391,9 @@ def gemini_session(body: GeminiBody, p: Principal = Depends(principal)):
     sid = _uuid(body.session_id)
     rate_limit.check(str(p.user_id), "live")
     with unit() as db:
-        user, _ = use(db, p, klass="voice")
+        user, d = use(db, p, klass="voice")
         _require_voice(db)
-        if flags.flag(db, "voice.engine") != "gemini":
+        if voice_engine_for(db, d) != "gemini":
             raise Forbidden("Gemini voice is switched off.", code="live_off")
         sess = find_owned(db, user.id, sid)
         if sess is None:

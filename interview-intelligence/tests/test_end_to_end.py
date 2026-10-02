@@ -12,9 +12,16 @@ def test_full_interview_flow(client):
 
     s = client.get(f"/v1/sessions/{sid}", headers=c.h).json()
     pre = s["pre_interview_summary"]
-    assert pre["competencies_identified"] >= 5
-    assert pre["strong_in_cv"] + pre["need_validation"] == pre["competencies_identified"]
-    assert any(sec["kind"] == "intro" for sec in pre["sections"])
+    # the candidate sees the role as understood, never the plan (sections, counts, claims to test)
+    assert pre["role"]["title"] and not {"sections", "claims_to_investigate", "not_planned", "competencies_identified"} & set(pre)
+    import uuid
+    from interview_intelligence.db.models import InterviewSession
+    from interview_intelligence.db.session import db_session
+    with db_session() as db:
+        full = db.get(InterviewSession, uuid.UUID(sid)).pre_interview_summary
+    assert full["competencies_identified"] >= 5
+    assert full["strong_in_cv"] + full["need_validation"] == full["competencies_identified"]
+    assert any(sec["kind"] == "intro" for sec in full["sections"])
 
     r = client.post(f"/v1/sessions/{sid}/start", headers=c.h)
     assert r.status_code == 200, r.text

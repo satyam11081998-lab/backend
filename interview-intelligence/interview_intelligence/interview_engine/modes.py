@@ -13,14 +13,18 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 SECTION_KINDS = ["intro", "cv", "functional", "technical", "behavioral", "situational", "case", "company",
-                 "motivation", "closing"]
+                 "personal", "awareness", "motivation", "closing"]
 
 SECTION_TITLES = {
     "intro": "Introduction", "cv": "CV & experience", "functional": "Functional knowledge",
     "technical": "Technical", "behavioral": "Behavioral", "situational": "Situational judgment",
-    "case": "Case / problem solving", "company": "Company & role", "motivation": "Motivation",
-    "closing": "Closing",
+    "case": "Case / problem solving", "company": "Company & role", "personal": "Beyond the CV",
+    "awareness": "Business awareness", "motivation": "Motivation", "closing": "Closing",
 }
+
+# Sections that exist for breadth (a real interviewer always asks about you as a person and about
+# what is happening in business), not to fill a competency gap: never skipped as "already covered".
+BREADTH_SECTIONS = ("personal", "awareness")
 
 
 @dataclass(frozen=True)
@@ -36,25 +40,31 @@ class Mode:
 
 
 MODES: Dict[str, Mode] = {m.id: m for m in [
-    Mode("cv_jd", "CV + JD", {"cv": 3, "functional": 2, "behavioral": 1.5, "situational": 1, "motivation": 0.6},
+    Mode("cv_jd", "CV + JD", {"cv": 3, "functional": 2, "behavioral": 1.5, "situational": 1, "personal": 0.6,
+                              "awareness": 0.5, "motivation": 0.6},
          description="Your experience against the role's requirements."),
-    Mode("cv_deep_dive", "CV deep dive", {"cv": 6, "functional": 1, "behavioral": 1}, probe_bonus=1, claim_focus=True,
-         description="Investigates your CV claims in depth."),
-    Mode("hr_behavioral", "HR / behavioral", {"behavioral": 5, "situational": 2, "motivation": 1.5},
+    Mode("cv_deep_dive", "CV deep dive", {"cv": 6, "functional": 1, "behavioral": 1, "personal": 0.8}, probe_bonus=1,
+         claim_focus=True, description="Investigates your CV claims in depth."),
+    Mode("hr_behavioral", "HR / behavioral", {"behavioral": 5, "situational": 2, "personal": 1.2, "motivation": 1.5},
          description="Motivation, ownership, conflict, failure, teamwork, self-awareness."),
     Mode("functional", "Functional", {"functional": 6, "situational": 1, "cv": 1},
          description="Deep functional questions for the role."),
     Mode("technical", "Technical", {"technical": 6, "cv": 1.5}, description="Role-specific technical assessment."),
     Mode("situational", "Situational", {"situational": 6, "behavioral": 1}, description="Realistic job situations."),
-    Mode("case", "Case / problem solving", {"case": 6, "functional": 1}, description="Role-specific cases."),
-    Mode("mixed", "Mixed", {"cv": 2, "functional": 2, "technical": 1.5, "behavioral": 2, "situational": 1.5, "case": 1},
+    Mode("case", "Case / problem solving", {"case": 6, "functional": 1, "awareness": 0.5},
+         description="Role-specific cases."),
+    Mode("mixed", "Mixed", {"cv": 2.5, "functional": 2, "technical": 1.5, "behavioral": 2, "situational": 1.5, "case": 1,
+                            "personal": 0.8, "awareness": 0.8},
          description="A balanced interview across dimensions."),
-    Mode("company_simulation", "Company + role simulation", {"company": 3, "functional": 2, "situational": 2, "motivation": 1},
+    Mode("company_simulation", "Company + role simulation", {"company": 3, "functional": 2, "situational": 2,
+                                                             "awareness": 1.2, "motivation": 1},
          description="Uses the company, the JD and your CV together."),
-    Mode("hiring_manager", "Hiring manager", {"situational": 3, "cv": 2, "functional": 2, "motivation": 1},
+    Mode("hiring_manager", "Hiring manager", {"situational": 3, "cv": 2, "functional": 2, "awareness": 0.8,
+                                              "personal": 0.5, "motivation": 1},
          description="Business judgment, ownership and prioritisation."),
     Mode("final_round", "Final round", {"cv": 1.5, "functional": 2, "technical": 1.5, "behavioral": 2, "situational": 1.5,
-                                         "case": 1, "motivation": 1}, description="Broad assessment across major competencies."),
+                                         "case": 1, "personal": 0.8, "awareness": 0.8, "motivation": 1},
+         description="Broad assessment across major competencies."),
     Mode("cv_attack", "CV attack / defense", {"cv": 9}, probe_bonus=2, claim_focus=True, pushback_bonus=0.1,
          description="Every major CV claim, probed."),
     Mode("weakness_targeting", "Weakness targeting", {"functional": 2, "behavioral": 2, "situational": 2, "cv": 1,
@@ -62,9 +72,10 @@ MODES: Dict[str, Mode] = {m.id: m for m in [
          requires_history=True, description="Focuses on competencies flagged in earlier interviews."),
     Mode("technical_deep_dive", "Technical deep dive", {"technical": 8, "functional": 1}, probe_bonus=2,
          description="Very deep functional or technical assessment."),
-    Mode("stress", "Stress / pressure", {"cv": 2, "functional": 2, "situational": 3, "behavioral": 1}, pushback_bonus=0.3,
-         description="Professional pushback, constraints and forced choices."),
-    Mode("grill", "Grill mode", {"cv": 3, "functional": 3, "situational": 2, "behavioral": 1}, probe_bonus=2,
+    Mode("stress", "Stress / pressure", {"cv": 2, "functional": 2, "situational": 3, "behavioral": 1, "awareness": 0.6},
+         pushback_bonus=0.3, description="Professional pushback, constraints and forced choices."),
+    Mode("grill", "Grill mode", {"cv": 3, "functional": 3, "situational": 2, "behavioral": 1, "personal": 0.6,
+                                 "awareness": 0.6}, probe_bonus=2,
          pushback_bonus=0.2, claim_focus=True, description="High scrutiny, high depth, low tolerance for vague answers."),
 ]}
 
@@ -147,6 +158,9 @@ class InterviewConfig(BaseModel):
     company_name: str = ""
     company_notes: str = ""
     voice: bool = False
+    # Set by the server from the access decision (trial | ultra | test_grant | pro | admin) — whatever
+    # a client sends here is overwritten in sessions.create_session.
+    plan: str = ""
 
     @field_validator("mode")
     @classmethod
@@ -194,6 +208,12 @@ class SectionPlan:
     n_items: int = 0
 
 
+# The running order of a real interview: your CV, then you beyond it, then the role itself, the
+# business around it, how you behave, and what you are looking for.
+SECTION_ORDER = ["cv", "personal", "functional", "technical", "case", "company", "awareness", "behavioral",
+                 "situational", "motivation"]
+
+
 def intro_closing_budget(duration_s: int) -> tuple[int, int]:
     if duration_s <= 15 * 60:
         return 60, 60
@@ -221,10 +241,15 @@ def allocate_sections(cfg: InterviewConfig, family_bias: Dict[str, float], techn
                                                          "functional") else 1.0
         weights[k] = weights.get(k, 0.0) + w * (bias if bias > 0 else 0.0)
     weights = {k: v for k, v in weights.items() if v > 0.05}
+    # A short interview cannot visit every area: one question per section would leave no time for
+    # follow-ups. Keep the areas this mode weights most (the order below is still the running order).
+    fits = max(2, int(round(main / max(avg_item_s, 90))))
+    if len(weights) > fits:
+        ranked = sorted(weights, key=lambda k: -weights[k])
+        weights = {k: weights[k] for k in ranked[:fits]}
     s = sum(weights.values()) or 1.0
     plans = [SectionPlan("intro", intro_s, 0)]
-    order = [k for k in ["cv", "functional", "technical", "case", "company", "behavioral", "situational", "motivation"]
-             if k in weights]
+    order = [k for k in SECTION_ORDER if k in weights]
     for k in order:
         budget = int(main * weights[k] / s)
         n = max(1, round(budget / max(avg_item_s, 90)))

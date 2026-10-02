@@ -47,6 +47,14 @@ def defaults() -> Dict[str, Any]:
         "limits.session_cost_cap_usd": s.session_cost_cap_usd,
         "limits.daily_budget_usd": s.daily_budget_usd,
         "limits.max_upload_mb": s.max_upload_mb,
+        # Plans (access/plans.py). Shown, not charged: no payment is wired.
+        "plans.visibility": "access",       # access = only people with Interview Intelligence; off = hidden
+        "plans.trial_open": False,          # on = every signed-in account gets one free interview
+        "plans.trial_minutes": 15,
+        "plans.trial_max_prepared": 3,      # interviews a trial account may build before starting one
+        "plans.ultra_price_inr": 1299,
+        "plans.ultra_monthly_interviews": 10,
+        "plans.trial_voice_engine": "same",  # same = voice.engine; or a cheaper engine for free interviews
     }
 
 
@@ -61,11 +69,19 @@ _TYPES = {
         "drive.export_reports": True, "limits.max_active_sessions": 2, "limits.max_sessions_per_day": 5,
         "limits.max_sessions_per_day_test": 10, "limits.allowed_durations": [45],
         "limits.session_cost_cap_usd": 1.0, "limits.daily_budget_usd": 1.0, "limits.max_upload_mb": 5,
+        "plans.visibility": "access", "plans.trial_open": False, "plans.trial_minutes": 15,
+        "plans.trial_max_prepared": 3, "plans.ultra_price_inr": 1299, "plans.ultra_monthly_interviews": 10,
+        "plans.trial_voice_engine": "same",
     }.items()
 }
 
 # String flags take one of a fixed set of values.
-ENUMS: Dict[str, tuple] = {"voice.engine": ("realtime", "gemini", "standard")}
+ENUMS: Dict[str, tuple] = {"voice.engine": ("realtime", "gemini", "standard"), "plans.visibility": ("access", "off"),
+                           "plans.trial_voice_engine": ("same", "realtime", "gemini", "standard")}
+# Integer flags with a sensible range (a typo must not make a free interview 900 minutes long).
+RANGES: Dict[str, tuple] = {"limits.max_active_sessions": (1, 10), "plans.trial_minutes": (5, 60),
+                            "plans.trial_max_prepared": (1, 20), "plans.ultra_price_inr": (0, 100000),
+                            "plans.ultra_monthly_interviews": (1, 200)}
 
 _cache: Dict[str, Any] = {"ts": 0.0, "data": {}}
 _lock = threading.Lock()
@@ -144,8 +160,9 @@ def coerce(key: str, value: Any) -> Any:
         return bool(value)
     if t is int:
         v = int(value)
-        if key == "limits.max_active_sessions" and not (1 <= v <= 10):
-            raise ValueError("max_active_sessions must be between 1 and 10")
+        lo_hi = RANGES.get(key)
+        if lo_hi and not (lo_hi[0] <= v <= lo_hi[1]):
+            raise ValueError(f"{key.split('.')[-1]} must be between {lo_hi[0]} and {lo_hi[1]}")
         if v < 0:
             raise ValueError("must be >= 0")
         return v

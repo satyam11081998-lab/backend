@@ -11,7 +11,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
-from interview_intelligence.db.models import InterviewBlueprint
+from interview_intelligence.db.models import InterviewBlueprint, InterviewSession
 from interview_intelligence.db.session import db_session
 from interview_intelligence.interview_engine.modes import MODES
 from interview_intelligence.question_engine import quality
@@ -29,6 +29,13 @@ def _blueprint(sid):
     with db_session() as db:
         return db.execute(select(InterviewBlueprint).where(InterviewBlueprint.session_id == uuid.UUID(sid))
                           ).scalar_one().blueprint
+
+
+def _session(sid):
+    with db_session() as db:
+        s = db.get(InterviewSession, uuid.UUID(sid))
+        db.expunge(s)
+        return s
 
 
 def _norm(s):
@@ -64,7 +71,7 @@ def test_role_family_run(client, family):
         assert gaps == [], ("every critical/high competency gets a planned question", gaps, bp["qa"]["coverage_repair"])
     else:  # a 15-minute interview cannot hold one question per key competency: disclosed, not hidden
         assert all(g["unresolved_reason"] == "no_redundant_slot" for g in gaps)
-        assert len(s["pre_interview_summary"]["not_planned"]) == len(gaps)
+        assert len(_session(sid).pre_interview_summary["not_planned"]) == len(gaps)
     assert sum(sec["budget_s"] for sec in bp["sections"]) <= minutes * 60
     kinds = [sec["kind"] for sec in bp["sections"]]
     assert kinds[0] == "intro" and kinds[-1] == "closing"

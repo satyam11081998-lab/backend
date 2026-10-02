@@ -1,6 +1,10 @@
 """Access policy (docs/J_ADMIN_ACCESS.md).
 
-allowed = flag(ii.enabled) AND ( admin OR active test grant OR (pro entitlement AND flag(ii.enabled_for_pro)) )
+allowed = flag(ii.enabled) AND ( admin OR active grant (test | ultra | trial*) OR tier "ultra"
+                                 OR (pro entitlement AND flag(ii.enabled_for_pro))
+                                 OR (flag(plans.trial_open) AND trial*) )
+  * trial = one interview per account, ever (access/plans.py): allowed before it starts and while
+    it is in progress; afterwards the account can still read its history and report.
 
 The entitlement comes ONLY from the signed assertion (auth/assertion.py). No request body
 or query field can influence it.
@@ -26,10 +30,11 @@ from .audit import audit
 @dataclass(frozen=True)
 class AccessDecision:
     allowed: bool
-    via: Optional[str]  # admin | test_grant | pro
+    via: Optional[str]  # admin | test_grant | ultra | pro | trial
     reason: str
     is_admin: bool
     read_only: bool  # may read own history but not start/continue interviews
+    via_hint: Optional[str] = None  # the plan a refused account is on (e.g. "trial" once it is used)
 
 
 def is_ii_admin(p: Principal) -> bool:
@@ -59,11 +64,22 @@ def decide(db: Session, p: Principal) -> AccessDecision:
         return AccessDecision(True, "admin", "admin", True, False)
     if not f.get("ii.enabled", True):
         return AccessDecision(False, None, "Interview Intelligence is temporarily unavailable.", False, True)
-    if f.get("admin.test_access", True) and active_grant(db, p.email_lc) is not None:
+    grant = active_grant(db, p.email_lc) if f.get("admin.test_access", True) else None
+    if grant is not None and grant.grant_type == "ultra":
+        return AccessDecision(True, "ultra", "ultra (granted)", False, False)
+    if grant is not None and grant.grant_type != "trial":
         return AccessDecision(True, "test_grant", "test access", False, False)
+    if (p.tier or "").lower() == "ultra":  # a future MECE plan: no II change needed when it ships
+        return AccessDecision(True, "ultra", "ultra", False, False)
+    if p.pro_entitled and f.get("ii.enabled_for_pro", False):
+        return AccessDecision(True, "pro", "pro", False, False)
+    if grant is not None or f.get("plans.trial_open", False):
+        from .plans import trial_allows_use
+        if trial_allows_use(db, p.user_id):
+            return AccessDecision(True, "trial", "free interview", False, False)
+        return AccessDecision(False, None, "You've used your free interview. Your report stays here whenever you "
+                                           "want it.", False, True, via_hint="trial")
     if p.pro_entitled:
-        if f.get("ii.enabled_for_pro", False):
-            return AccessDecision(True, "pro", "pro", False, False)
         return AccessDecision(False, None, "Interview Intelligence is in private preview and opening to Pro soon.",
                               False, True)
     return AccessDecision(False, None, "Interview Intelligence is a Pro feature.", False, True)

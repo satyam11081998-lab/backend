@@ -1,4 +1,4 @@
-# Build status — 2026-10-02
+# Build status — 2026-10-03
 
 Honest state of Interview Intelligence (II) after the first build. "Tested" means an
 automated test or a recorded run exists (see `L_ADVERSARIAL_QA_MATRIX.md`); nothing below is
@@ -98,6 +98,52 @@ shows which of the JD's key terms the CV mentions (literal check, worded as such
 | Progress node tests / voice node tests (device) | 4 / 4, 47 / 47 |
 | Frontend `tsc --noEmit` (device) / `next build` (copy) | exit 0 / OK |
 | Browser (simulated models slowed to realistic step times) | CV progress rose 10 % → 39 % while reading; continued to the JD while the CV ran; JD queued behind it with a note; findings + skill chips on completion; key-term match; build steps with findings; report steps with "8 of 9" scoring detail; phone width; no console errors |
+
+## 0e. The plan stays hidden, a real opening, more breadth, plans (seventh pass, 2026-10-03)
+
+Owner feedback and what changed:
+* **Candidates no longer see the plan.** The ready screen, the build progress and the live interview
+  show nothing about how many questions, of which kind, in which sections, or which CV claims will be
+  tested (`sessions.candidate_summary`, `session_progress` is time only). Admins still see it
+  (Interviews → Inspect shows the plan line).
+* **The interviewer opens like a person**, deterministically from the real plan
+  (`interviewer.opening_line`): "Hi, I'm your MECE interviewer. This is grill mode, about 30 minutes,
+  for the Brand Manager role. Expect me to push for specifics... We'll start with a quick
+  introduction, then go through your CV for about 9 minutes, ... switch to behavioural questions for
+  about 5 minutes. I'll keep a few minutes at the end for your questions." It can never announce a part
+  that is not in the plan; "repeat that" repeats the question, not the whole introduction.
+* **Breadth.** Two new sections: *Beyond the CV* (hobbies, interests, positions of responsibility,
+  competitions — the CV parser now extracts `activities` and `interests`, cv_parser@2) and *Business
+  awareness* (a question built on ONE real recent business headline from the backend's existing news
+  pipeline — `news_headlines`, read-only, via `host.mount(..., news=)` — or, without news, the
+  candidate picks the story). Political/geopolitical stories are never used; a question that adds a
+  number not in the headline is rejected. CV questions now spread across roles (best claim of each role
+  first). 9 new behavioural archetypes (learning fast, feedback, ambiguity, integrity, setbacks,
+  persuading with evidence, team, customer, an idea adopted) + 4 personal + 3 awareness; 19 new
+  curated questions; the same kind of question is not picked twice (selection penalty);
+  question_generator@3 asks for varied openings. Short interviews keep only the areas that fit
+  (15 minutes = about three). Coverage repair never trades away the breadth sections or the last CV
+  question.
+* **Hard stop**: an interview ends at its length + 15 % (min 2 minutes) of active time
+  (`ended_reason=time_limit`) — keeps the free interview at 15 minutes and a forgotten call cheap.
+* **Plans** (`access/plans.py`, Admin → Plans), not public and charging nothing:
+  free interview = one per account, `plans.trial_minutes` (15), started = used, finishable, report kept;
+  given by a "Free interview" access grant, or to everyone when `plans.trial_open` is switched on;
+  `plans.trial_voice_engine` can run it on a cheaper voice. Ultra = granted ("ultra" grant) or a
+  future MECE tier "ultra" (already recognised), fair use `plans.ultra_monthly_interviews` (10) per
+  30 days. Plans page `/interview-intelligence/plans` (404 for anyone without access; noindex):
+  Free interview / Pro (MECE's real price) / Ultra (`plans.ultra_price_inr`, default ₹1,299) with
+  "Tell me when it opens" (recorded once per account; Admin → Plans shows who).
+
+Versions: question_engine qe-3, blueprint bp-2, interviewer iv-3, decision_policy pol-3; prompts
+cv_parser@2, question_generator@3; library arch-2 / bank-2. CV analysis version unchanged (cv-1), so
+saved CVs are not re-analysed; CVs uploaded from now on get activities/interests.
+
+Gates: II suite 323 passed (Postgres 16) / 322 + 1 skipped (SQLite), incl.
+`tests/test_breadth_and_plans.py` (21); voice node tests 48/48, progress 4/4; `tsc --noEmit` EXIT 0;
+`next build` OK (copy); browser walk-through (free interview end to end, plans page desktop + phone,
+admin Plans / Test users / Inspect). NOT verified: real-model question quality for the new sections,
+and the news glue against the live `news_headlines` table (unit-checked with a stub client).
 
 ## 0d. Interviewer stays with the conversation; sectioned report (sixth pass, 2026-10-02)
 

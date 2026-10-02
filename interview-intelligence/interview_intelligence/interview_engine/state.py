@@ -84,6 +84,18 @@ def section_spent_s(state: dict, sid: str) -> int:
     return spent
 
 
+def hard_cap_s(blueprint: dict) -> int:
+    """Past this much active time the interview ends, whatever is happening: the planned length
+    plus a little grace (15 % / at least 2 minutes) to finish a thought. Keeps a free 15-minute
+    interview at 15 minutes, and stops a call left running from costing money."""
+    total = total_budget_s(blueprint)
+    return total + max(120, int(0.15 * total))
+
+
+def past_hard_cap(state: dict, blueprint: dict) -> bool:
+    return float(state["clock"]["active_s"]) >= hard_cap_s(blueprint)
+
+
 def remaining_s(state: dict, blueprint: dict) -> int:
     return max(0, total_budget_s(blueprint) - int(state["clock"]["active_s"]))
 

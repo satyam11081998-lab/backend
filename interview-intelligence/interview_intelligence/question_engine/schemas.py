@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 QuestionType = Literal["behavioral", "situational", "functional", "technical", "case", "cv_deep_dive",
-                       "motivation", "company", "estimation", "closing", "intro", "pressure"]
+                       "motivation", "company", "estimation", "closing", "intro", "pressure", "personal", "awareness"]
 
 
 class _M(BaseModel):
@@ -18,6 +18,8 @@ class SelectionReason(_M):
     requirement_ids: List[str] = Field(default_factory=list)
     claim_ids: List[str] = Field(default_factory=list)
     company_fact_ids: List[str] = Field(default_factory=list)
+    news_ids: List[str] = Field(default_factory=list)
+    activity_refs: List[str] = Field(default_factory=list)  # hobbies / activities from the CV it asks about
     explanation: str = ""
 
 
@@ -65,6 +67,8 @@ class GeneratedQuestion(_M):
     probe_tree: List[str] = Field(default_factory=list)
     requirement_ids: List[str] = Field(default_factory=list)
     claim_ids: List[str] = Field(default_factory=list)
+    news_ids: List[str] = Field(default_factory=list, description="N# of the news item the question uses, if any")
+    activity_refs: List[str] = Field(default_factory=list, description="A# activity or the interest it asks about")
     why_this_question: str = ""
 
 

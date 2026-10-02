@@ -71,6 +71,16 @@ class Certification(_M):
     year: str = ""
 
 
+class Activity(_M):
+    """Life beyond the job: positions of responsibility, clubs, competitions, sport, volunteering,
+    awards outside work. Interviewers ask about these to see the person, not only the employee."""
+    id: str = Field("", description="A1, A2 ...")
+    kind: Literal["position_of_responsibility", "extracurricular", "competition", "sport", "volunteering",
+                  "award", "creative", "other"] = "other"
+    text: str = Field("", description="close to the CV wording")
+    organization: str = ""
+
+
 class Skills(_M):
     technical: List[str] = Field(default_factory=list)
     tools: List[str] = Field(default_factory=list)
@@ -98,6 +108,8 @@ class CandidateProfile(_M):
     projects: List[Project] = Field(default_factory=list)
     skills: Skills = Field(default_factory=Skills)
     certifications: List[Certification] = Field(default_factory=list)
+    activities: List[Activity] = Field(default_factory=list)
+    interests: List[str] = Field(default_factory=list, description="hobbies / interests as listed, short phrases")
     claims: List[CVClaim] = Field(default_factory=list)
     parse_quality: ParseQuality = Field(default_factory=ParseQuality)
 

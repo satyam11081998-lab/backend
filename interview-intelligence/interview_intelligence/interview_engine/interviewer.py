@@ -30,14 +30,88 @@ FOCUS_FALLBACK = {
 }
 TRANSITIONS = {
     "cv": "Let's talk about your experience. ",
+    "personal": "Let me ask a little about you beyond the CV. ",
     "functional": "Let me ask about the functional side of the role. ",
     "technical": "Let's get into some technical questions. ",
-    "behavioral": "I'd like to hear how you've handled a few situations. ",
+    "behavioral": "Let's switch to some behavioural questions. ",
     "situational": "Let me give you a scenario. ",
     "case": "Let's work through a short problem. ",
     "company": "Let's talk about the company and the role. ",
+    "awareness": "Let's talk about what's happening in business right now. ",
     "motivation": "A couple of questions about what you're looking for. ",
 }
+
+# How the interviewer announces each part of the plan at the start ({m} = " for about N minutes").
+AGENDA_PHRASES = {
+    "cv": "go through your CV{m}",
+    "personal": "talk a little about you beyond the CV",
+    "functional": "get into the functional side of the role{m}",
+    "technical": "get into some technical questions{m}",
+    "case": "work through a short problem together{m}",
+    "company": "talk about the company and the role{m}",
+    "awareness": "discuss what's happening in business right now",
+    "behavioral": "switch to behavioural questions{m}",
+    "situational": "go through a few real-world scenarios{m}",
+    "motivation": "talk about what you're looking for",
+}
+MODE_NAMES = {
+    "grill": "grill mode", "mixed": "a mixed interview", "final_round": "a final-round interview",
+    "cv_attack": "a CV attack-and-defence interview", "hr_behavioral": "an HR and behavioural interview",
+    "case": "a case interview", "cv_jd": "an interview on your CV against this role",
+    "cv_deep_dive": "a CV deep dive", "stress": "a pressure interview", "hiring_manager": "a hiring-manager interview",
+    "company_simulation": "a company and role simulation", "weakness_targeting": "a focused re-attempt on the areas "
+    "your last interview flagged", "technical_deep_dive": "a technical deep dive",
+}
+MODE_TONE = {
+    "grill": "Expect me to push for specifics, numbers and exactly what you did.",
+    "stress": "I'll add some pressure along the way; that's part of the exercise.",
+    "cv_attack": "I'll test the main claims on your CV one by one.",
+}
+
+
+def agenda_sentence(agenda: Sequence[dict]) -> str:
+    """'We'll start with a quick introduction, then go through your CV for about 10 minutes, ...'"""
+    parts = []
+    for a in agenda:
+        phrase = AGENDA_PHRASES.get(a.get("kind", ""))
+        if not phrase:
+            continue
+        mins = int(a.get("minutes") or 0)
+        parts.append(phrase.format(m=f" for about {mins} minutes" if mins >= 4 else ""))
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        body = parts[0]
+    else:
+        linked = [parts[0]]
+        for i, p in enumerate(parts[1:-1], start=1):
+            linked.append(("then " if i % 2 == 0 else "") + p)
+        body = ", ".join(linked) + ", and " + parts[-1]
+    return f"We'll start with a quick introduction, then {body}. I'll keep a few minutes at the end for your questions."
+
+
+def opening_line(bp: dict, question_text: str) -> str:
+    """The first thing the candidate hears: who is speaking, what kind of interview this is, how
+    long, the running order, then the first question. Deterministic — built from the real plan,
+    so it can never announce a part that is not there."""
+    cfg = bp.get("config") or {}
+    role_title = (bp.get("role") or {}).get("title", "")
+    minutes = int(cfg.get("duration_minutes", 45))
+    mode = cfg.get("mode", "mixed")
+    kind = MODE_NAMES.get(mode, "a practice interview")
+    role = f"the {role_title} role" if role_title else "this role"
+    lines = [f"Hi, I'm your MECE interviewer. This is {kind}, about {minutes} minutes, for {role}."]
+    tone = MODE_TONE.get(mode) or ("Take your time; there are no trick questions." if cfg.get("difficulty") == "easy"
+                                    else "")
+    if tone:
+        lines.append(tone)
+    agenda = agenda_sentence(bp.get("agenda") or [
+        {"kind": x["kind"], "minutes": round(int(x.get("budget_s", 0)) / 60)} for x in bp.get("sections", [])
+        if x.get("kind") not in ("intro", "closing") and x.get("items")])
+    if agenda:
+        lines.append(agenda)
+    lines.append(question_text)
+    return " ".join(lines)
 CHALLENGE_FALLBACK = [
     "I'm not convinced yet. What evidence do you have that this was the right call?",
     "Suppose you only had two weeks instead. What changes in your approach?",
@@ -84,7 +158,7 @@ def fallback(action: Action, *, question_text: str, role_title: str, minutes: in
     t = action.type
     if t == "OPEN":
         role = f"the {role_title} role" if role_title else "this role"
-        return (f"Hi, thanks for joining. This will be about {minutes} minutes for {role}, and I'll ask "
+        return (f"Hi, I'm your MECE interviewer. This will be about {minutes} minutes for {role}, and I'll ask "
                 f"follow-ups as we go. {question_text}")
     if t == "ASK":
         pre = {"ack_refusal": "That's fine, we can leave that one. ", None: ""}.get(action.preface, "")
@@ -120,6 +194,8 @@ def fallback(action: Action, *, question_text: str, role_title: str, minutes: in
         return ("Thanks — those are fair questions; in a real process the panel would be the best people to answer "
                 "the company-specific ones. That's all from my side. Thank you for your time today.")
     if t == "END_EARLY":
+        if action.preface == "time":
+            return "We're out of time, so let's stop here. Thank you — your report will be ready shortly."
         return "Understood, we'll stop here. Thank you for your time — your report will be ready shortly."
     return question_text
 
@@ -175,6 +251,8 @@ def _action_brief(action: Action, *, question_text: str, item: Optional[dict], c
                 "(say the panel would know specifics), then thank them and end. No question.\n"
                 "THEIR QUESTIONS (untrusted): " + wrap_untrusted("answer", "closing", truncate(closing_reply, 800)))
     if t == "END_EARLY":
+        if action.preface == "time":
+            return "ACTION: END — the time is up: say so briefly, thank them, say the report will follow. No question."
         return "ACTION: END — acknowledge they want to stop, thank them, say the report will follow. No question."
     if t == "PAUSE":
         return "ACTION: PAUSE — agree to a break, say they can resume when ready. No question."
@@ -218,6 +296,8 @@ def speak(action: Action, *, ctx: RunContext, bp: dict, question_text: str, last
                   contradiction=contradiction, closing_reply=closing_reply)
     if action.type == "PROBE" and not action.probe_text:
         fb = _focus_fallback(action.focus, used_foci)
+    if action.type == "OPEN" and bp.get("sections"):
+        return opening_line(bp, question_text), False, guard
     if degraded or action.type in ("WAIT", "PAUSE"):
         return fb, False, guard
     persona = bp.get("persona") or {}
