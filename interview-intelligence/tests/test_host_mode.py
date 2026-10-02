@@ -158,6 +158,26 @@ def test_access_rules_hold_in_host_mode(hclient):
     assert hclient.get("/v1/admin/overview", headers=htok(tier="free", email=ADMIN_EMAIL)).status_code == 200
 
 
+def test_nav_access_check_follows_grants_immediately(hclient):
+    """The app nav shows the Interview Intelligence link iff /v1/access says allowed; adding or
+    deleting a test grant must show on the very next check, and checking never registers anyone."""
+    from interview_intelligence.db.models import User
+    from interview_intelligence.db.session import db_session
+    owner = htok(tier="free", adm=True, email="owner@example.invalid")
+    tester = HostCandidate(hclient, tier="free", email="tester@example.invalid")
+    r = hclient.get("/v1/access", headers=tester.h)
+    assert r.status_code == 200 and r.json() == {"allowed": False, "via": None, "is_admin": False}
+    with db_session() as db:
+        assert db.get(User, tester.uid) is None  # looking does not register the user
+    g = hclient.post("/v1/admin/access-grants", json={"email": "tester@example.invalid"}, headers=owner).json()
+    assert hclient.get("/v1/access", headers=tester.h).json()["allowed"] is True
+    assert hclient.delete(f"/v1/admin/access-grants/{g['id']}", headers=owner).status_code == 204
+    assert hclient.get("/v1/access", headers=tester.h).json()["allowed"] is False
+    a = hclient.get("/v1/access", headers=owner).json()
+    assert a["allowed"] is True and a["is_admin"] is True
+    assert hclient.get("/v1/access", headers=htok(guest=True)).status_code == 403
+
+
 def test_identity_is_cached_briefly(hclient):
     h = htok(tier="pro")
     for _ in range(5):

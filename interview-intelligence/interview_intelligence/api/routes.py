@@ -31,6 +31,18 @@ def _uid(raw: str) -> uuid.UUID:
 
 
 # ------------------------------------------------------------------ identity ----------
+@router.get("/access")
+def access(p: Principal = Depends(principal)):
+    """Cheap check for the MECE app nav: may this user open Interview Intelligence right now?
+    The nav calls it once per page load, so it does one grant lookup at most (flags are
+    cached) and never registers the user. Same decision as every other route."""
+    from ..access import policy, rate_limit
+    rate_limit.check(str(p.user_id), "read")
+    with unit() as db:
+        d = policy.decide(db, p)
+        return {"allowed": d.allowed, "via": d.via, "is_admin": d.is_admin}
+
+
 @router.get("/me")
 def me(p: Principal = Depends(principal)):
     with unit() as db:
