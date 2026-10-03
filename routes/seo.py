@@ -6,6 +6,12 @@ Growth Agent routes — programmatic SEO generation (admin only).
                           explicit topic), self-critique it, and store it as a
                           DRAFT in seo_pages. Never publishes — an admin approves
                           in /admin/growth, which flips status to 'published'.
+  GET  /seo/daily/status -> the daily blog: switches, today's post, the last
+                          fortnight, and the topics it would pick right now.
+  POST /seo/daily/run    -> write today's daily post now (services/growth/daily_blog.py).
+                          Works even while DAILY_BLOG_ENABLED is off, so the owner can
+                          try it; saves a DRAFT unless {"publish": true} and it passes
+                          every check. {"dry_run": true} = preview, nothing saved.
 
 Admin-gated with the same contract as routes/agentic.py & routes/coach.py.
 The daily-budget kill switch is enforced before any model call.
@@ -71,3 +77,27 @@ async def seo_generate(body: GenerateRequest, authorization: Optional[str] = Hea
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Generation failed: {type(e).__name__}")
     return draft
+
+
+class DailyRunRequest(BaseModel):
+    force: bool = False      # write another even if today's exists
+    dry_run: bool = False    # preview only, nothing saved
+    publish: bool = False    # publish if it passes every check (else a draft)
+
+
+@router.get("/daily/status")
+def seo_daily_status(authorization: Optional[str] = Header(default=None)):
+    _require_admin(authorization)
+    from services.growth import daily_blog
+    return daily_blog.status(get_supabase_client())
+
+
+@router.post("/daily/run")
+def seo_daily_run(body: DailyRunRequest, authorization: Optional[str] = Header(default=None)):
+    """Plain `def`: a run takes a minute or two of blocking calls (threadpool, not the event loop)."""
+    uid = _require_admin(authorization)
+    check_rate_limit(f"seo:daily:{uid}", max_calls=6, window_seconds=600)
+    assert_daily_budget()
+    from services.growth import daily_blog
+    return daily_blog.run_daily(get_supabase_client(), user_id=uid, force=body.force, dry_run=body.dry_run,
+                                publish=body.publish)

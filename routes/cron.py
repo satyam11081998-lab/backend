@@ -182,3 +182,38 @@ async def cron_schedule_daily_us(x_cron_secret: Optional[str] = Header(default=N
         message=result.get("message", "US daily schedule updated"),
         details=result,
     )
+
+
+# ============================================================
+# Endpoint: Daily blog (Growth Agent) — 2026-10-04
+#
+# Writes today's /insights article (services/growth/daily_blog.py). Called by
+# .github/workflows/daily-blog.yml at ~07:00 IST, after the 06:00 news fetch, so
+# the post is live (ISR, <= 1 h) by 08:00. Does nothing until DAILY_BLOG_ENABLED
+# is on; publishes only when DAILY_BLOG_AUTOPUBLISH is on AND every check passes,
+# otherwise leaves a draft in /admin/growth. One post per IST day (idempotent).
+# A plain `def` on purpose: research + writing take a minute or two of blocking
+# calls, which FastAPI runs in its threadpool instead of the event loop.
+# ============================================================
+
+@router.post("/daily-blog", response_model=CronResponse)
+def cron_daily_blog(x_cron_secret: Optional[str] = Header(default=None)) -> CronResponse:
+    verify_cron_secret(x_cron_secret)
+    from services.growth import daily_blog
+    cfg = daily_blog.config()
+    if not cfg["enabled"]:
+        return CronResponse(status="skipped", message="Daily blog is off (set DAILY_BLOG_ENABLED=1 to turn it on)",
+                            details={"enabled": False})
+    try:
+        from services.ai_usage import assert_daily_budget
+        assert_daily_budget()
+    except HTTPException as e:
+        return CronResponse(status="skipped", message=str(e.detail), details={"budget": True})
+    result = daily_blog.run_daily(get_supabase_client())
+    page = result.get("page") or {}
+    return CronResponse(
+        status=result.get("status", "skipped"),
+        message=result.get("reason", ""),
+        details={"slug": page.get("slug"), "title": page.get("title"), "status": page.get("status"),
+                 "score": page.get("quality_score")},
+    )
