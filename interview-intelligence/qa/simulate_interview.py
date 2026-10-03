@@ -123,7 +123,8 @@ def run_one(family: str, persona: str, *, mode: str, difficulty: str, minutes: i
     uid = uuid.uuid4()
     from interview_intelligence.main import create_app
     with TestClient(create_app()) as c:
-        c.patch("/v1/admin/config", json={"values": {"ii.enabled_for_pro": True}},
+        # Every mode and length: the simulator exercises the engine, not the Pro plan's limits.
+        c.patch("/v1/admin/config", json={"values": {"ii.enabled_for_pro": True, "plans.pro_limits": False}},
                 headers=tok("sim-admin@example.invalid", "free")).raise_for_status()
         h = tok("candidate@example.invalid", "pro")
         cv = c.post("/v1/documents", data={"kind": "cv"}, headers=h,

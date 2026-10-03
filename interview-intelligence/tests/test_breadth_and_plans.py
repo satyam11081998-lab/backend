@@ -4,7 +4,10 @@
  * more breadth: the whole CV (not one job), the person beyond it (hobbies, positions of
    responsibility) and business awareness built on real recent news — never invented news;
  * plans: one free 15-minute interview per account, Ultra with a fair-use cap, a plans page only
-   people with Interview Intelligence can see; and a hard stop at the planned length."""
+   people with Interview Intelligence can see; and a hard stop at the planned length.
+Round 9 (owner, 2026-10-04): Free = one 10-minute interview, Pro = 20-minute interviews with a
+monthly allowance and the everyday + role-specific types, Ultra = every type and length and the
+re-attempt loop — enforced by the server on prepare and again on start."""
 
 import uuid
 
@@ -229,11 +232,11 @@ def test_the_interview_stops_at_its_length(client):
 
 
 # --------------------------------------------------------------------------- plans
-def test_free_interview_is_15_minutes_once_and_the_report_stays(client):
+def test_free_interview_is_10_minutes_once_and_the_report_stays(client):
     _grant(client, "trial@example.invalid", "trial")
     c = Candidate(client, email="trial@example.invalid", tier="free")
     me = client.get("/v1/me", headers=c.h).json()
-    assert me["access"]["via"] == "trial" and me["limits"]["allowed_durations"] == [15]
+    assert me["access"]["via"] == "trial" and me["limits"]["allowed_durations"] == [10]
     assert me["plan"]["trial"]["available"] is True and me["plan"]["visible"] is True
 
     cv, jd = c.upload_cv(), c.paste_jd()
@@ -241,7 +244,7 @@ def test_free_interview_is_15_minutes_once_and_the_report_stays(client):
     a = c.create(cv["id"], jd["id"], duration_minutes=45).json()
     b = c.create(cv["id"], jd["id"]).json()
     run_jobs()
-    assert a["duration_minutes"] == 15 and a["plan"] == "trial", "the free interview has one length"
+    assert a["duration_minutes"] == 10 and a["plan"] == "trial", "the free interview has one length"
     assert client.post(f"/v1/sessions/{a['id']}/start", headers=c.h).status_code == 200
     # one interview, ever: the other prepared one cannot start, and no new one can be prepared
     r = client.post(f"/v1/sessions/{b['id']}/start", headers=c.h)
@@ -307,7 +310,12 @@ def test_plans_page_and_interest_are_for_people_with_access_only(client):
     _grant(client, "tester@example.invalid")
     c = Candidate(client, email="tester@example.invalid", tier="free")
     p = client.get("/v1/plans", headers=c.h).json()
-    assert p["preview"] is True and p["ultra"]["price_inr"] == 1299 and p["trial"]["minutes"] == 15
+    assert p["preview"] is True and p["ultra"]["price_inr"] == 1299 and p["trial"]["minutes"] == 10
+    assert p["pro"] == {"minutes": 20, "monthly_interviews": 2, "open": False}
+    assert p["voice"] == {"free": "realtime", "pro": "realtime", "ultra": "realtime"}
+    by_mode = {m["id"]: m["plan"] for m in p["modes"]}
+    assert by_mode["mixed"] == "free" and by_mode["functional"] == "pro" and by_mode["grill"] == "ultra"
+    assert by_mode["weakness_targeting"] == "ultra" and set(by_mode.values()) == {"free", "pro", "ultra"}
     for _ in range(2):  # recorded once per account
         assert client.post("/v1/plans/interest", json={"plan": "ultra"}, headers=c.h).json()["interested"] is True
     assert client.get("/v1/plans", headers=c.h).json()["ultra"]["interested"] is True
@@ -347,3 +355,106 @@ def test_free_interviews_can_run_on_a_cheaper_voice_engine(client):
     _grant(client, "full@example.invalid")
     full = Candidate(client, email="full@example.invalid", tier="free")
     assert client.get("/v1/me", headers=full.h).json()["flags"]["voice_engine"] == "realtime"
+
+
+# --------------------------------------------------------------------------- round 9: plan limits
+def test_the_free_interview_has_the_everyday_types_only(client):
+    _grant(client, "trial3@example.invalid", "trial")
+    c = Candidate(client, email="trial3@example.invalid", tier="free")
+    me = client.get("/v1/me", headers=c.h).json()
+    assert me["plan"]["level"] == "free"
+    assert me["plan"]["locked_modes"]["functional"] == "pro" and me["plan"]["locked_modes"]["grill"] == "ultra"
+    assert "mixed" not in me["plan"]["locked_modes"] and "case" not in me["plan"]["locked_modes"]
+    cv, jd = c.upload_cv(), c.paste_jd()
+    run_jobs()
+    r = c.create(cv["id"], jd["id"], mode="functional")
+    assert r.status_code == 403 and r.json()["error"]["code"] == "plan_mode_locked"
+    assert "part of Pro" in r.json()["error"]["message"]
+    r = c.create(cv["id"], jd["id"], mode="grill")
+    assert r.status_code == 403 and "part of Ultra" in r.json()["error"]["message"]
+    assert c.create(cv["id"], jd["id"], mode="case").status_code == 201
+
+
+def test_pro_is_20_minutes_with_a_monthly_allowance(client):
+    enable_pro(client, limits=True)
+    client.patch("/v1/admin/config", json={"values": {"plans.pro_monthly_interviews": 1}}, headers=_admin_h())
+    c = Candidate(client, email="pro9@example.invalid", tier="pro")
+    me = client.get("/v1/me", headers=c.h).json()
+    assert me["access"]["via"] == "pro" and me["plan"]["level"] == "pro"
+    assert me["limits"]["allowed_durations"] == [20] and me["plan"]["pro"]["left"] == 1
+    assert "functional" not in me["plan"]["locked_modes"] and me["plan"]["locked_modes"]["final_round"] == "ultra"
+    cv, jd = c.upload_cv(), c.paste_jd()
+    run_jobs()
+    r = c.create(cv["id"], jd["id"], mode="stress")
+    assert r.status_code == 403 and r.json()["error"]["code"] == "plan_mode_locked"
+    a = c.create(cv["id"], jd["id"], mode="functional", duration_minutes=60).json()
+    b = c.create(cv["id"], jd["id"], mode="mixed").json()
+    run_jobs()
+    assert a["duration_minutes"] == 20 and a["plan"] == "pro", "Pro interviews have one length"
+    assert client.post(f"/v1/sessions/{a['id']}/start", headers=c.h).status_code == 200
+    assert client.post(f"/v1/sessions/{a['id']}/start", headers=c.h).status_code != 429, "pressing Start again is not a new one"
+    r = client.post(f"/v1/sessions/{b['id']}/start", headers=c.h)
+    assert r.status_code == 429 and r.json()["error"]["code"] == "pro_monthly_limit"
+    assert client.get("/v1/me", headers=c.h).json()["plan"]["pro"]["left"] == 0
+
+
+def test_re_attempts_are_ultra(client):
+    enable_pro(client, limits=True)
+    c = Candidate(client, email="pro10@example.invalid", tier="pro")
+    sid = c.ready_session(mode="mixed")
+    client.post(f"/v1/sessions/{sid}/start", headers=c.h)
+    client.post(f"/v1/sessions/{sid}/end", headers=c.h)
+    run_jobs()
+    r = client.post(f"/v1/sessions/{sid}/reattempt", json={}, headers=c.h)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "plan_mode_locked"
+
+
+def test_an_interview_prepared_on_ultra_starts_only_if_the_plan_still_has_it(client):
+    g = _grant(client, "lapsed@example.invalid", "ultra")
+    c = Candidate(client, email="lapsed@example.invalid", tier="free")
+    sid = c.ready_session(mode="grill", duration_minutes=45)
+    client.patch(f"/v1/admin/access-grants/{g['id']}", json={"grant_type": "trial"}, headers=_admin_h())
+    r = client.post(f"/v1/sessions/{sid}/start", headers=c.h)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "plan_mode_locked"
+    client.patch(f"/v1/admin/access-grants/{g['id']}", json={"grant_type": "ultra"}, headers=_admin_h())
+    sid2 = c.ready_session(mode="mixed", duration_minutes=45)
+    client.patch(f"/v1/admin/access-grants/{g['id']}", json={"grant_type": "trial"}, headers=_admin_h())
+    r = client.post(f"/v1/sessions/{sid2}/start", headers=c.h)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "plan_duration_locked"
+
+
+def test_pro_without_plan_limits_keeps_everything(client):
+    enable_pro(client)  # plans.pro_limits off: the pre-plans behaviour
+    c = Candidate(client, email="pro11@example.invalid", tier="pro")
+    me = client.get("/v1/me", headers=c.h).json()
+    assert me["limits"]["allowed_durations"] == [15, 30, 45, 60] and me["plan"]["locked_modes"] == {}
+    assert me["plan"]["level"] == "ultra" and me["plan"]["pro"] is None
+
+
+def test_test_grants_and_admins_have_no_plan_limits(client):
+    _grant(client, "tester9@example.invalid")
+    c = Candidate(client, email="tester9@example.invalid", tier="free")
+    me = client.get("/v1/me", headers=c.h).json()
+    assert me["plan"]["locked_modes"] == {} and me["limits"]["allowed_durations"] == [15, 30, 45, 60]
+    admin_me = client.get("/v1/me", headers=_admin_h()).json()
+    assert admin_me["plan"]["locked_modes"] == {}
+
+
+def test_plan_settings_are_validated(client):
+    for key, bad in (("plans.pro_interview_minutes", 600), ("plans.pro_monthly_interviews", 0)):
+        assert client.patch("/v1/admin/config", json={"values": {key: bad}}, headers=_admin_h()).status_code == 422
+    cfg = client.get("/v1/admin/plans", headers=_admin_h()).json()["config"]
+    assert cfg["trial_minutes"] == 10 and cfg["pro_interview_minutes"] == 20 and cfg["pro_limits"] is True
+
+
+def test_pro_interviews_can_run_on_a_cheaper_voice_engine_and_the_plans_page_says_so(client):
+    enable_pro(client, limits=True)
+    client.patch("/v1/admin/config", json={"values": {"voice.engine": "realtime", "plans.pro_voice_engine": "gemini"}},
+                 headers=_admin_h())
+    c = Candidate(client, email="pro12@example.invalid", tier="pro")
+    assert client.get("/v1/me", headers=c.h).json()["flags"]["voice_engine"] == "gemini"
+    p = client.get("/v1/plans", headers=c.h).json()
+    assert p["voice"] == {"free": "realtime", "pro": "gemini", "ultra": "realtime"} and p["pro"]["open"] is True
+    _grant(client, "u12@example.invalid", "ultra")
+    u = Candidate(client, email="u12@example.invalid", tier="free")
+    assert client.get("/v1/me", headers=u.h).json()["flags"]["voice_engine"] == "realtime"

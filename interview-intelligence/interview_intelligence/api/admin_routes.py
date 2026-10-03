@@ -55,7 +55,7 @@ def list_grants(p: Principal = Depends(principal)):
         return {"grants": [_grant_view(g) for g in rows]}
 
 
-GRANT_TYPES = ("test", "trial", "ultra")  # full access | the free 15-minute interview | Ultra (comped)
+GRANT_TYPES = ("test", "trial", "ultra")  # full access | the one free interview | Ultra (comped)
 
 
 class GrantBody(BaseModel):
@@ -144,8 +144,7 @@ def admin_plans(p: Principal = Depends(principal)):
                             .group_by(AccessGrant.grant_type)).all()
         by_plan = db.execute(select(InterviewSession.config, InterviewSession.started_at, InterviewSession.status)
                              .where(InterviewSession.created_at >= utcnow() - timedelta(days=90))).all()
-        stats = {"trial": {"prepared": 0, "started": 0, "completed": 0}, "ultra": {"prepared": 0, "started": 0,
-                                                                                  "completed": 0}}
+        stats = {k: {"prepared": 0, "started": 0, "completed": 0} for k in ("trial", "pro", "ultra")}
         for cfg, started, status in by_plan:
             plan = (cfg or {}).get("plan")
             if plan in stats:

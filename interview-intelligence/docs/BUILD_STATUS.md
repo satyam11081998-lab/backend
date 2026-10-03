@@ -1,4 +1,4 @@
-# Build status — 2026-10-03
+# Build status — 2026-10-04
 
 Honest state of Interview Intelligence (II) after the first build. "Tested" means an
 automated test or a recorded run exists (see `L_ADVERSARIAL_QA_MATRIX.md`); nothing below is
@@ -98,6 +98,38 @@ shows which of the JD's key terms the CV mentions (literal check, worded as such
 | Progress node tests / voice node tests (device) | 4 / 4, 47 / 47 |
 | Frontend `tsc --noEmit` (device) / `next build` (copy) | exit 0 / OK |
 | Browser (simulated models slowed to realistic step times) | CV progress rose 10 % → 39 % while reading; continued to the JD while the CV ran; JD queued behind it with a note; findings + skill chips on completion; key-term match; build steps with findings; report steps with "8 of 9" scoring detail; phone width; no console errors |
+
+## 0f. Plan limits: Free 10 min, Pro 20 min, Ultra everything (eighth pass, 2026-10-04)
+
+Owner decision: Free = one 10-minute interview; Pro = 20-minute interviews; Ultra = full
+interviews — and a plans table that reads as a staircase (Free ticks then crosses, Pro ticks
+longer, Ultra all ticks). Enforced by the server, shown by the app:
+
+* `plans.trial_minutes` default 15 → **10**. New flags: `plans.pro_limits` (on), `plans.pro_interview_minutes`
+  (20, range 5–60), `plans.pro_monthly_interviews` (2, range 1–100), `plans.pro_voice_engine` (same).
+  A DB override of `plans.trial_minutes` (if an admin ever saved 15) still wins — check Admin → Plans.
+* `access/plans.py`: `MODE_PLAN` — the plan that first includes each interview type. Every plan:
+  Mixed, CV + JD, HR/behavioural, Case. Pro adds Functional, Technical, Situational, CV deep dive,
+  Company + role. Ultra adds Hiring manager, Final round, Technical deep dive, CV attack, Stress, Grill
+  and the re-attempt (`weakness_targeting`). `plan_level` (free | pro | ultra; test grants, admins and
+  Pro with `plans.pro_limits` off are "ultra"), `required_plan`, `locked_modes`, `durations_for`,
+  `engines_by_plan`.
+* `sessions.create_session`: a locked type → 403 `plan_mode_locked` ("… interviews are part of Ultra.");
+  Free and Pro get their one length whatever is asked. `check_plan_allows` on start: an interview
+  prepared on a higher plan (a lapsed Ultra grant) starts only if the current plan has its type
+  (403 `plan_mode_locked`) and length (403 `plan_duration_locked`); Pro allowance → 429
+  `pro_monthly_limit`. Pressing Start again on an interview that already started is not counted
+  again (Pro and Ultra).
+* `/reattempt` → 403 `plan_mode_locked` below Ultra. `/me`: `plan.level`, `plan.pro`, `plan.locked_modes`,
+  `limits.allowed_durations` per plan. `/plans`: `pro {minutes, monthly_interviews, open}`, `ultra.durations`,
+  `modes [{id, label, plan}]`, `voice {free, pro, ultra}`. Admin → Plans: Pro settings, Pro started (90 d).
+* App: the setup screen shows types outside the plan with a lock and the plan's name (and a "Compare
+  plans" link); the length step says "Pro interviews are 20 minutes. You have N of M left"; the hub
+  shows Pro's allowance; the report's re-attempt says it is part of Ultra; the plans page is one
+  staircase table: In every plan → Added in Pro → Added in Ultra, a tick with the limit under it,
+  case-practice rows from MECE's `TIER_LIMITS`, interview rows from `/plans`. No Lite column.
+* Tests: engine tests use Pro without plan limits (`enable_pro(client)`; `limits=True` for plan tests);
+  the QA simulator switches Pro limits off too (it exercises every mode). 9 new tests.
 
 ## 0e. The plan stays hidden, a real opening, more breadth, plans (seventh pass, 2026-10-03)
 

@@ -15,7 +15,7 @@ from ..access.policy import AccessDecision
 from ..ai.runner import spend_today_usd
 from ..db.models import Document, InterviewSession, Report, User
 from ..documents.service import get_owned
-from ..errors import Conflict, NotFound, TooMany, Unavailable, Unprocessable
+from ..errors import Conflict, Forbidden, NotFound, TooMany, Unavailable, Unprocessable
 from ..jobs.queue import enqueue
 from .lifecycle import assert_slot_available, lock_user, sessions_today, sweep_user
 from .modes import MODES, InterviewConfig
@@ -40,11 +40,13 @@ def create_session(db: Session, user: User, decision: AccessDecision, *, cv_docu
     except Exception as e:  # pydantic ValidationError -> clean 422
         raise Unprocessable(f"Invalid interview settings: {e}".split("\n")[0][:300], code="bad_config")
     cfg.plan = decision.via or ""
-    if decision.via == plans.TRIAL:
-        # The free interview has one length, whatever the client asked for.
-        cfg.duration_minutes = int(f["plans.trial_minutes"])
-    elif cfg.duration_minutes not in f["limits.allowed_durations"]:
-        raise Unprocessable(f"Duration must be one of {f['limits.allowed_durations']} minutes.", code="bad_duration")
+    assert_mode_in_plan(f, decision, cfg.mode)
+    durations = plans.durations_for(f, decision)
+    if plans.plan_level(f, decision) in ("free", "pro"):
+        # Free and Pro interviews have one length each, whatever the client asked for.
+        cfg.duration_minutes = durations[0]
+    elif cfg.duration_minutes not in durations:
+        raise Unprocessable(f"Duration must be one of {durations} minutes.", code="bad_duration")
     if cfg.voice and not f["voice.enabled"]:
         cfg.voice = False
     if cfg.mode == "technical_deep_dive" and not f["technical.advanced_mode"]:
@@ -118,9 +120,25 @@ def create_session(db: Session, user: User, decision: AccessDecision, *, cv_docu
     return sess
 
 
+def assert_mode_in_plan(f: dict, decision: AccessDecision, mode: str) -> None:
+    need = plans.required_plan(f, decision, mode)
+    if need:
+        label = MODES[mode].label if mode in MODES else mode
+        raise Forbidden(f"{label} interviews are part of {plans.PLAN_LABEL[need]}.", code="plan_mode_locked")
+
+
 def check_plan_allows(db: Session, user_id: uuid.UUID, decision: AccessDecision, f: dict, *,
                       starting: Optional[uuid.UUID] = None) -> None:
-    """Plan limits, checked when an interview is prepared and again when it starts."""
+    """Plan limits, checked when an interview is prepared and again when it starts (an interview
+    prepared on a higher plan — e.g. a lapsed Ultra grant — starts only if the current plan has it)."""
+    if starting is not None:
+        s = db.execute(select(InterviewSession).where(InterviewSession.id == starting,
+                                                      InterviewSession.user_id == user_id)).scalar_one_or_none()
+        if s is not None and s.started_at is None:
+            assert_mode_in_plan(f, decision, s.mode)
+            if plans.plan_level(f, decision) in ("free", "pro") and s.duration_minutes > max(plans.durations_for(f, decision)):
+                raise Forbidden(f"This {s.duration_minutes}-minute interview needs Ultra. Prepare a new one on your plan.",
+                                code="plan_duration_locked")
     if decision.via == plans.TRIAL:
         st = plans.trial_state(db, user_id)
         if st["started"] and (starting is None or st["session_id"] != str(starting)):
@@ -129,11 +147,24 @@ def check_plan_allows(db: Session, user_id: uuid.UUID, decision: AccessDecision,
         if starting is None and st["prepared"] >= int(f["plans.trial_max_prepared"]):
             raise TooMany("Your free interview is already prepared. Open it from Interview Intelligence and press Start.",
                           code="trial_prepare_limit")
+    if plans.plan_level(f, decision) == "pro":
+        cap = int(f["plans.pro_monthly_interviews"])
+        if cap and plans.started_last_30d(db, user_id) >= cap and not _is_live(db, user_id, starting):
+            raise TooMany(f"You've started {cap} interviews in the last 30 days, the Pro allowance. It frees up as "
+                          "older interviews pass 30 days, or Ultra has more.", code="pro_monthly_limit")
     if decision.via == plans.ULTRA:
         cap = int(f["plans.ultra_monthly_interviews"])
-        if cap and plans.started_last_30d(db, user_id) >= cap:
+        if cap and plans.started_last_30d(db, user_id) >= cap and not _is_live(db, user_id, starting):
             raise TooMany(f"You've started {cap} interviews in the last 30 days, the Ultra fair-use limit. "
                           "It frees up as older interviews pass 30 days.", code="ultra_monthly_limit")
+
+
+def _is_live(db: Session, user_id: uuid.UUID, sid: Optional[uuid.UUID]) -> bool:
+    """Re-pressing Start on an interview that already started is not a new one."""
+    if sid is None:
+        return False
+    s = db.get(InterviewSession, sid)
+    return s is not None and s.user_id == user_id and s.started_at is not None
 
 
 # What a candidate may see before the interview: the role as understood and any warnings about the

@@ -50,11 +50,15 @@ def defaults() -> Dict[str, Any]:
         # Plans (access/plans.py). Shown, not charged: no payment is wired.
         "plans.visibility": "access",       # access = only people with Interview Intelligence; off = hidden
         "plans.trial_open": False,          # on = every signed-in account gets one free interview
-        "plans.trial_minutes": 15,
+        "plans.trial_minutes": 10,          # Free: one interview, this long
         "plans.trial_max_prepared": 3,      # interviews a trial account may build before starting one
+        "plans.pro_limits": True,           # off = Pro gets every type and length (the pre-plans behaviour)
+        "plans.pro_interview_minutes": 20,
+        "plans.pro_monthly_interviews": 2,
         "plans.ultra_price_inr": 1299,
         "plans.ultra_monthly_interviews": 10,
         "plans.trial_voice_engine": "same",  # same = voice.engine; or a cheaper engine for free interviews
+        "plans.pro_voice_engine": "same",    # same = voice.engine; or a cheaper engine for Pro interviews
     }
 
 
@@ -69,19 +73,22 @@ _TYPES = {
         "drive.export_reports": True, "limits.max_active_sessions": 2, "limits.max_sessions_per_day": 5,
         "limits.max_sessions_per_day_test": 10, "limits.allowed_durations": [45],
         "limits.session_cost_cap_usd": 1.0, "limits.daily_budget_usd": 1.0, "limits.max_upload_mb": 5,
-        "plans.visibility": "access", "plans.trial_open": False, "plans.trial_minutes": 15,
+        "plans.visibility": "access", "plans.trial_open": False, "plans.trial_minutes": 10,
         "plans.trial_max_prepared": 3, "plans.ultra_price_inr": 1299, "plans.ultra_monthly_interviews": 10,
-        "plans.trial_voice_engine": "same",
+        "plans.trial_voice_engine": "same", "plans.pro_limits": True, "plans.pro_interview_minutes": 20,
+        "plans.pro_monthly_interviews": 2, "plans.pro_voice_engine": "same",
     }.items()
 }
 
 # String flags take one of a fixed set of values.
 ENUMS: Dict[str, tuple] = {"voice.engine": ("realtime", "gemini", "standard"), "plans.visibility": ("access", "off"),
-                           "plans.trial_voice_engine": ("same", "realtime", "gemini", "standard")}
+                           "plans.trial_voice_engine": ("same", "realtime", "gemini", "standard"),
+                           "plans.pro_voice_engine": ("same", "realtime", "gemini", "standard")}
 # Integer flags with a sensible range (a typo must not make a free interview 900 minutes long).
 RANGES: Dict[str, tuple] = {"limits.max_active_sessions": (1, 10), "plans.trial_minutes": (5, 60),
                             "plans.trial_max_prepared": (1, 20), "plans.ultra_price_inr": (0, 100000),
-                            "plans.ultra_monthly_interviews": (1, 200)}
+                            "plans.ultra_monthly_interviews": (1, 200), "plans.pro_interview_minutes": (5, 60),
+                            "plans.pro_monthly_interviews": (1, 100)}
 
 _cache: Dict[str, Any] = {"ts": 0.0, "data": {}}
 _lock = threading.Lock()

@@ -117,10 +117,14 @@ def run_jobs(max_jobs: int = 500) -> int:
     return run_pending(max_jobs, include_delayed=True)
 
 
-def enable_pro(client):
-    """Admin flips the launch flag so Pro users get in (default is preview-only)."""
+def enable_pro(client, *, limits=False):
+    """Admin flips the launch flag so Pro users get in (default is preview-only).
+    Engine tests use a Pro account as "any account that may interview", so the Pro PLAN limits
+    (20 minutes, a monthly allowance, the everyday interview types) are off unless a test asks for
+    them (`limits=True`, tests/test_breadth_and_plans.py)."""
     t = mint(email=ADMIN_EMAIL, tier="free")
-    r = client.patch("/v1/admin/config", json={"values": {"ii.enabled_for_pro": True}}, headers=auth(t))
+    r = client.patch("/v1/admin/config", json={"values": {"ii.enabled_for_pro": True, "plans.pro_limits": limits}},
+                     headers=auth(t))
     assert r.status_code == 200, r.text
 
 

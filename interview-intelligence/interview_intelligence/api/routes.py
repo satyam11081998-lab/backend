@@ -56,7 +56,7 @@ def me(p: Principal = Depends(principal)):
         user, d = read_own(db, p)
         f = flags.all_flags(db)
         act = active_sessions(db, user.id)
-        durations = [int(f["plans.trial_minutes"])] if d.via == plans.TRIAL else f["limits.allowed_durations"]
+        durations = plans.durations_for(f, d)
         return {
             "user": {"id": str(user.id), "email": user.email},
             "access": {"allowed": d.allowed, "via": d.via, "reason": d.reason},
@@ -302,11 +302,13 @@ def reattempt(sid: str, body: ReattemptBody, p: Principal = Depends(principal)):
             raise NotFound("Interview not found.")
         if src.status not in ("completed", "expired"):
             raise Conflict("You can re-attempt an interview once it has finished.", code="not_finished")
+        f = flags.all_flags(db)
+        sessions.assert_mode_in_plan(f, d, "weakness_targeting")  # the re-attempt loop is Ultra
         cfg = dict(src.config or {})
         cfg.update({"mode": "weakness_targeting", "target_competencies": body.target_competencies,
                     "duration_minutes": body.duration_minutes or min(30, int(cfg.get("duration_minutes", 30))),
                     "difficulty": body.difficulty or cfg.get("difficulty", "medium")})
-        if cfg["duration_minutes"] not in flags.flag(db, "limits.allowed_durations"):
+        if cfg["duration_minutes"] not in f["limits.allowed_durations"]:
             raise Unprocessable("Unsupported duration.", code="bad_duration")
         s = sessions.create_session(db, user, d, cv_document_id=src.cv_document_id, jd_document_id=src.jd_document_id,
                                     config=cfg, source_session_id=src.id)

@@ -6,12 +6,18 @@
            ((grant of type trial ∨ flag(plans.trial_open)) ∧ free interview not used up) )`
 
 Plans (`access/plans.py`, Admin → Plans; shown, not charged):
-* **Free interview** (`via=trial`): one per account, ever, `plans.trial_minutes` long (any requested
+* **Free interview** (`via=trial`): one per account, ever, `plans.trial_minutes` (10) long (any requested
   length is replaced); allowed before it starts and while it is in progress; afterwards the account is
   read-only (its report stays). At most `plans.trial_max_prepared` interviews may be prepared before one
-  is started. Optional cheaper voice: `plans.trial_voice_engine`.
+  is started. Optional cheaper voice: `plans.trial_voice_engine`. The everyday interview types only.
+* **Pro** (`via=pro`, only while `ii.enabled_for_pro`): with `plans.pro_limits` on, every interview is
+  `plans.pro_interview_minutes` (20) long, `plans.pro_monthly_interviews` (2) started per 30 days,
+  the everyday + role-specific types; optional cheaper voice `plans.pro_voice_engine`. Off = everything.
 * **Ultra** (`via=ultra`): an "ultra" grant, or tier "ultra" on the identity (no MECE plan yet; accepted
-  so nothing changes in II when it ships). Fair use: `plans.ultra_monthly_interviews` started per 30 days.
+  so nothing changes in II when it ships). Every type and length, the re-attempt. Fair use:
+  `plans.ultra_monthly_interviews` started per 30 days.
+* Interview types per plan: `access/plans.py` `MODE_PLAN` (code, not a flag), enforced on prepare and
+  on start (403 `plan_mode_locked` / `plan_duration_locked`). Test grants and admins: no plan limits.
 * Plans page visibility `plans.visibility`: `access` (people with II, and accounts that used a free
   interview) or `off` (admins only). Everyone else gets 404.
 
@@ -53,6 +59,6 @@ inspection is audit-logged.
 `ii.enabled`, `ii.enabled_for_pro`, `voice.enabled`, `company_intel.enabled`,
 `company_intel.web_research`, `technical.advanced_mode`, `technical.coding_exercises`,
 `admin.test_access`, `limits.*`, `drive.export_reports`, `ocr.enabled`, `plans.*` (visibility,
-trial_open, trial_minutes, trial_max_prepared, trial_voice_engine, ultra_price_inr,
-ultra_monthly_interviews). Env provides
+trial_open, trial_minutes, trial_max_prepared, trial_voice_engine, pro_limits, pro_interview_minutes,
+pro_monthly_interviews, pro_voice_engine, ultra_price_inr, ultra_monthly_interviews). Env provides
 defaults; DB overrides; 30 s cache.

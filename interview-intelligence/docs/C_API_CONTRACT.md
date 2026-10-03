@@ -53,8 +53,8 @@ Resources owned by another user return **404** (never 403) to prevent enumeratio
 ### Identity & access
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/me` | `{user, access: {allowed, reason, via: admin\|test_grant\|ultra\|pro\|trial}, has_history, plan: {via, visible, trial?, ultra?}, limits: {max_active, active_count, sessions_today, max_per_day, allowed_durations (trial: [trial_minutes])}, flags: {voice, voice_engine (trial may differ), company_intel}, is_admin}` |
-| GET | `/plans` | plans page data (404 unless `plans.visible`): `{preview, currency, trial: {minutes, open_to_everyone}, ultra: {price_inr, monthly_interviews, interested}, you}` |
+| GET | `/me` | `{user, access: {allowed, reason, via: admin\|test_grant\|ultra\|pro\|trial}, has_history, plan: {via, level: free\|pro\|ultra, visible, trial?, pro?, ultra?, locked_modes: {mode: plan}}, limits: {max_active, active_count, sessions_today, max_per_day, allowed_durations (trial: [trial_minutes], pro: [pro_interview_minutes])}, flags: {voice, voice_engine (trial/pro may differ), company_intel}, is_admin}` |
+| GET | `/plans` | plans page data (404 unless `plans.visible`): `{preview, currency, trial: {minutes, open_to_everyone}, pro: {minutes, monthly_interviews, open}, ultra: {price_inr, monthly_interviews, durations, interested}, modes: [{id, label, plan}], voice: {free, pro, ultra}, you}` |
 | POST | `/plans/interest` | `{plan: "ultra"}` → recorded once per account (audit `plans.interest`) |
 
 ### Documents (CV / JD)
@@ -111,5 +111,7 @@ preview regex (same pattern the existing backend uses), credentials **not** requ
 * Live progress (`/sessions/{id}`, `/room`, turn responses): `{status, ended_reason, section:
   interview|closing, elapsed_s, remaining_s, duration_s, hard_stop_s}` — `section_title`,
   `questions_asked` and `questions_planned` are gone.
-* Start/create may answer 409 `trial_used`, 429 `trial_prepare_limit` or 429 `ultra_monthly_limit`.
+* Start/create may answer 409 `trial_used`, 429 `trial_prepare_limit`, 429 `pro_monthly_limit`, 429
+  `ultra_monthly_limit`, 403 `plan_mode_locked` (type not in the plan; also `/reattempt` below Ultra) or
+  403 `plan_duration_locked` (start: length not in the plan).
 * Admin: `GET /admin/plans`; access grants take `grant_type` test | trial | ultra (POST and PATCH).
