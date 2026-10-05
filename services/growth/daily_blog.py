@@ -81,13 +81,68 @@ def _int_env(name: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
+def _gemini_default() -> str:
+    """The Gemini model the rest of the backend already runs on (GD briefs, news classification)."""
+    try:
+        from services.ai_providers import _GEMINI_LLM
+        return _GEMINI_LLM
+    except Exception:
+        return "gemini-3.6-flash"
+
+
+# Models that answered "not found / no longer available" in this process: skipped for 6 hours, so a
+# retired model costs one failed call, not one per topic.
+_dead_models: Dict[str, float] = {}
+_discovered: Dict[str, Any] = {"at": 0.0, "models": []}
+
+
 def research_models() -> List[str]:
     out: List[str] = []
-    for m in (os.getenv("DAILY_BLOG_RESEARCH_MODEL"), os.getenv("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-2.0-flash"):
-        m = (m or "").strip()
-        if m and m not in out:
+    for m in (os.getenv("DAILY_BLOG_RESEARCH_MODEL"), os.getenv("GEMINI_MODEL"), _gemini_default(),
+              "gemini-flash-latest", *(_discovered["models"] or [])):
+        m = (m or "").strip().removeprefix("models/")
+        if m and m not in out and time.time() - _dead_models.get(m, 0) > 6 * 3600:
             out.append(m)
     return out
+
+
+def _version_key(name: str) -> Tuple[float, int]:
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    v = float(m.group(1)) if m else 0.0
+    tier = 0 if "flash" in name and "lite" not in name else 1 if "pro" in name else 2
+    return (-v, tier)
+
+
+def discover_gemini_models() -> List[str]:
+    """Ask the API which Gemini models this key can use (newest first, flash before pro), once an hour.
+    Google retires model names without notice; this keeps research working when it does."""
+    if time.time() - _discovered["at"] < 3600:
+        return _discovered["models"]
+    names: List[str] = []
+    try:
+        from google import genai
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+        for mdl in client.models.list():
+            name = (getattr(mdl, "name", "") or "").removeprefix("models/")
+            actions = getattr(mdl, "supported_actions", None) or []
+            if not name.startswith("gemini") or (actions and "generateContent" not in actions):
+                continue
+            if any(x in name for x in ("embedding", "image", "tts", "live", "audio", "vision", "exp", "preview-tts",
+                                        "computer-use", "robotics", "nano")):
+                continue
+            if "flash" in name or "pro" in name:
+                names.append(name)
+    except Exception as e:  # noqa: BLE001
+        print(f"[daily_blog] model discovery failed: {type(e).__name__}: {e}")
+    names = sorted(dict.fromkeys(names), key=_version_key)[:8]
+    _discovered.update(at=time.time(), models=names)
+    return names
+
+
+def _is_gone(err: Exception) -> bool:
+    t = f"{type(err).__name__} {err}".lower()
+    return any(k in t for k in ("404", "not_found", "not found", "no longer available", "is not supported",
+                                "unsupported", "does not support"))
 
 
 def config() -> Dict[str, Any]:
@@ -100,8 +155,8 @@ def config() -> Dict[str, Any]:
         "min_linked_facts": 3,
         "time_budget_s": _int_env("DAILY_BLOG_TIME_BUDGET_S", 480, 60, 1500),
         "max_topics": _int_env("DAILY_BLOG_MAX_TOPICS", 8, 1, 20),
-        "research_available": research_available(),
-        "research_models": research_models(),
+        "research_available": research_available() or bool(os.getenv("OPENAI_API_KEY")),
+        "research_models": research_models() + [f"openai web search: {m}" for m in openai_search_models()[:1]],
         "writer_model": (os.getenv("DAILY_BLOG_WRITER_MODEL") or "").strip() or "seo_writer (gpt-4o by default)",
     }
 
@@ -456,26 +511,131 @@ def extract_grounding(resp: Any, model: str = "") -> Dict[str, Any]:
     return {"text": text, "chunks": chunks, "supports": supports, "usage": usage, "model": model}
 
 
-def grounded_with_fallback(prompt: str, grounded: Callable) -> Dict[str, Any]:
-    """Try each research model in turn; returns the first answer that came back with search results."""
-    errors = []
+def grounded_with_fallback(prompt: str, grounded: Callable, web_search: Optional[Callable] = None) -> Dict[str, Any]:
+    """Research engines in order: Gemini + Google Search on each usable model (asking the API which
+    models exist if the configured ones are gone), then OpenAI + web search. Returns the first answer
+    that came back with web sources, with `engine` and the errors met on the way."""
+    errors: List[str] = []
     last: Dict[str, Any] = {}
-    for model in research_models():
+    tried: set = set()
+
+    def try_models(models: List[str]) -> Optional[Dict[str, Any]]:
+        nonlocal last
+        for model in models:
+            if model in tried:
+                continue
+            tried.add(model)
+            try:
+                try:
+                    g = grounded(prompt, model)
+                except TypeError:  # an injected single-argument fake (tests)
+                    g = grounded(prompt)
+            except Exception as e:  # noqa: BLE001
+                if _is_gone(e):
+                    _dead_models[model] = time.time()
+                    errors.append(f"{model}: not available on this key")
+                else:
+                    errors.append(f"{model}: {type(e).__name__}: {str(e)[:100]}")
+                continue
+            last = g
+            if g.get("chunks"):
+                g["engine"] = f"gemini:{model}"
+                return g
+            errors.append(f"{model}: answered without searching")
+        return None
+
+    if grounded is not _gemini_grounded or research_available():
+        got = try_models(research_models())
+        if got is None and not _discovered["models"]:
+            got = try_models(discover_gemini_models())
+        if got is not None:
+            got["errors"] = errors
+            return got
+    if web_search is not None:
         try:
-            g = grounded(prompt, model)
-        except TypeError:  # an injected single-argument fake (tests)
-            g = grounded(prompt)
+            g = web_search(prompt)
+            if g.get("chunks"):
+                g["errors"] = errors
+                return g
+            errors.append("openai web search: no sources")
+            last = last or g
         except Exception as e:  # noqa: BLE001
-            errors.append(f"{model}: {type(e).__name__}: {str(e)[:120]}")
-            continue
-        last = g
-        if g.get("chunks"):
-            g["errors"] = errors
-            return g
-        errors.append(f"{model}: answered without searching")
+            errors.append(f"openai web search: {type(e).__name__}: {str(e)[:120]}")
     last = dict(last or {"text": "", "chunks": [], "supports": []})
     last["errors"] = errors
     return last
+
+
+def openai_search_models() -> List[str]:
+    out: List[str] = []
+    for m in (os.getenv("DAILY_BLOG_OPENAI_SEARCH_MODEL"), "gpt-4.1", "gpt-4o", "gpt-4.1-mini"):
+        m = (m or "").strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _openai_web_search(prompt: str) -> Dict[str, Any]:
+    """OpenAI Responses API with the web search tool, returned in the same shape as Gemini grounding."""
+    from services.ai_providers import openai_client
+    cli = openai_client()
+    if cli is None:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    errors = []
+    for model in openai_search_models():
+        for tool in ("web_search", "web_search_preview"):
+            try:
+                resp = cli.responses.create(model=model, tools=[{"type": tool}], input=prompt)
+                return extract_openai_search(resp, model)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{model}/{tool}: {type(e).__name__}: {str(e)[:80]}")
+    raise RuntimeError("; ".join(errors)[:500])
+
+
+def _clean_url(url: str) -> str:
+    return re.sub(r"([?&])utm_source=openai(&|$)", lambda m: m.group(1) if m.group(2) else "", url or "").rstrip("?&")
+
+
+def extract_openai_search(resp: Any, model: str = "") -> Dict[str, Any]:
+    """Text, the pages cited, and which line each citation belongs to, from an OpenAI Responses object."""
+    texts, chunks, supports, index = [], [], [], {}
+    for item in getattr(resp, "output", None) or []:
+        if getattr(item, "type", "") != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            text = getattr(part, "text", "") or ""
+            if not text:
+                continue
+            texts.append(text)
+            spans, pos = [], 0
+            for ln in text.splitlines(keepends=True):
+                spans.append((pos, pos + len(ln), ln))
+                pos += len(ln)
+            for a in getattr(part, "annotations", None) or []:
+                if getattr(a, "type", "") != "url_citation":
+                    continue
+                url = _clean_url(getattr(a, "url", "") or "")
+                if not url:
+                    continue
+                if url not in index:
+                    index[url] = len(chunks)
+                    chunks.append({"uri": url, "title": getattr(a, "title", "") or _domain(url), "domain": _domain(url)})
+                start = getattr(a, "start_index", 0) or 0
+                line = next((ln for a0, b0, ln in spans if a0 <= start < b0), "")
+                if line:
+                    supports.append({"text": _strip_links(line).strip(), "chunks": [index[url]]})
+    u = getattr(resp, "usage", None)
+    return {"text": "\n".join(texts) or (getattr(resp, "output_text", "") or ""), "chunks": chunks, "supports": supports,
+            "usage": {"prompt": getattr(u, "input_tokens", None), "completion": getattr(u, "output_tokens", None)},
+            "model": model, "engine": f"openai:{model}"}
+
+
+_LINK_RE = re.compile(r"\(?\[([^\]]*)\]\((https?://[^)\s]+)\)\)?")
+
+
+def _strip_links(s: str) -> str:
+    """Remove markdown citation links ("([site.com](https://…))") a search model puts inline."""
+    return re.sub(r"\s{2,}", " ", _LINK_RE.sub("", s or ""))
 
 
 def _resolve_url(uri: str) -> str:
@@ -543,7 +703,7 @@ def parse_fact_lines(text: str) -> List[Dict[str, str]]:
     """FACT lines, however the model dressed them ('* **FACT:** …', '1. FACT - …'), with the named source.
     If it ignored the format entirely, numbered or bulleted lines that carry a figure are taken instead."""
     out: List[Dict[str, str]] = []
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    lines = [_strip_links(ln).strip() for ln in (text or "").splitlines() if _strip_links(ln).strip()]
     for ln in lines:
         m = _FACT_RE.match(ln.replace("**", "").replace("__", ""))
         if m:
@@ -654,7 +814,8 @@ def link_facts(g: Dict[str, Any], resolve: Callable, fetch: Callable) -> Tuple[L
 
 
 def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Callable = _gemini_grounded,
-             resolve: Callable = _resolve_url, fetch: Callable = _fetch_text) -> Dict[str, Any]:
+             resolve: Callable = _resolve_url, fetch: Callable = _fetch_text,
+             web_search: Optional[Callable] = None) -> Dict[str, Any]:
     """Sourced facts for the angle: {facts: [{id, text, sources, linked}], linked, attributed, errors, usage}."""
     hook = hook or {}
     hook_line = f' News hook: "{hook.get("title")}" ({hook.get("source_name") or "news"}).' if hook.get("title") else ""
@@ -662,6 +823,7 @@ def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Cal
     attributed: List[Dict[str, Any]] = []
     errors: List[str] = []
     usage = {"prompt": 0, "completion": 0}
+    engines: List[str] = []
     if hook.get("title") and hook.get("source_url"):
         desc = (hook.get("description") or "").strip()
         linked.append({"text": f"{hook['title'].strip().rstrip('.')}." + (f" {desc}" if desc else ""),
@@ -669,8 +831,10 @@ def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Cal
                        "sources": [{"url": hook["source_url"], "label": hook.get("source_name") or _domain(hook["source_url"]),
                                     "domain": _domain(hook["source_url"])}], "how": "news"})
     for prompt in (_RESEARCH_PROMPT, _CONTEXT_PROMPT):
-        g = grounded_with_fallback(prompt.format(angle=angle, hook=hook_line), grounded)
-        errors += g.get("errors") or []
+        g = grounded_with_fallback(prompt.format(angle=angle, hook=hook_line), grounded, web_search)
+        errors += [e for e in (g.get("errors") or []) if e not in errors]
+        if g.get("engine"):
+            engines.append(g["engine"])
         u = g.get("usage") or {}
         usage["prompt"] += u.get("prompt") or 0
         usage["completion"] += u.get("completion") or 0
@@ -687,7 +851,8 @@ def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Cal
     for f in linked[:16] + attributed[:6]:
         facts.append({"id": f"F{len(facts) + 1}", "text": f["text"], "sources": f["sources"],
                       "linked": bool(f["sources"]), "named_source": f.get("named_source") or "", "how": f.get("how", "")})
-    return {"facts": facts, "linked": sum(1 for f in facts if f["linked"]), "errors": errors[:6], "usage": usage}
+    return {"facts": facts, "linked": sum(1 for f in facts if f["linked"]), "errors": errors[:6], "usage": usage,
+            "engines": list(dict.fromkeys(engines))}
 
 
 # =============================================================================
@@ -1089,7 +1254,7 @@ def _default_deps() -> Dict[str, Callable]:
     from services.ai_usage import log_ai_usage
     from services.growth import telegram_review
     return {"chat": chat_with_fallback, "grounded": _gemini_grounded, "resolve": _resolve_url, "fetch": _fetch_text,
-            "log": log_ai_usage, "review": telegram_review}
+            "web_search": _openai_web_search, "log": log_ai_usage, "review": telegram_review}
 
 
 def run_daily(supabase, *, user_id: Optional[str] = None, force: bool = False, publish: Optional[bool] = None,
@@ -1148,14 +1313,15 @@ def _run(supabase, *, user_id, force, publish, dry_run, now, deps, notify_failur
         hook = cand.get("headline") or {}
         angle = cand.get("angle") or hook.get("title") or ""
         t0 = time.time()
-        res = research(angle, hook, grounded=deps["grounded"], resolve=deps["resolve"], fetch=deps.get("fetch"))
+        res = research(angle, hook, grounded=deps["grounded"], resolve=deps["resolve"], fetch=deps.get("fetch"),
+                       web_search=deps.get("web_search"))
         u = res.get("usage") or {}
-        _log(log, user_id, "research", (cfg["research_models"] or ["gemini"])[0],
+        _log(log, user_id, "research", ((res.get("engines") or ["research:unknown"])[0]).split(":", 1)[-1],
              SimpleNamespace(id=None, usage=SimpleNamespace(prompt_tokens=u.get("prompt"), completion_tokens=u.get("completion"),
                                                             total_tokens=(u.get("prompt") or 0) + (u.get("completion") or 0))),
              t0, facts=len(res.get("facts") or []), linked=res.get("linked"))
         trace["research"].append({"angle": angle, "facts": len(res.get("facts") or []), "linked": res.get("linked", 0),
-                                  "errors": res.get("errors")})
+                                  "engines": res.get("engines"), "errors": res.get("errors")})
         if res.get("linked", 0) < cfg["min_linked_facts"]:
             continue
         page = _write_and_save(supabase, cand, angle, res["facts"], cfg=cfg, deps=deps, user_id=user_id, now=now,

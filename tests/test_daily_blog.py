@@ -303,18 +303,62 @@ calls = []
 
 def flaky(prompt, model):
     calls.append(model)
-    if model != "gemini-2.5-flash":
-        raise RuntimeError("model does not support search")
+    if model != "gemini-3.6-flash":
+        raise RuntimeError("404 NOT_FOUND. This model is no longer available to new users")
     return fake_grounded(prompt, model)
 
 
 env(GEMINI_MODEL="gemini-9-pro")
+db._dead_models.clear()
 r2 = db.research("x", grounded=flaky, resolve=fake_resolve, fetch=fake_fetch)
-check("research falls back to a model that supports search", r2["linked"] >= 3 and calls[:2] == ["gemini-9-pro", "gemini-2.5-flash"])
+check("research skips a retired model and uses one that works",
+      r2["linked"] >= 3 and calls[:2] == ["gemini-9-pro", "gemini-3.6-flash"] and r2["engines"] == ["gemini:gemini-3.6-flash"])
+calls.clear()
+db.research("y", grounded=flaky, resolve=fake_resolve, fetch=fake_fetch)
+check("a retired model is remembered: it costs one failed call, not one per topic", "gemini-9-pro" not in calls)
 env()
+db._dead_models.clear()
+
+# every Gemini model gone (as on 2026-10-06): ask the API which exist, then fall back to OpenAI web search
+db._discovered.update(at=10 ** 12, models=["gemini-4.0-flash"])
+seen_models = []
+
+
+def all_gone(prompt, model):
+    seen_models.append(model)
+    raise RuntimeError("404 NOT_FOUND: model no longer available")
+
+
+OPENAI_TEXT = ("FACT: UPI processed 20.6 billion transactions in August 2026, NPCI data show. | SOURCE: NPCI "
+               "([npci.org.in](https://www.npci.org.in/stats?utm_source=openai))\n"
+               "FACT: About 69 million Indians held mutual fund investments in 2026. | SOURCE: AMFI "
+               "([amfiindia.com](https://www.amfiindia.com/data?utm_source=openai))\n"
+               "FACT: Around 50 million people bought shares directly in 2026. | SOURCE: Mint "
+               "([livemint.com](https://www.livemint.com/x?utm_source=openai))")
+
+
+def openai_search(prompt):
+    chunks = [{"uri": "https://www.npci.org.in/stats", "title": "npci.org.in", "domain": "npci.org.in"},
+              {"uri": "https://www.amfiindia.com/data", "title": "amfiindia.com", "domain": "amfiindia.com"},
+              {"uri": "https://www.livemint.com/x", "title": "livemint.com", "domain": "livemint.com"}]
+    supports = [{"text": db._strip_links(ln), "chunks": [i]} for i, ln in enumerate(OPENAI_TEXT.split("\n"))]
+    return {"text": OPENAI_TEXT, "chunks": chunks, "supports": supports, "usage": {}, "engine": "openai:gpt-4.1"}
+
+
+r3 = db.research("Why are millions of UPI users not investing?", grounded=all_gone, resolve=lambda u: u,
+                 fetch=fake_fetch, web_search=openai_search)
+check("when no Gemini model works, OpenAI web search does the research",
+      r3["linked"] >= 3 and r3["engines"] == ["openai:gpt-4.1"] and "gemini-4.0-flash" in seen_models)
+check("inline citation links are stripped from the facts",
+      all("](" not in f["text"] and "utm_source" not in f["text"] for f in r3["facts"]))
+db._discovered.update(at=0.0, models=[])
+db._dead_models.clear()
+db._discovered.update(at=10 ** 12, models=[])
 check("a broken research call gives no facts, not an error",
       db.research("x", grounded=lambda p, m: (_ for _ in ()).throw(RuntimeError("quota")), resolve=fake_resolve,
                   fetch=fake_fetch)["facts"] == [])
+db._discovered.update(at=0.0, models=[])
+db._dead_models.clear()
 
 # ---------------------------------------------------------------------------- checks
 print("checks")
