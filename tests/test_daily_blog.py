@@ -169,6 +169,12 @@ def good_article(**over):
                                            "Estimate the market in a city of 50 lakh."],
                           "wat_prompt": "Ten-minute delivery: convenience or a race to the bottom?",
                           "case_question": "A grocery app asks whether to open 40 more stores in a city."},
+            "topic": "Operations",
+            "pull_quote": "The race has moved from opening stores to filling them [F3].",
+            "art": {"hero": {"prompt": "A dark store at night in Bengaluru, shelves lit, a rider waiting outside",
+                             "alt": "A lit dark store at night", "caption": "Where ten-minute orders are packed"},
+                    "inline": [{"after_section": 1, "prompt": "Crates of vegetables in a warehouse aisle",
+                                "alt": "Warehouse aisle", "caption": "Stock close to the customer"}]},
             "faq": [{"q": "Is quick commerce profitable?", "a": para(40, "[F5]")},
                     {"q": "How many dark stores are there?", "a": "About 5,000 across the three largest apps [F3]."},
                     {"q": "What drives profit?", "a": para(40, "[F4]")}],
@@ -213,9 +219,21 @@ class Review:
         return 1
 
 
+made_images = []
+
+
+def fake_images(_sb, slug, art):
+    made_images.append((slug, art))
+    return {"hero": {"url": f"https://cdn.example/{slug}/hero.webp", "og_url": f"https://cdn.example/{slug}/og.jpg",
+                     "width": 2000, "height": 1125, "alt": art["hero"]["alt"], "caption": art["hero"]["caption"],
+                     "credit": "Image generated with Gemini for MECE Insights"},
+            "images": [{"url": f"https://cdn.example/{slug}/inline-1.webp", "after_section": 1, "alt": "a", "caption": "c",
+                        "credit": "Image generated with Gemini for MECE Insights"}], "errors": []}
+
+
 def deps(chat, review=None, grounded=fake_grounded):
     return {"chat": chat, "grounded": grounded, "resolve": fake_resolve, "fetch": fake_fetch,
-            "log": lambda **k: None, "review": review}
+            "log": lambda **k: None, "review": review, "images": fake_images}
 
 
 def base_tables():
@@ -406,6 +424,76 @@ check("it is the new format, with sources and a related case and guesstimate",
       page["content"]["format"] == "daily-2" and page["content"]["sources"]
       and page["content"]["related"]["case"]["id"] == "c1" and page["content"]["related"]["guesstimate"]["id"] == "g1")
 check("one post per IST day", db.run_daily(sb, now=NOW + timedelta(hours=3), deps=deps(Chat([GOOD]), rev))["status"] == "exists")
+check("every post gets Gemini pictures from the writer's art direction (hero and inline)",
+      page["content"]["hero"]["url"].endswith("/hero.webp") and page["content"]["images"][0]["after_section"] == 1
+      and made_images and made_images[-1][0] == page["slug"] and "art" not in page["content"]
+      and page["agent_meta"]["art"]["hero"]["prompt"].startswith("A dark store"))
+check("topic label and pull quote are kept, without citation markers",
+      page["content"]["topic_label"] == "Operations" and "[" not in page["content"]["pull_quote"])
+n_before = len(made_images)
+db.run_daily(FakeSupabase(base_tables()), now=NOW, dry_run=True, deps=deps(Chat([GOOD]), Review()))
+check("a dry run commissions no pictures", len(made_images) == n_before)
+
+print("images")
+from services.growth import images as im  # noqa: E402
+import io as _io  # noqa: E402
+from PIL import Image as _Image  # noqa: E402
+
+
+def png(w=2400, h=1350):
+    b = _io.BytesIO()
+    _Image.new("RGB", (w, h), (120, 90, 60)).save(b, format="PNG")
+    return b.getvalue()
+
+
+uploads, prompts = [], []
+
+
+def fake_gen(prompt, aspect):
+    prompts.append((prompt, aspect))
+    return {"bytes": png(), "mime": "image/png", "model": "gemini-x-image"}
+
+
+def fake_upload(_sb, path, data, ctype):
+    uploads.append((path, len(data), ctype))
+    return f"https://store.example/{path}"
+
+
+art = {"hero": {"prompt": "Scene A", "alt": "A", "caption": "Cap A"},
+       "inline": [{"after_section": 3, "prompt": "Scene C", "alt": "C", "caption": "Cap C"},
+                  {"after_section": 1, "prompt": "Scene B", "alt": "B", "caption": "Cap B"}]}
+out = im.make_images(None, "my-post", art, generate=fake_gen, upload=fake_upload)
+check("hero (16:9) and inline (3:2) pictures are generated in one house style",
+      out["hero"]["width"] == 2000 and out["hero"]["height"] == 1125 and len(out["images"]) == 2
+      and all("No text" in p or "no text" in p for p, _ in prompts) and {a for _, a in prompts} == {"16:9", "3:2"})
+check("pictures are stored as WebP for the page and a JPEG link preview for the hero",
+      any(p.startswith("my-post/hero-") and t in ("image/webp", "image/jpeg") for p, _, t in uploads)
+      and any(p.startswith("my-post/og-") and t == "image/jpeg" for p, _, t in uploads)
+      and out["hero"]["og_url"].startswith("https://store.example/my-post/og-"))
+check("inline pictures keep their place in the article", [i["after_section"] for i in out["images"]] == [1, 3])
+broken = im.make_images(None, "p", art, generate=lambda p, a: (_ for _ in ()).throw(RuntimeError("quota")),
+                        upload=fake_upload)
+check("a failed picture never breaks the article", broken.get("hero") is None and broken["errors"])
+
+
+class _ArtChat:
+    def __call__(self, feature, **_k):
+        msg = SimpleNamespace(content=json.dumps(art))
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)]), None, None
+
+
+old_post = {"id": "p-old", "slug": "old-post", "title": "How UPI makes money", "dek": "d", "status": "published",
+            "content": {"format": "daily-1", "summary": "s", "sections": [{"heading": "H", "paragraphs": ["p"]}]},
+            "agent_meta": {"domain": "finance"}}
+sb = FakeSupabase({"seo_pages": [json.loads(json.dumps(old_post))]})
+res = db.add_images(sb, "p-old", chat=_ArtChat(),
+                    make=lambda s, slug, a: im.make_images(s, slug, a, generate=fake_gen, upload=fake_upload))
+row = sb.tables["seo_pages"][0]
+check("pictures can be added to an older post (art planned from the article)",
+      res["ok"] and row["content"]["hero"]["url"].startswith("https://store.example/old-post/hero-")
+      and len(row["content"]["images"]) == 2 and row["agent_meta"]["art"]["hero"]["prompt"] == "Scene A")
+check("an older post gets its topic label for the magazine layout", row["content"]["topic_label"] == "Finance")
+check("adding pictures to a missing post says so", db.add_images(sb, "nope", chat=_ArtChat())["ok"] is False)
 
 env(DAILY_BLOG_AUTOPUBLISH="1")
 sb = FakeSupabase(base_tables())

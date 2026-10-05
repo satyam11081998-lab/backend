@@ -913,10 +913,20 @@ SHAPE: 1,000-1,400 words in total. Return ONLY JSON:
                   "pi_questions": ["3 questions an interviewer could ask about it"],
                   "wat_prompt": "a WAT essay prompt on it",
                   "case_question": "how it could come up as a case in a placement interview (one or two sentences)"},
-    "faq": [{"q": "a question people search", "a": "2-3 sentences, cited"}]
+    "faq": [{"q": "a question people search", "a": "2-3 sentences, cited"}],
+    "topic": "one of: Strategy, Marketing, Finance, Operations, Technology, Economy, Careers",
+    "pull_quote": "the most striking sentence of your article, as it appears in the text, without the [F] marker",
+    "art": {
+      "hero": {"prompt": "the cover photograph: a concrete scene set in India that evokes the story (places, objects, \
+work, streets, markets, warehouses, offices, crowds at a distance, hands); no text, logos, brands, charts or real people",
+               "alt": "what the image shows", "caption": "one short sentence linking the image to the story, no numbers"},
+      "inline": [{"after_section": 1, "prompt": "a second, different scene", "alt": "...", "caption": "..."},
+                 {"after_section": 3, "prompt": "a third scene", "alt": "...", "caption": "..."}]
+    }
   }
 }
-4-5 sections, 4-6 numbers, 3 FAQs."""
+4-5 sections, 4-6 numbers, 3 FAQs. The pictures are commissioned from your art direction, so make each scene \
+specific and visual (light, place, objects), never generic stock ("businessman shaking hands")."""
 
 
 def _chat_json(chat: Callable, feature: str, system: str, user: str, *, max_tokens: int, temperature: float,
@@ -1008,6 +1018,9 @@ def _checked_texts(article: Dict[str, Any]) -> List[str]:
     for f in c.get("faq") or []:
         out += [f.get("q") or "", f.get("a") or ""]
     out += list(c.get("takeaways") or [])
+    out += [c.get("pull_quote") or ""]
+    art = c.get("art") or {}
+    out += [(art.get("hero") or {}).get("caption") or ""] + [(i or {}).get("caption") or "" for i in art.get("inline") or []]
     return [str(x) for x in out if x]
 
 
@@ -1091,6 +1104,17 @@ def check_article(article: Dict[str, Any], facts: List[Dict[str, Any]], cfg: Opt
     if is_blocked(everything):
         p.append("touches a political, tragic or divisive subject: " + (_BLOCK_RE.search(everything).group(0)))
     return p
+
+
+TOPIC_LABELS = {"strategy": "Strategy", "marketing": "Marketing", "finance": "Finance", "operations": "Operations",
+                "tech_product": "Technology", "economy": "Economy", "careers": "Careers"}
+
+
+def topic_label(article: Dict[str, Any], domain: str = "") -> str:
+    t = str((article.get("content") or {}).get("topic") or "").strip().title()
+    if t in TOPIC_LABELS.values():
+        return t
+    return TOPIC_LABELS.get(domain or "", "Business")
 
 
 def _serious(problems: List[str]) -> List[str]:
@@ -1253,8 +1277,10 @@ def _default_deps() -> Dict[str, Callable]:
     from services.ai_providers import chat_with_fallback
     from services.ai_usage import log_ai_usage
     from services.growth import telegram_review
+    from services.growth import images
     return {"chat": chat_with_fallback, "grounded": _gemini_grounded, "resolve": _resolve_url, "fetch": _fetch_text,
-            "web_search": _openai_web_search, "log": log_ai_usage, "review": telegram_review}
+            "web_search": _openai_web_search, "log": log_ai_usage, "review": telegram_review,
+            "images": images.make_images}
 
 
 def run_daily(supabase, *, user_id: Optional[str] = None, force: bool = False, publish: Optional[bool] = None,
@@ -1368,15 +1394,31 @@ def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, pu
     related = related_practice(supabase, article, angle)
     cited, sources = apply_citations(article, facts)
     content = dict(cited.get("content") or {})
-    content.update({"format": FORMAT, "sources": sources, "related": related, "words": word_count(article)})
+    art = content.pop("art", None) or {}
+    content.update({"format": FORMAT, "sources": sources, "related": related, "words": word_count(article),
+                    "topic_label": topic_label(article, cand.get("domain") or ""),
+                    "pull_quote": re.sub(r"\s*\[\d+(?:,\d+)*\]", "", str(content.get("pull_quote") or "")).strip()})
+    content.pop("topic", None)
 
     want_publish = cfg["autopublish"] if publish is None else bool(publish)
     passes = (not problems and review_note.get("score") is not None and review_note["score"] >= cfg["min_score"]
               and review_note.get("publishable"))
     status = "published" if (want_publish and passes) else "draft"
     title = (cited.get("title") or angle).strip()[:120]
+    slug = _unique_slug(supabase, _slugify(title))
+    pics: Dict[str, Any] = {"images": [], "errors": []}
+    make = deps.get("images")
+    if make is not None and art and not dry_run:
+        t0 = time.time()
+        pics = make(supabase, slug, art)
+        _log(log, user_id, "images", "gemini-image", None, t0, made=len(pics.get("images") or []) + (1 if pics.get("hero") else 0),
+             errors=pics.get("errors"))
+    if pics.get("hero"):
+        content["hero"] = pics["hero"]
+    if pics.get("images"):
+        content["images"] = pics["images"]
     row = {
-        "slug": _unique_slug(supabase, _slugify(title)),
+        "slug": slug,
         "kind": KIND,
         "title": title,
         "meta_description": (cited.get("meta_description") or "").strip()[:300],
@@ -1395,6 +1437,7 @@ def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, pu
                        "problems": problems, "serious_problems": _serious(problems),
                        "critic": {k: review_note.get(k) for k in ("score", "publishable", "model")},
                        "writer_provider": provider, "research_models": cfg["research_models"],
+                       "art": art, "image_errors": pics.get("errors") or [],
                        "review": "auto" if status == "published" else "pending"},
         "source_headline_id": hook.get("id"),
         "created_by": user_id,
@@ -1475,3 +1518,31 @@ def status(supabase, now: Optional[datetime] = None) -> Dict[str, Any]:
     return {"config": config(), "telegram": tg, "today": todays_post(supabase, now), "recent": recent,
             "candidates": [{"title": (c["headline"] or {}).get("title"), "score": c["score"], "reasons": c["reasons"],
                             "domain": c["domain"]} for c in candidate_topics(supabase, now)]}
+
+
+def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make: Optional[Callable] = None) -> Dict[str, Any]:
+    """Commission and attach images to an existing article (older posts, or a retry when generation failed)."""
+    from services.growth import images
+    if chat is None:
+        from services.ai_providers import chat_with_fallback as chat  # noqa: N813
+    make = make or images.make_images
+    rows = supabase.table("seo_pages").select("*").eq("id", page_id).limit(1).execute().data or []
+    if not rows:
+        return {"ok": False, "reason": "not found"}
+    page = rows[0]
+    meta = dict(page.get("agent_meta") or {})
+    art = meta.get("art") or images.art_plan(chat, page)
+    if not art:
+        return {"ok": False, "reason": "could not plan the images"}
+    pics = make(supabase, page["slug"], art)
+    content = dict(page.get("content") or {})
+    if pics.get("hero"):
+        content["hero"] = pics["hero"]
+    if pics.get("images"):
+        content["images"] = pics["images"]
+    if not content.get("topic_label"):
+        content["topic_label"] = topic_label(page, meta.get("domain") or "")
+    meta.update({"art": art, "image_errors": pics.get("errors") or []})
+    supabase.table("seo_pages").update({"content": content, "agent_meta": meta}).eq("id", page_id).execute()
+    return {"ok": bool(pics.get("hero") or pics.get("images")), "hero": pics.get("hero"),
+            "images": len(pics.get("images") or []), "errors": pics.get("errors") or []}

@@ -240,7 +240,18 @@ def send_for_review(supabase, page: Dict[str, Any]) -> bool:
         mid = send_text(f"✅ Published automatically: <b>{_e(page.get('title'))}</b>\n{SITE}/insights/{page.get('slug')}",
                         html_mode=True)
         return bool(mid)
-    ids = [m for m in (send_text(t, html_mode=True) for t in render_messages(page)) if m]
+    ids: List[int] = []
+    hero = (page.get("content") or {}).get("hero") or {}
+    if hero.get("url"):
+        try:
+            res = _call("sendPhoto", {"chat_id": _chat_id(), "photo": hero.get("og_url") or hero["url"],
+                                      "caption": f"{page.get('title') or ''}"[:1000]})
+            if res.get("ok"):
+                ids.append((res.get("result") or {}).get("message_id"))
+        except Exception:
+            pass
+    ids += [m for m in (send_text(t, html_mode=True) for t in render_messages(page)) if m]
+    ids = [i for i in ids if i]
     if not ids:
         return False
     try:

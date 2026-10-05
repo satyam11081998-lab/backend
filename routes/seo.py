@@ -14,6 +14,7 @@ Growth Agent routes — programmatic SEO generation (admin only).
                           {"publish": true} and it passes every check. {"dry_run": true}
                           = preview, nothing saved.
   POST /seo/daily/send/{id} -> send a daily draft to Telegram for review again (admin).
+  POST /seo/daily/images/{id} -> commission Gemini images for an existing article (admin).
   POST /seo/telegram/setup  -> (re)register the Telegram webhook (admin).
   POST /seo/telegram/webhook -> Telegram calls this when the admin replies to a draft
                           (publish / another / reject). Not a user route: it checks the
@@ -125,6 +126,16 @@ def seo_daily_send(page_id: str, authorization: Optional[str] = Header(default=N
     if not telegram_review.configured():
         raise HTTPException(status_code=422, detail="Telegram is not set up (TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID)")
     return {"sent": telegram_review.send_for_review(sb, rows[0])}
+
+
+@router.post("/daily/images/{page_id}")
+def seo_daily_images(page_id: str, authorization: Optional[str] = Header(default=None)):
+    """Commission Gemini images for an existing article (older posts, or a retry)."""
+    uid = _require_admin(authorization)
+    check_rate_limit(f"seo:images:{uid}", max_calls=6, window_seconds=600)
+    assert_daily_budget()
+    from services.growth import daily_blog
+    return daily_blog.add_images(get_supabase_client(), page_id)
 
 
 @router.post("/telegram/setup")
