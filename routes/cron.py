@@ -209,11 +209,16 @@ def cron_daily_blog(x_cron_secret: Optional[str] = Header(default=None)) -> Cron
         assert_daily_budget()
     except HTTPException as e:
         return CronResponse(status="skipped", message=str(e.detail), details={"budget": True})
-    result = daily_blog.run_daily(get_supabase_client())
+    # The workflow calls this every 30 minutes through the morning: each call is a no-op once
+    # today's post exists, starts further down the topic list than the last, and only the late
+    # calls (11:00 IST on) tell the admin on Telegram that nothing has worked yet.
+    ist_hour = datetime.now(timezone(timedelta(hours=5, minutes=30))).hour
+    result = daily_blog.run_daily(get_supabase_client(), rotate=True, notify_failure=ist_hour >= 11)
     page = result.get("page") or {}
     return CronResponse(
         status=result.get("status", "skipped"),
         message=result.get("reason", ""),
         details={"slug": page.get("slug"), "title": page.get("title"), "status": page.get("status"),
-                 "score": page.get("quality_score")},
+                 "score": page.get("quality_score"),
+                 "research": (result.get("trace") or {}).get("research")},
     )

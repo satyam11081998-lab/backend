@@ -1,20 +1,26 @@
-name: Daily Blog (7:00 AM IST)
+name: Daily Blog (7:00 IST, retries until 11:30 IST)
 
-# Writes today's /insights article (services/growth/daily_blog.py) one hour after the
-# 06:00 IST news fetch, so a published post is live by 08:00 IST (pages revalidate hourly).
-# The backend does nothing until DAILY_BLOG_ENABLED is set on Render, and publishes only when
-# DAILY_BLOG_AUTOPUBLISH is set and the post passes every check — otherwise it waits as a draft
-# in /admin/growth. One post per IST day: a retry or a second run is a no-op.
+# Writes today's /insights article (services/growth/daily_blog.py) after the 06:00 IST news fetch
+# and sends it to the admin's Telegram chat for review (reply "publish" there to post it).
+# Runs every 30 minutes from 07:00 to 11:30 IST: each run tries several topics, does nothing once
+# today's post exists, and the 11:00+ runs tell the admin on Telegram if nothing has worked yet.
+# The backend does nothing until DAILY_BLOG_ENABLED is set on Render.
 
 on:
   schedule:
-    # 01:30 UTC == 07:00 IST
-    - cron: '30 1 * * *'
-  workflow_dispatch: {}  # manual trigger
+    - cron: '30 1 * * *'        # 07:00 IST
+    - cron: '0,30 2-5 * * *'    # 07:30 - 11:00 IST
+    - cron: '0 6 * * *'         # 11:30 IST
+  workflow_dispatch: {}         # manual trigger
+
+concurrency:
+  group: daily-blog
+  cancel-in-progress: false
 
 jobs:
   daily-blog:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Wake the backend (Render cold-start guard)
         run: |
@@ -29,8 +35,5 @@ jobs:
         run: |
           curl -X POST "${{ secrets.API_BASE_URL }}/cron/daily-blog" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-            --max-time 420 \
-            --retry 1 \
-            --retry-delay 30 \
-            --retry-all-errors \
+            --max-time 900 \
             --fail-with-body
