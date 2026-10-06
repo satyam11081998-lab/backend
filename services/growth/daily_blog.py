@@ -93,7 +93,7 @@ def _gemini_default() -> str:
 # Models that answered "not found / no longer available" in this process: skipped for 6 hours, so a
 # retired model costs one failed call, not one per topic.
 _dead_models: Dict[str, float] = {}
-_discovered: Dict[str, Any] = {"at": 0.0, "models": []}
+_discovered: Dict[str, Any] = {"at": 0.0, "models": [], "all": []}
 
 
 def research_models() -> List[str]:
@@ -134,9 +134,26 @@ def discover_gemini_models() -> List[str]:
                 names.append(name)
     except Exception as e:  # noqa: BLE001
         print(f"[daily_blog] model discovery failed: {type(e).__name__}: {e}")
-    names = sorted(dict.fromkeys(names), key=_version_key)[:8]
-    _discovered.update(at=time.time(), models=names)
-    return names
+    names = sorted(dict.fromkeys(names), key=_version_key)
+    _discovered.update(at=time.time(), models=names[:8], all=names)
+    return names[:8]
+
+
+def writer_models() -> List[str]:
+    """Models that write (and edit) the essay, best first. DAILY_BLOG_WRITER_MODEL (comma-separated; gemini-* names go
+    to Gemini, anything else to OpenAI) wins; otherwise the newest Gemini Pro model this key lists, then the backend's
+    Gemini default. If all fail, the `seo_writer` provider chain (gpt-4o) writes."""
+    env = [m.strip().removeprefix("models/") for m in (os.getenv("DAILY_BLOG_WRITER_MODEL") or "").split(",") if m.strip()]
+    if env:
+        return [m for m in env if time.time() - _dead_models.get(m, 0) > 6 * 3600] or env[:1]
+    discover_gemini_models()
+    pros = sorted([m for m in _discovered.get("all") or [] if "pro" in m],
+                  key=lambda n: (_version_key(n)[0], "preview" in n))
+    out: List[str] = []
+    for m in pros[:2] + [_gemini_default()]:
+        if m and m not in out and time.time() - _dead_models.get(m, 0) > 6 * 3600:
+            out.append(m)
+    return out
 
 
 def _is_gone(err: Exception) -> bool:
@@ -145,19 +162,28 @@ def _is_gone(err: Exception) -> bool:
                                 "unsupported", "does not support"))
 
 
+def _picture_order() -> List[str]:
+    try:
+        from services.growth import images
+        return images.picture_order()
+    except Exception:
+        return []
+
+
 def config() -> Dict[str, Any]:
     return {
         "enabled": _flag("DAILY_BLOG_ENABLED"),
         "autopublish": _flag("DAILY_BLOG_AUTOPUBLISH"),
         "min_score": _int_env("DAILY_BLOG_MIN_SCORE", 80, 0, 100),
-        "min_words": 850,
-        "max_words": 1700,
-        "min_linked_facts": 3,
-        "time_budget_s": _int_env("DAILY_BLOG_TIME_BUDGET_S", 480, 60, 1500),
+        "min_words": 1300,
+        "max_words": 2600,
+        "min_linked_facts": _int_env("DAILY_BLOG_MIN_FACTS", 6, 3, 20),
+        "time_budget_s": _int_env("DAILY_BLOG_TIME_BUDGET_S", 600, 60, 1500),
         "max_topics": _int_env("DAILY_BLOG_MAX_TOPICS", 8, 1, 20),
         "research_available": research_available() or bool(os.getenv("OPENAI_API_KEY")),
         "research_models": research_models() + [f"openai web search: {m}" for m in openai_search_models()[:1]],
-        "writer_model": (os.getenv("DAILY_BLOG_WRITER_MODEL") or "").strip() or "seo_writer (gpt-4o by default)",
+        "writer_model": ", ".join(writer_models()[:3]) + " (then seo_writer: gpt-4o)",
+        "pictures": _picture_order(),
     }
 
 
@@ -473,6 +499,20 @@ Search the live web for 8 to 12 more checkable facts, different from obvious hea
 - the main companies and their shares or sizes;
 - the history: when it started, the turning points, with years;
 - what regulators, companies or industry bodies have said or decided, attributed.
+Prefer primary sources and established business press, with dates.
+
+Write each fact on its own line, in exactly this form (no bullets, no numbering, no bold):
+FACT: <one sentence> | SOURCE: <publisher or organisation>
+Nothing else."""
+
+_DEPTH_PROMPT = """Research the numbers and comparisons behind this business topic for a long-form article read by Indian MBA students: "{angle}".{hook}
+
+Search the live web for 8 to 12 more checkable facts that give scale, contrast and history, different from the obvious headline numbers:
+- the trend over five to ten years (a figure then, a figure now, with years);
+- company financials where relevant: revenue, profit or loss, margins, market value, funding, with periods;
+- unit economics or the cost structure (price, cost per unit, take rate, capacity, utilisation);
+- a comparison with another country, company or period (China, the US, a rival, the last cycle);
+- what named executives, regulators or analysts said publicly, attributed with the date.
 Prefer primary sources and established business press, with dates.
 
 Write each fact on its own line, in exactly this form (no bullets, no numbering, no bold):
@@ -830,7 +870,7 @@ def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Cal
                        "named_source": hook.get("source_name") or "",
                        "sources": [{"url": hook["source_url"], "label": hook.get("source_name") or _domain(hook["source_url"]),
                                     "domain": _domain(hook["source_url"])}], "how": "news"})
-    for prompt in (_RESEARCH_PROMPT, _CONTEXT_PROMPT):
+    for prompt in (_RESEARCH_PROMPT, _CONTEXT_PROMPT, _DEPTH_PROMPT):
         g = grounded_with_fallback(prompt.format(angle=angle, hook=hook_line), grounded, web_search)
         errors += [e for e in (g.get("errors") or []) if e not in errors]
         if g.get("engine"):
@@ -843,12 +883,12 @@ def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Cal
         linked += [f for f in lk if _norm_text(f["text"]) not in seen]
         seen = {_norm_text(f["text"]) for f in linked + attributed}
         attributed += [f for f in at if _norm_text(f["text"]) not in seen]
-        if len(linked) >= 8:
+        if len(linked) >= 18:
             break
     # attributed-only facts never outnumber linked ones
     attributed = attributed[: max(0, len(linked))]
     facts = []
-    for f in linked[:16] + attributed[:6]:
+    for f in linked[:24] + attributed[:8]:
         facts.append({"id": f"F{len(facts) + 1}", "text": f["text"], "sources": f["sources"],
                       "linked": bool(f["sources"]), "named_source": f.get("named_source") or "", "how": f.get("how", "")})
     return {"facts": facts, "linked": sum(1 for f in facts if f["linked"]), "errors": errors[:6], "usage": usage,
@@ -861,90 +901,185 @@ def research(angle: str, hook: Optional[Dict[str, Any]] = None, *, grounded: Cal
 _STRONG_TELLS = ["fast-paced", "delve", "tapestry", "game-changer", "game changer", "in conclusion", "it's worth noting",
                  "it is worth noting", "ever-evolving", "testament to", "navigate the", "navigating the", "realm",
                  "unleash", "embark", "revolutioni", "in today's world", "in the world of", "a myriad", "plethora",
-                 "paradigm", "synergy", "buckle up", "let's dive", "dive into", "deep dive", "unlock the", "unlocking"]
+                 "paradigm", "synergy", "buckle up", "let's dive", "dive into", "deep dive", "unlock the", "unlocking",
+                 "stands as a", "serves as a", "rich history", "intricate", "multifaceted", "a nuanced", "shed light",
+                 "sheds light", "it remains to be seen", "only time will tell", "the stakes are high", "double-edged sword",
+                 "million-dollar question", "at the end of the day", "in essence", "in summary", "to sum up", "all in all",
+                 "ushering in", "a new era", "in an era", "evolving landscape", "the landscape of", "plays a crucial role",
+                 "plays a vital role", "plays a pivotal role", "is poised to", "are poised to", "not only", "showcasing",
+                 "a beacon", "a cornerstone", "the backbone of", "the fabric of", "ever-changing", "whopping"]
 _SOFT_TELLS = ["crucial", "pivotal", "landscape", "leverage", "robust", "seamless", "holistic", "moreover", "furthermore",
-               "underscore", "boasts", "cutting-edge", "when it comes to", "not just", "key player", "significant"]
+               "underscore", "boasts", "cutting-edge", "when it comes to", "key player", "significant", "notably",
+               "additionally", "fostering", "bolster", "spearhead", "harness", "empower", "transformative",
+               "comprehensive", "amidst", "highlights the", "underscores", "showcases", "vital"]
+_ADVERB_OPENERS = re.compile(r"(?:^|[.!?]\s+)(Additionally|Moreover|Furthermore|Notably|Interestingly|Importantly|"
+                             r"Ultimately|Overall|Consequently|Crucially|Essentially|Indeed),", re.M)
+_GENERIC_HEADINGS = {"what happened", "why it matters", "why does it matter", "why this matters", "background",
+                     "overview", "introduction", "conclusion", "the way forward", "way forward", "key takeaways",
+                     "takeaways", "the bottom line", "bottom line", "the road ahead", "road ahead", "looking ahead",
+                     "final thoughts", "the big picture", "big picture", "implications", "analysis", "context",
+                     "the context", "what's next", "what next", "what lies ahead", "the challenges", "challenges",
+                     "opportunities", "challenges and opportunities", "the debate", "summary", "the numbers"}
+_TITLE_BAD = re.compile(r"\b(case study|a case for|explained|everything you need to know|decoded|deep dive|unpacking|"
+                        r"a closer look|an analysis|insights into|navigating|unveiling|demystif\w*|the rise of|"
+                        r"the future of|a guide|what you need to know)\b", re.I)
+_DEK_BAD = re.compile(r"^\s*(learn|understand|explore|discover|find out|read|this article|in this article|"
+                      r"here's|here is|a look at|we look|we explore|dive)\b", re.I)
 
-_WRITER_SYSTEM = """You are a senior business writer at MECE Insights. Write one article that stands with the best \
-Indian business explainers (Mint, ET Prime, The Ken) and consulting insight pieces (McKinsey, BCG): clear, specific, \
-evidence-led, worth sharing. Readers: MBA students preparing for placements, MBA aspirants preparing for GD, PI and WAT \
-rounds, and young professionals.
+_WRITER_SYSTEM = """You write long-form business essays for MECE Insights. The bar is a feature in Mint, The Ken or \
+ET Prime, with the depth of an Aeon essay: a writer with a point of view who has done the reporting, explains how \
+the business really works, and leaves the reader understanding something they did not before. Readers: MBA students \
+preparing for placements, MBA aspirants preparing for GD, PI and WAT, and young professionals in India.
+
+THE ARGUMENT
+- Before writing, decide the one thing this story is really about underneath the news (the economics, the incentive, \
+the constraint, the strategic bet). State it in the lede and make every section move it forward.
+- Depth means: how money is made and lost here (revenue, costs, margins, unit economics); how we got here (history \
+and turning points); a comparison that gives scale (another company, country or period); the strongest argument on \
+the other side; second-order effects (who else wins or loses); what a manager or consultant would actually do.
+- Explain mechanisms. Put every number in context: compare it, divide it, set it against time ("roughly a third \
+of…", "up from … in 2019"). A number without a so-what is padding.
 
 FACTS
-- Use ONLY the numbered facts provided for anything factual. End every sentence that uses a fact with its id in \
-square brackets: "Orders grew 40% last year [F3]." Several: [F2][F5].
+- Use ONLY the numbered facts provided for anything factual, and use most of them (at least 10 different facts \
+when that many are given). End every sentence that uses a fact with its id: "Orders grew 40% last year [F3]." \
+Several: [F2][F5].
 - Attribute in the sentence where it helps the reader: "according to RBI data", "the company said in its annual report".
 - Every number in the article must come from a fact, written the same way. Only the PI questions, the WAT prompt and \
 the case question may use numbers for an estimate.
 - If the facts don't support a claim, leave it out. Never invent a decision, a quote, a forecast or a figure.
 - Facts marked (attributed) have a named source but no link: use them only with the attribution in the sentence.
 
-QUALITY
-- Lead with the news and why it matters now. Then explain the business underneath: how money is made, who wins and \
-loses, what drives it, what the numbers say. Give both sides where there is a real debate. End with what to watch.
-- Analysis, not summary: connect facts ("that is twice the growth of…", "which means each order…") and explain \
-mechanisms. Concrete beats general. One idea per paragraph.
-- Plain, precise English as written in India. Money in ₹ with crore and lakh. Paragraphs of 2-4 sentences, varied \
-sentence length, active verbs.
+VOICE (this is what separates a human editor's piece from generated text)
+- Open with something concrete: a number in context, a decision, a place, a moment. Never with a generality about \
+the world, India or "the industry".
+- Specific nouns and active verbs. Vary sentence length; some short sentences land the point. Paragraphs of 3-5 \
+sentences that each do one job.
+- No throat-clearing, no signposting ("In this article", "Let's look at"), no paragraph that ends by summarising \
+itself ("This shows that…", "This highlights…"), no stacked adjectives, no lists of three for rhythm, no \
+"not only… but also", no rhetorical questions in the body, no sentence starting with Additionally, Moreover, \
+Furthermore, Notably, Interestingly, Importantly, Ultimately or Overall.
 - Never use: delve, landscape, navigate, crucial, pivotal, robust, seamless, holistic, leverage, realm, tapestry, \
-game-changer, unlock, moreover, furthermore, "in conclusion", "it's worth noting", "in today's fast-paced world", \
-"when it comes to", "not just X but Y", "dive into". No exclamation marks. No em dashes (use commas, colons or full \
-stops). No hype, no politics, no preaching.
+game-changer, unlock, foster, bolster, harness, empower, transformative, multifaceted, intricate, testament, \
+"plays a vital role", "a new era", "it remains to be seen", "only time will tell", "the stakes are high", \
+"in conclusion", "in essence", "it's worth noting", "when it comes to". No exclamation marks. No em dashes \
+(use commas, colons or full stops). No hype, no politics, no preaching.
+- Machine: "The quick commerce landscape is evolving rapidly, with players leveraging dark stores to unlock growth."
+  Human: "Each dark store costs about the same whether it ships 400 orders a day or 2,000. That is the whole game."
+- Machine: "This development highlights the crucial role of policy in shaping the sector's future."
+  Human: "The rule changes who pays for the free transfer: until now it was the bank, from April it is the merchant."
+- Plain Indian English. Money in ₹ with crore and lakh.
 
-SHAPE: 1,000-1,400 words in total. Return ONLY JSON:
+TITLE AND DEK
+- Title: one natural phrase, 6-12 words, that says something specific: a claim, a tension or a question a reader \
+would ask. No colon, no "A Case for", "Case Study", "Explained", "Decoded", "The Rise of", "The Future of", \
+"Everything you need to know", no clickbait.
+  Bad: "Tata's Ownership: A Case for Wealth as Public Trust". Good: "Why two-thirds of Tata Sons belongs to charities".
+- Dek: one sentence with the specific tension or answer, never starting with Learn, Understand, Explore, Discover \
+or "This article".
+- Section headings say something (a short claim or a pointed question), never labels like "What happened", \
+"Why it matters", "Background", "Challenges", "The way forward" or "Conclusion".
+
+SHAPE: 1,600-2,000 words in total. Return ONLY JSON:
 {
-  "title": "<= 70 characters, specific and informative, what a reader would search for; no clickbait",
+  "title": "see TITLE above, <= 70 characters",
   "meta_description": "<= 155 characters, specific, with the key figure",
-  "dek": "one sentence that says what the reader will understand",
+  "dek": "see TITLE AND DEK above",
   "keywords": ["5-8 search phrases"],
   "content": {
-    "key_points": ["exactly 3 short sentences: the most important things to know, cited"],
-    "lede": "2-3 sentences: what happened and why it matters now, with the key figure, cited",
+    "key_points": ["exactly 3 sentences a busy reader needs, each with a figure, cited"],
+    "lede": "3-5 sentences: the concrete opening and the argument of the piece, cited",
     "sections": [
-      {"heading": "a specific heading (at least two of the headings phrased as questions)",
-       "paragraphs": ["2-4 paragraphs"], "bullets": ["optional, 3-5 items"]}
+      {"heading": "a claim or a pointed question", "paragraphs": ["3-5 paragraphs"], "bullets": ["optional, 3-5 items"]}
     ],
     "numbers": [{"figure": "as written in the fact, e.g. ₹1,200 crore", "what": "what it measures", "fact": "F2"}],
     "framework": {"name": "a consulting lens that fits, e.g. profit tree, Porter's five forces, 3Cs, value chain",
-                  "heading": "How to break it down", "steps": ["3-5 steps applying the lens to THIS story"]},
-    "what_to_watch": ["3 specific things to watch next, phrased as questions or indicators, no predictions"],
+                  "heading": "How to break it down", "steps": ["3-5 steps applying the lens to THIS story, specific"]},
+    "what_to_watch": ["3 specific indicators or decisions to watch, no predictions"],
     "aspirants": {"gd_topic": "a GD topic this story fits",
-                  "for": ["2-3 strong points on one side"], "against": ["2-3 strong points on the other"],
-                  "pi_questions": ["3 questions an interviewer could ask about it"],
+                  "for": ["3 strong, specific points on one side"], "against": ["3 strong, specific points on the other"],
+                  "pi_questions": ["3 questions an interviewer could ask about it, sharp and specific"],
                   "wat_prompt": "a WAT essay prompt on it",
-                  "case_question": "how it could come up as a case in a placement interview (one or two sentences)"},
+                  "case_question": "how it could come up as a case in a placement interview (two sentences)"},
     "faq": [{"q": "a question people search", "a": "2-3 sentences, cited"}],
     "topic": "one of: Strategy, Marketing, Finance, Operations, Technology, Economy, Careers",
     "pull_quote": "the most striking sentence of your article, as it appears in the text, without the [F] marker",
     "art": {
-      "hero": {"prompt": "the cover photograph: a concrete scene set in India that evokes the story (places, objects, \
-work, streets, markets, warehouses, offices, crowds at a distance, hands); no text, logos, brands, charts or real people",
+      "hero": {"subject": "what a REAL photograph should show: the actual company, building, plant, product, port, \
+market, city or activity in the story",
+               "search": ["2-3 short Wikimedia Commons search queries with proper names, e.g. 'Bombay House Mumbai'"],
+               "prompt": "a fallback scene for an AI image: concrete, set in India, no text, logos, brands or real people",
                "alt": "what the image shows", "caption": "one short sentence linking the image to the story, no numbers"},
-      "inline": [{"after_section": 1, "prompt": "a second, different scene", "alt": "...", "caption": "..."},
-                 {"after_section": 3, "prompt": "a third scene", "alt": "...", "caption": "..."}]
+      "inline": [{"after_section": 2, "subject": "...", "search": ["..."], "prompt": "...", "alt": "...", "caption": "..."},
+                 {"after_section": 4, "subject": "...", "search": ["..."], "prompt": "...", "alt": "...", "caption": "..."}]
     }
   }
 }
-4-5 sections, 4-6 numbers, 3 FAQs. The pictures are commissioned from your art direction, so make each scene \
-specific and visual (light, place, objects), never generic stock ("businessman shaking hands")."""
+5-6 sections, 5-8 numbers, 3-4 FAQs."""
+
+_EDITOR_SYSTEM = """You are the line editor of MECE Insights. You get a draft essay (JSON) and the facts it is built \
+on. Edit it so it reads like the work of a skilled human writer at Mint or The Ken, not generated text, and return \
+the FULL article in exactly the same JSON shape.
+- Keep the argument, the structure, every fact and every [F#] marker attached to the same claim. Keep every number \
+exactly as written. Do not add facts, numbers, quotes or claims. Keep the art and aspirants fields as they are \
+unless a rule below is broken.
+- Fix: generic or label headings (make each a short claim or pointed question); a title with a colon or stock \
+phrasing (make it one natural, specific phrase, <= 70 characters); a dek that starts with Learn/Understand/Explore; \
+throat-clearing; paragraphs that end by summarising themselves; stacked adjectives and lists of three; "not only… \
+but also"; sentences opening with Additionally, Moreover, Furthermore, Notably, Interestingly, Importantly, \
+Ultimately, Overall; any of: delve, landscape, navigate, crucial, pivotal, robust, seamless, holistic, leverage, \
+realm, tapestry, unlock, foster, bolster, harness, empower, transformative, multifaceted, intricate, testament, \
+"plays a vital role", "a new era", "it remains to be seen", "the stakes are high", "in essence"; em dashes; \
+exclamation marks.
+- Make it more concrete where it is vague: prefer the specific number, company or mechanism already in the facts.
+- Vary sentence length. Cut padding. Do not shorten the piece below 1,600 words.
+Return ONLY the JSON."""
+
+
+def _gone(e: Exception) -> bool:
+    return _is_gone(e)
+
+
+def _llm_json(chat: Callable, feature: str, system: str, user: str, *, models: List[str], max_tokens: int,
+              temperature: float):
+    """Try each named model (gemini-* through Gemini's OpenAI-compatible endpoint, anything else through OpenAI),
+    then the feature's provider chain. Returns (json, response, model, provider)."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    for m in models:
+        prov = "gemini" if m.startswith("gemini") else "openai"
+        try:
+            from services.ai_providers import _client_for, _kwargs_for
+            cli = _client_for(prov)
+            if cli is None:
+                continue
+            kw: Dict[str, Any] = {"messages": messages, "temperature": temperature,
+                                  "response_format": {"type": "json_object"}, "max_tokens": max_tokens}
+            if prov == "gemini":
+                kw = _kwargs_for("gemini", dict(kw, max_tokens=max(max_tokens * 3, 16000)))
+                resp = cli.chat.completions.create(model=m, **kw)
+            else:
+                try:
+                    resp = cli.chat.completions.create(model=m, **kw)
+                except Exception as e:  # noqa: BLE001 - newer OpenAI models take max_completion_tokens, no temperature
+                    if "max_tokens" not in str(e) and "temperature" not in str(e):
+                        raise
+                    kw.pop("max_tokens", None)
+                    kw.pop("temperature", None)
+                    resp = cli.chat.completions.create(model=m, max_completion_tokens=max_tokens * 3, **kw)
+            return _extract_json(resp.choices[0].message.content), resp, m, prov
+        except Exception as e:  # noqa: BLE001 - next model
+            if _gone(e):
+                _dead_models[m] = time.time()
+            print(f"[daily_blog] {feature} via {m} failed: {type(e).__name__}: {str(e)[:200]}")
+    resp, model, provider = chat(feature, messages=messages, response_format={"type": "json_object"},
+                                 temperature=temperature, max_tokens=max_tokens)
+    return _extract_json(resp.choices[0].message.content), resp, model, provider
 
 
 def _chat_json(chat: Callable, feature: str, system: str, user: str, *, max_tokens: int, temperature: float,
                model_override: str = ""):
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    if model_override:
-        try:
-            from services.ai_providers import openai_client
-            cli = openai_client()
-            if cli is not None:
-                resp = cli.chat.completions.create(model=model_override, messages=messages, temperature=temperature,
-                                                   max_tokens=max_tokens, response_format={"type": "json_object"})
-                return _extract_json(resp.choices[0].message.content), resp, model_override, "openai"
-        except Exception as e:  # noqa: BLE001 - fall back to the configured feature
-            print(f"[daily_blog] writer model {model_override} failed: {type(e).__name__}: {e}")
-    resp, model, provider = chat(feature, messages=messages, response_format={"type": "json_object"},
-                                 temperature=temperature, max_tokens=max_tokens)
-    return _extract_json(resp.choices[0].message.content), resp, model, provider
+    return _llm_json(chat, feature, system, user, models=[model_override] if model_override else [],
+                     max_tokens=max_tokens, temperature=temperature)
 
 
 def _facts_block(facts: List[Dict[str, Any]]) -> str:
@@ -965,9 +1100,16 @@ def write_article(chat: Callable, angle: str, hook: Dict[str, Any], facts: List[
     if problems and previous:
         user += ("\n\nYOUR PREVIOUS DRAFT FAILED THESE CHECKS. Fix every one, keep everything else that was good, "
                  "and return the full article again:\n- " + "\n- ".join(problems)
-                 + "\n\nPREVIOUS DRAFT:\n" + json.dumps(previous, ensure_ascii=False)[:12000])
-    return _chat_json(chat, "seo_writer", _WRITER_SYSTEM, user, max_tokens=4500, temperature=0.55,
-                      model_override=(os.getenv("DAILY_BLOG_WRITER_MODEL") or "").strip())
+                 + "\n\nPREVIOUS DRAFT:\n" + json.dumps(previous, ensure_ascii=False)[:20000])
+    return _llm_json(chat, "seo_writer", _WRITER_SYSTEM, user, models=writer_models(), max_tokens=6500,
+                     temperature=0.6)
+
+
+def edit_article(chat: Callable, article: Dict[str, Any], facts: List[Dict[str, Any]]):
+    """The line edit: same facts and markers, human voice."""
+    models = [m.strip() for m in (os.getenv("DAILY_BLOG_EDITOR_MODEL") or "").split(",") if m.strip()] or writer_models()
+    user = (f"FACTS:\n{_facts_block(facts)}\n\nDRAFT:\n{json.dumps(article, ensure_ascii=False)[:24000]}")
+    return _llm_json(chat, "seo_writer", _EDITOR_SYSTEM, user, models=models, max_tokens=6500, temperature=0.4)
 
 
 # =============================================================================
@@ -1051,17 +1193,31 @@ def check_article(article: Dict[str, Any], facts: List[Dict[str, Any]], cfg: Opt
     meta = (article.get("meta_description") or "").strip()
     if not title or len(title) > 75:
         p.append(f"title must be 1-70 characters (is {len(title)})")
+    if ":" in title or " - " in title or " | " in title:
+        p.append("title: no colon or dash; write it as one natural, specific phrase")
+    elif _TITLE_BAD.search(title):
+        p.append(f"title: stock phrasing ('{_TITLE_BAD.search(title).group(0)}'); say something specific instead")
+    if _DEK_BAD.search(article.get("dek") or ""):
+        p.append("dek: don't start with Learn/Understand/Explore/Discover; state the specific tension or answer")
     if not meta or len(meta) > 160:
         p.append(f"meta_description must be 1-155 characters (is {len(meta)})")
     words = word_count(article)
     if words < cfg["min_words"] or words > cfg["max_words"]:
-        p.append(f"length must be {cfg['min_words']}-{cfg['max_words']} words (is {words}); aim for 1,000-1,400")
+        p.append(f"length must be {cfg['min_words']}-{cfg['max_words']} words (is {words}); aim for 1,600-2,000")
     if len(c.get("key_points") or []) < 3:
         p.append("key_points needs 3 items")
     if len((c.get("lede") or "").split()) < 20:
         p.append("lede needs 2-3 full sentences")
-    if len(c.get("sections") or []) < 4:
-        p.append(f"needs 4-5 sections (has {len(c.get('sections') or [])})")
+    secs = c.get("sections") or []
+    if len(secs) < 5:
+        p.append(f"needs 5-6 sections (has {len(secs)})")
+    thin = [i + 1 for i, x in enumerate(secs) if len([q for q in (x.get("paragraphs") or []) if len(str(q).split()) > 12]) < 2]
+    if thin:
+        p.append("each section needs 3-5 real paragraphs; too thin: section " + ", ".join(map(str, thin)))
+    generic = [x.get("heading") for x in secs
+               if re.sub(r"[^a-z' ]", "", str(x.get("heading") or "").lower()).strip() in _GENERIC_HEADINGS]
+    if generic:
+        p.append("headings must say something (a claim or a pointed question), not labels: " + "; ".join(map(str, generic)))
     if len(c.get("numbers") or []) < 4:
         p.append("needs at least 4 entries in numbers")
     if len((c.get("framework") or {}).get("steps") or []) < 3:
@@ -1083,15 +1239,21 @@ def check_article(article: Dict[str, Any], facts: List[Dict[str, Any]], cfg: Opt
     bad = sorted(cited - fact_ids)
     if bad:
         p.append("these fact ids do not exist: " + ", ".join(bad))
-    if len(cited & fact_ids) < min(5, len(fact_ids)):
-        p.append(f"cite at least {min(5, len(fact_ids))} different facts inline, like [F1]")
+    need = min(10, max(5, len(fact_ids) * 2 // 3), len(fact_ids))
+    if len(cited & fact_ids) < need:
+        p.append(f"cite at least {need} different facts inline, like [F1] (cites {len(cited & fact_ids)}); "
+                 "use more of the research")
     for n in c.get("numbers") or []:
         if n.get("fact") not in fact_ids:
             p.append(f"numbers entry '{str(n.get('figure'))[:30]}' must name its fact id")
             break
-    everything = " \n".join(_all_texts(article)).lower()
-    strong = [t for t in _STRONG_TELLS if t in everything]
-    soft = [t for t in _SOFT_TELLS if t in everything]
+    raw_all = " \n".join(_all_texts(article))
+    everything = raw_all.lower()
+    strong = [t for t in _STRONG_TELLS if _has_phrase(everything, t)]
+    soft = [t for t in _SOFT_TELLS if _has_phrase(everything, t)]
+    openers = _ADVERB_OPENERS.findall(raw_all)
+    if len(openers) >= 2:
+        p.append("don't open sentences with " + ", ".join(sorted(set(openers))) + "; connect ideas through the argument")
     if strong:
         p.append("remove these phrases: " + ", ".join(strong))
     if len(soft) >= 3:
@@ -1104,6 +1266,12 @@ def check_article(article: Dict[str, Any], facts: List[Dict[str, Any]], cfg: Opt
     if is_blocked(everything):
         p.append("touches a political, tragic or divisive subject: " + (_BLOCK_RE.search(everything).group(0)))
     return p
+
+
+def _has_phrase(text: str, phrase: str) -> bool:
+    """Whole-word match ('realm' must not hit 'Realme'); a phrase ending in a letter stem ('revolutioni') is a prefix."""
+    tail = "" if phrase.endswith("i") else r"(?![a-z])"
+    return re.search(r"(?<![a-z])" + re.escape(phrase) + tail, text) is not None
 
 
 TOPIC_LABELS = {"strategy": "Strategy", "marketing": "Marketing", "finance": "Finance", "operations": "Operations",
@@ -1126,21 +1294,27 @@ def _serious(problems: List[str]) -> List[str]:
 # =============================================================================
 # 5. Critic, related practice, citations
 # =============================================================================
-_CRITIC_SYSTEM = """You are the editor-in-chief of MECE Insights. Would this article hold its own next to a good Mint \
-or ET Prime explainer or a consulting insight piece? Readers: Indian MBA students and MBA aspirants (GD/PI/WAT).
-Score 0-100, harshly, on: insight (does it explain the business underneath, not just repeat news?), accuracy and \
-grounding (claims match the listed facts, nothing invented), clarity and voice (reads like a skilled human writer), \
-usefulness to the reader (could they speak on this in a GD or interview?), and structure. Generic or padded: under 50.
+_CRITIC_SYSTEM = """You are the editor-in-chief of MECE Insights. Would this essay hold its own next to a feature in \
+Mint, The Ken or ET Prime? Readers: Indian MBA students and MBA aspirants (GD/PI/WAT).
+Score 0-100, harshly, on: depth (does it explain how the business works, with history, comparison and the other \
+side, or does it just restate the news?), accuracy and grounding (claims match the listed facts, nothing invented), \
+voice (reads like a skilled human writer: concrete, varied, no stock phrases; anything that sounds generated scores \
+under 60), usefulness (could the reader speak on this in a GD or interview?), and structure. Generic or padded: under 50.
 Return ONLY JSON: {"score": <int>, "publishable": <bool>, "notes": "the two most important improvements, or why it \
 is strong, in one or two sentences"}. publishable is true only if score >= 80 and nothing is invented."""
 
 
+def critic_models() -> List[str]:
+    return [m.strip() for m in (os.getenv("DAILY_BLOG_CRITIC_MODEL") or _gemini_default()).split(",") if m.strip()]
+
+
 def critique(chat: Callable, article: Dict[str, Any], facts: List[Dict[str, Any]]) -> Dict[str, Any]:
     try:
-        data, resp, model, provider = _chat_json(
+        data, resp, model, provider = _llm_json(
             chat, "seo_critique", _CRITIC_SYSTEM,
-            f"FACTS:\n{_facts_block(facts)}\n\nDRAFT:\n{json.dumps(article, ensure_ascii=False)[:12000]}",
-            max_tokens=300, temperature=0.0)
+            f"FACTS:\n{_facts_block(facts)}\n\nDRAFT:\n{json.dumps(article, ensure_ascii=False)[:24000]}",
+            models=critic_models(),
+            max_tokens=400, temperature=0.0)
         raw = data.get("score")
         return {"score": int(raw) if isinstance(raw, (int, float)) else None,
                 "publishable": bool(data.get("publishable")), "notes": str(data.get("notes") or "")[:600],
@@ -1338,16 +1512,7 @@ def _run(supabase, *, user_id, force, publish, dry_run, now, deps, notify_failur
             break
         hook = cand.get("headline") or {}
         angle = cand.get("angle") or hook.get("title") or ""
-        t0 = time.time()
-        res = research(angle, hook, grounded=deps["grounded"], resolve=deps["resolve"], fetch=deps.get("fetch"),
-                       web_search=deps.get("web_search"))
-        u = res.get("usage") or {}
-        _log(log, user_id, "research", ((res.get("engines") or ["research:unknown"])[0]).split(":", 1)[-1],
-             SimpleNamespace(id=None, usage=SimpleNamespace(prompt_tokens=u.get("prompt"), completion_tokens=u.get("completion"),
-                                                            total_tokens=(u.get("prompt") or 0) + (u.get("completion") or 0))),
-             t0, facts=len(res.get("facts") or []), linked=res.get("linked"))
-        trace["research"].append({"angle": angle, "facts": len(res.get("facts") or []), "linked": res.get("linked", 0),
-                                  "engines": res.get("engines"), "errors": res.get("errors")})
+        res = _research_logged(angle, hook, deps=deps, user_id=user_id, trace=trace)
         if res.get("linked", 0) < cfg["min_linked_facts"]:
             continue
         page = _write_and_save(supabase, cand, angle, res["facts"], cfg=cfg, deps=deps, user_id=user_id, now=now,
@@ -1364,8 +1529,20 @@ def _run(supabase, *, user_id, force, publish, dry_run, now, deps, notify_failur
     return {"status": "skipped", "reason": reason, "trace": trace}
 
 
-def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, publish, dry_run, trace):
-    chat, log, review = deps["chat"], deps.get("log") or (lambda **k: None), deps.get("review")
+def _merge_missing(new: Dict[str, Any], old: Dict[str, Any]) -> Dict[str, Any]:
+    """An edited article keeps any field the editor dropped (art, aspirants, numbers…)."""
+    out = dict(old)
+    out.update({k: v for k, v in new.items() if k != "content" and v})
+    oc, nc = dict(old.get("content") or {}), dict(new.get("content") or {})
+    oc.update({k: v for k, v in nc.items() if v})
+    out["content"] = oc
+    return out
+
+
+def compose(supabase, cand: Dict[str, Any], angle: str, facts: List[Dict[str, Any]], *, cfg: Dict[str, Any],
+            deps: Dict[str, Callable], user_id, trace: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Write, check, repair, line-edit, critique and cite one essay. None if the writer failed."""
+    chat, log = deps["chat"], deps.get("log") or (lambda **k: None)
     hook = cand.get("headline") or {}
     t0 = time.time()
     try:
@@ -1381,15 +1558,31 @@ def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, pu
             break
         t0 = time.time()
         try:
-            fixed, resp, model, provider = write_article(chat, angle, hook, facts, problems, article)
+            fixed, resp, model2, provider2 = write_article(chat, angle, hook, facts, problems, article)
         except Exception as e:  # noqa: BLE001
             trace["repair_error"] = f"{type(e).__name__}"
             break
-        _log(log, user_id, f"repair{rnd + 1}", model, resp, t0, provider=provider)
+        _log(log, user_id, f"repair{rnd + 1}", model2, resp, t0, provider=provider2)
+        fixed = _merge_missing(fixed, article)
         fixed_problems = check_article(fixed, facts, cfg)
         if len(_serious(fixed_problems)) < len(_serious(problems)) or \
                 (len(_serious(fixed_problems)) == len(_serious(problems)) and len(fixed_problems) <= len(problems)):
             article, problems = fixed, fixed_problems
+    if deps.get("edit", True):  # the line edit: a human voice, same facts
+        t0 = time.time()
+        try:
+            edited, resp, model3, provider3 = edit_article(chat, article, facts)
+            _log(log, user_id, "edit", model3, resp, t0, provider=provider3)
+            edited = _merge_missing(edited, article)
+            ep = check_article(edited, facts, cfg)
+            if len(_serious(ep)) <= len(_serious(problems)) and len(ep) <= len(problems) \
+                    and word_count(edited) >= 0.85 * word_count(article):
+                article, problems = edited, ep
+                trace["edited"] = True
+            else:
+                trace["edit_discarded"] = ep[:4]
+        except Exception as e:  # noqa: BLE001
+            trace["edit_error"] = f"{type(e).__name__}: {str(e)[:120]}"
     review_note = critique(chat, article, facts)
     related = related_practice(supabase, article, angle)
     cited, sources = apply_citations(article, facts)
@@ -1399,44 +1592,79 @@ def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, pu
                     "topic_label": topic_label(article, cand.get("domain") or ""),
                     "pull_quote": re.sub(r"\s*\[\d+(?:,\d+)*\]", "", str(content.get("pull_quote") or "")).strip()})
     content.pop("topic", None)
+    return {
+        "title": (cited.get("title") or angle).strip()[:120],
+        "meta_description": (cited.get("meta_description") or "").strip()[:300],
+        "dek": (cited.get("dek") or "").strip()[:300],
+        "content": content,
+        "source_refs": [{"label": x["label"], "url": x["url"]} for x in sources if x.get("url")],
+        "keywords": [str(k)[:60] for k in (cited.get("keywords") or [])][:8],
+        "quality_score": review_note.get("score"),
+        "quality_notes": ("; ".join(problems) + (" | " if problems else "") + (review_note.get("notes") or ""))[:900],
+        "model": model,
+        "_art": art, "_problems": problems, "_review": review_note, "_provider": provider,
+    }
 
+
+def illustrate(supabase, slug: str, art: Dict[str, Any], title: str, *, deps: Dict[str, Callable], user_id,
+               article: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Pictures for an essay: (result, art direction used). Plans the art first if the writer gave none."""
+    make = deps.get("images")
+    if make is None:
+        return {"images": [], "errors": []}, art or {}
+    if not art or not (art.get("hero") or art.get("inline")):
+        from services.growth import images
+        art = images.art_plan(deps["chat"], article or {"title": title})
+    if not art:
+        return {"images": [], "errors": ["no art direction (the picture planner failed)"]}, {}
+    t0 = time.time()
+    try:
+        pics = make(supabase, slug, art, title=title)
+    except Exception as e:  # noqa: BLE001
+        pics = {"images": [], "errors": [f"{type(e).__name__}: {str(e)[:200]}"]}
+    _log(deps.get("log") or (lambda **k: None), user_id, "images", "pictures", None, t0,
+         made=len(pics.get("images") or []) + (1 if pics.get("hero") else 0), errors=pics.get("errors"),
+         sources=[x.get("source") for x in ([pics.get("hero")] if pics.get("hero") else []) + (pics.get("images") or [])])
+    return pics, art
+
+
+def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, publish, dry_run, trace, kind=KIND):
+    review = deps.get("review")
+    hook = cand.get("headline") or {}
+    out = compose(supabase, cand, angle, facts, cfg=cfg, deps=deps, user_id=user_id, trace=trace)
+    if out is None:
+        return None
+    problems, review_note, art = out.pop("_problems"), out.pop("_review"), out.pop("_art")
+    provider = out.pop("_provider")
+    content = out["content"]
     want_publish = cfg["autopublish"] if publish is None else bool(publish)
     passes = (not problems and review_note.get("score") is not None and review_note["score"] >= cfg["min_score"]
               and review_note.get("publishable"))
     status = "published" if (want_publish and passes) else "draft"
-    title = (cited.get("title") or angle).strip()[:120]
-    slug = _unique_slug(supabase, _slugify(title))
+    slug = _unique_slug(supabase, _slugify(out["title"]))
     pics: Dict[str, Any] = {"images": [], "errors": []}
-    make = deps.get("images")
-    if make is not None and art and not dry_run:
-        t0 = time.time()
-        pics = make(supabase, slug, art)
-        _log(log, user_id, "images", "gemini-image", None, t0, made=len(pics.get("images") or []) + (1 if pics.get("hero") else 0),
-             errors=pics.get("errors"))
+    if not dry_run:
+        pics, art = illustrate(supabase, slug, art, out["title"], deps=deps, user_id=user_id,
+                               article={"title": out["title"], "dek": out["dek"], "keywords": out["keywords"],
+                                        "content": content})
     if pics.get("hero"):
         content["hero"] = pics["hero"]
     if pics.get("images"):
         content["images"] = pics["images"]
     row = {
         "slug": slug,
-        "kind": KIND,
-        "title": title,
-        "meta_description": (cited.get("meta_description") or "").strip()[:300],
-        "dek": (cited.get("dek") or "").strip()[:300],
+        "kind": kind,
+        **out,
         "content": content,
-        "source_refs": [{"label": s["label"], "url": s["url"]} for s in sources if s.get("url")],
         "topic": angle[:280],
-        "keywords": [str(k)[:60] for k in (cited.get("keywords") or [])][:8],
         "status": status,
-        "quality_score": review_note.get("score"),
-        "quality_notes": ("; ".join(problems) + (" | " if problems else "") + (review_note.get("notes") or ""))[:900],
-        "model": model,
         "agent_meta": {"ist_date": trace["ist_date"], "domain": cand.get("domain"), "reasons": cand.get("reasons"),
                        "topic_source": "news" if hook else "evergreen", "facts": len(facts),
                        "linked_facts": sum(1 for f in facts if f.get("linked")),
                        "problems": problems, "serious_problems": _serious(problems),
                        "critic": {k: review_note.get(k) for k in ("score", "publishable", "model")},
-                       "writer_provider": provider, "research_models": cfg["research_models"],
+                       "writer_provider": provider, "edited": bool(trace.get("edited")),
+                       "research_models": cfg["research_models"],
                        "art": art, "image_errors": pics.get("errors") or [],
                        "review": "auto" if status == "published" else "pending"},
         "source_headline_id": hook.get("id"),
@@ -1463,6 +1691,157 @@ def _write_and_save(supabase, cand, angle, facts, *, cfg, deps, user_id, now, pu
     return {"status": status, "reason": why, "page": page, "trace": trace}
 
 
+def _research_logged(angle, hook, *, deps, user_id, trace) -> Dict[str, Any]:
+    t0 = time.time()
+    res = research(angle, hook, grounded=deps["grounded"], resolve=deps["resolve"], fetch=deps.get("fetch"),
+                   web_search=deps.get("web_search"))
+    u = res.get("usage") or {}
+    _log(deps.get("log") or (lambda **k: None), user_id, "research",
+         ((res.get("engines") or ["research:unknown"])[0]).split(":", 1)[-1],
+         SimpleNamespace(id=None, usage=SimpleNamespace(prompt_tokens=u.get("prompt"), completion_tokens=u.get("completion"),
+                                                        total_tokens=(u.get("prompt") or 0) + (u.get("completion") or 0))),
+         t0, facts=len(res.get("facts") or []), linked=res.get("linked"))
+    trace.setdefault("research", []).append({"angle": angle, "facts": len(res.get("facts") or []),
+                                             "linked": res.get("linked", 0), "engines": res.get("engines"),
+                                             "errors": res.get("errors")})
+    return res
+
+
+def _domain_of(text: str) -> str:
+    hits = domain_hits(text)
+    return max(hits, key=hits.get) if hits else ""
+
+
+def write_on(supabase, *, headline_id: Optional[str] = None, topic: Optional[str] = None, user_id=None,
+             deps: Optional[Dict[str, Callable]] = None, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Admin -> Growth "Generate a draft": one full essay on a chosen headline or topic, through the same research,
+    writing, checks and pictures as the daily post (saved as a draft and sent to Telegram for review)."""
+    deps = deps or _default_deps()
+    now = now or datetime.now(timezone.utc)
+    cfg = config()
+    hook: Dict[str, Any] = {}
+    if headline_id:
+        try:
+            r = supabase.table("news_headlines").select("*").eq("id", headline_id).limit(1).execute()
+            hook = (r.data or [{}])[0]
+        except Exception:
+            hook = {}
+    if not hook and not topic:
+        cands = candidate_topics(supabase, now)
+        if cands:
+            hook = cands[0].get("headline") or {}
+    angle = (topic or hook.get("title") or "").strip()
+    if not angle:
+        return {"status": "skipped", "reason": "no topic: type one, or wait for fresh news"}
+    cand = {"headline": hook, "angle": angle, "domain": _domain_of(angle), "reasons": ["requested in Admin -> Growth"]}
+    trace: Dict[str, Any] = {"ist_date": now.astimezone(IST).date().isoformat(), "research": []}
+    res = _research_logged(angle, hook, deps=deps, user_id=user_id, trace=trace)
+    if res.get("linked", 0) < cfg["min_linked_facts"]:
+        return {"status": "skipped", "trace": trace,
+                "reason": f"only {res.get('linked', 0)} facts tied to a source (needs {cfg['min_linked_facts']}); "
+                          "try a more specific topic"}
+    out = _write_and_save(supabase, cand, angle, res["facts"], cfg=cfg, deps=deps, user_id=user_id, now=now,
+                          publish=False, dry_run=False, trace=trace, kind="news_case")
+    return out or {"status": "skipped", "reason": "writing failed: " + "; ".join(trace.get("write_errors") or ["unknown"]),
+                   "trace": trace}
+
+
+_REWRITE_FIELDS = ("title", "meta_description", "dek", "content", "source_refs", "keywords", "quality_score",
+                   "quality_notes", "model")
+
+
+def rewrite_page(supabase, page_id: str, *, user_id=None, deps: Optional[Dict[str, Callable]] = None,
+                 now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Re-research and rewrite an existing post as a full essay with pictures (same slug, so links keep working).
+    A draft is replaced in place and sent for review. A live post keeps its current version until the owner
+    approves the rewrite (reply publish on Telegram, or "Apply the rewrite" in Admin -> Growth)."""
+    deps = deps or _default_deps()
+    now = now or datetime.now(timezone.utc)
+    cfg = config()
+    try:
+        rows = supabase.table("seo_pages").select("*").eq("id", page_id).limit(1).execute().data or []
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"database: {type(e).__name__}"}
+    if not rows:
+        return {"ok": False, "reason": "not found"}
+    page = rows[0]
+    hook: Dict[str, Any] = {}
+    if page.get("source_headline_id"):
+        try:
+            r = supabase.table("news_headlines").select("*").eq("id", page["source_headline_id"]).limit(1).execute()
+            hook = (r.data or [{}])[0]
+        except Exception:
+            hook = {}
+    refs = page.get("source_refs") or []
+    if not hook and refs and refs[0].get("url"):
+        hook = {"title": page.get("topic") or page.get("title"), "source_url": refs[0]["url"],
+                "source_name": refs[0].get("label") or ""}
+    angle = (page.get("topic") or page.get("title") or "").strip()
+    meta = dict(page.get("agent_meta") or {})
+    cand = {"headline": hook, "angle": angle, "domain": meta.get("domain") or _domain_of(angle + " " + (page.get("title") or "")),
+            "reasons": ["rewrite of an existing post"]}
+    trace: Dict[str, Any] = {"ist_date": now.astimezone(IST).date().isoformat(), "research": []}
+    res = _research_logged(angle, hook, deps=deps, user_id=user_id, trace=trace)
+    if res.get("linked", 0) < cfg["min_linked_facts"]:
+        return {"ok": False, "trace": trace,
+                "reason": f"only {res.get('linked', 0)} facts tied to a source (needs {cfg['min_linked_facts']}); kept as it is"}
+    out = compose(supabase, cand, angle, res["facts"], cfg=cfg, deps=deps, user_id=user_id, trace=trace)
+    if out is None:
+        return {"ok": False, "reason": "writing failed: " + "; ".join(trace.get("write_errors") or ["unknown"]), "trace": trace}
+    problems, review_note, art = out.pop("_problems"), out.pop("_review"), out.pop("_art")
+    out.pop("_provider", None)
+    pics, art = illustrate(supabase, page["slug"], art, out["title"], deps=deps, user_id=user_id,
+                           article={"title": out["title"], "dek": out["dek"], "keywords": out["keywords"],
+                                    "content": out["content"]})
+    if pics.get("hero"):
+        out["content"]["hero"] = pics["hero"]
+    if pics.get("images"):
+        out["content"]["images"] = pics["images"]
+    fields = {k: out[k] for k in _REWRITE_FIELDS}
+    meta.update({"art": art, "image_errors": pics.get("errors") or [], "problems": problems,
+                 "serious_problems": _serious(problems), "facts": len(res["facts"]),
+                 "linked_facts": res.get("linked", 0), "domain": cand["domain"],
+                 "critic": {k: review_note.get(k) for k in ("score", "publishable", "model")},
+                 "rewritten_at": now.isoformat(), "review": "pending"})
+    live = page.get("status") == "published"
+    try:
+        if live:
+            meta["pending_rewrite"] = fields
+            supabase.table("seo_pages").update({"agent_meta": meta}).eq("id", page_id).execute()
+        else:
+            supabase.table("seo_pages").update({**fields, "agent_meta": meta}).eq("id", page_id).execute()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"not saved: {type(e).__name__}", "trace": trace}
+    sent = False
+    review = deps.get("review")
+    if review is not None:
+        try:
+            sent = review.send_for_review(supabase, {**page, **fields, "agent_meta": meta, "status": "draft",
+                                                     "_rewrite_of_live": live})
+        except Exception as e:  # noqa: BLE001
+            trace["telegram_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+    return {"ok": True, "live": live, "sent": bool(sent), "title": fields["title"], "words": fields["content"].get("words"),
+            "sources": len(fields["content"].get("sources") or []), "score": fields["quality_score"],
+            "problems": problems, "pictures": (1 if pics.get("hero") else 0) + len(pics.get("images") or []),
+            "image_errors": pics.get("errors") or [],
+            "reason": ("rewrite ready: the live version stays until you approve it" if live else "draft rewritten")
+                      + (" (sent to Telegram)" if sent else "")}
+
+
+def drop_rewrite(supabase, page_id: str, *, via: str = "admin") -> bool:
+    try:
+        rows = supabase.table("seo_pages").select("agent_meta").eq("id", page_id).limit(1).execute().data or []
+        if not rows:
+            return False
+        meta = dict(rows[0].get("agent_meta") or {})
+        meta.pop("pending_rewrite", None)
+        meta.update({"review": "rewrite_dropped", "reviewed_via": via})
+        supabase.table("seo_pages").update({"agent_meta": meta}).eq("id", page_id).execute()
+        return True
+    except Exception:
+        return False
+
+
 def publish_page(supabase, page_id: str, *, via: str = "admin", now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
     """Publish one seo_pages row (also used by the Telegram reply). Returns the updated row or None."""
     now = now or datetime.now(timezone.utc)
@@ -1473,9 +1852,19 @@ def publish_page(supabase, page_id: str, *, via: str = "admin", now: Optional[da
             return None
         meta = dict(rows[0].get("agent_meta") or {})
         meta.update({"review": "published", "reviewed_via": via, "reviewed_at": now.isoformat()})
-        up = (supabase.table("seo_pages").update({"status": "published", "published_at": now.isoformat(),
-                                                  "agent_meta": meta}).eq("id", page_id).execute())
-        return (up.data or [dict(rows[0], status="published")])[0]
+        patch: Dict[str, Any] = {"status": "published", "published_at": now.isoformat()}
+        pending = meta.pop("pending_rewrite", None)
+        if pending:  # a rewrite of a live post: swap the content in, keep the date and the link
+            full = (supabase.table("seo_pages").select("title, dek, content, published_at").eq("id", page_id)
+                    .limit(1).execute().data or [{}])[0]
+            meta["previous_version"] = {"title": full.get("title"), "dek": full.get("dek"), "content": full.get("content"),
+                                        "replaced_at": now.isoformat()}
+            patch.update({k: v for k, v in pending.items() if k in _REWRITE_FIELDS})
+            if full.get("published_at") or rows[0].get("status") == "published":
+                patch["published_at"] = full.get("published_at") or now.isoformat()
+        patch["agent_meta"] = meta
+        up = supabase.table("seo_pages").update(patch).eq("id", page_id).execute()
+        return (up.data or [dict(rows[0], **patch)])[0]
     except Exception:
         return None
 
@@ -1531,10 +1920,12 @@ def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make:
         return {"ok": False, "reason": "not found"}
     page = rows[0]
     meta = dict(page.get("agent_meta") or {})
-    art = meta.get("art") or images.art_plan(chat, page)
+    art = meta.get("art") or {}
+    if not any((art.get("hero") or {}).get(k) for k in ("search", "subject")):  # older plans had no photo search
+        art = images.art_plan(chat, page) or art
     if not art:
         return {"ok": False, "reason": "could not plan the images"}
-    pics = make(supabase, page["slug"], art)
+    pics = make(supabase, page["slug"], art, title=page.get("title") or "")
     content = dict(page.get("content") or {})
     if pics.get("hero"):
         content["hero"] = pics["hero"]
@@ -1545,4 +1936,22 @@ def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make:
     meta.update({"art": art, "image_errors": pics.get("errors") or []})
     supabase.table("seo_pages").update({"content": content, "agent_meta": meta}).eq("id", page_id).execute()
     return {"ok": bool(pics.get("hero") or pics.get("images")), "hero": pics.get("hero"),
-            "images": len(pics.get("images") or []), "errors": pics.get("errors") or []}
+            "images": len(pics.get("images") or []), "errors": pics.get("errors") or [],
+            "sources": [x.get("source") for x in ([pics.get("hero")] if pics.get("hero") else []) + (pics.get("images") or [])]}
+
+
+def backfill_images(supabase, *, limit: int = 3, chat: Optional[Callable] = None,
+                    make: Optional[Callable] = None) -> Dict[str, Any]:
+    """Pictures for published posts that have none, newest first, a few per call (each takes ~30-60 s)."""
+    try:
+        rows = (supabase.table("seo_pages").select("id, slug, title, content").eq("status", "published")
+                .order("published_at", desc=True).limit(200).execute().data or [])
+    except Exception as e:  # noqa: BLE001
+        return {"done": [], "remaining": None, "error": type(e).__name__}
+    todo = [r for r in rows if not ((r.get("content") or {}).get("hero") or {}).get("url")]
+    done = []
+    for r in todo[:limit]:
+        res = add_images(supabase, r["id"], chat=chat, make=make)
+        done.append({"id": r["id"], "title": r.get("title"), "ok": res.get("ok"), "errors": (res.get("errors") or [])[:3],
+                     "sources": res.get("sources")})
+    return {"done": done, "remaining": max(0, len(todo) - limit)}

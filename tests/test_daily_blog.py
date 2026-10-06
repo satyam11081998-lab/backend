@@ -12,6 +12,7 @@ only, secret token).
 """
 
 import json
+import re
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -150,11 +151,18 @@ def good_article(**over):
                            "Average orders reached ₹520 [F4]."],
             "lede": "India's quick-commerce apps grew orders 74% in FY25 [F2], and the race has moved from opening "
                     "stores to filling them, with about 5,000 dark stores now running [F3].",
-            "sections": [{"heading": "What happened?", "paragraphs": [para(150, "[F2]"),
-                                                                      "The apps keep adding dark stores [F1]."]},
-                         {"heading": "Why does it matter?", "paragraphs": [para(150, "[F3]")]},
-                         {"heading": "How do the economics work?", "paragraphs": [para(170, "[F4]")]},
-                         {"heading": "Where is the debate?", "paragraphs": [para(150, "[F5]")]}],
+            "sections": [{"heading": "The race moved from opening stores to filling them",
+                          "paragraphs": [para(150, "[F2]"), "The apps keep adding dark stores in the same "
+                                         "neighbourhoods, because a store that is close is a store that is fast [F1].",
+                                         para(60, "[F2]")]},
+                         {"heading": "A dark store is a fixed cost looking for orders",
+                          "paragraphs": [para(150, "[F3]"), para(80, "[F3]")]},
+                         {"heading": "Bigger baskets carry the same delivery cost",
+                          "paragraphs": [para(170, "[F4]"), para(80, "[F4]")]},
+                         {"heading": "Why 1,300 orders a day is the number to watch",
+                          "paragraphs": [para(150, "[F5]"), para(80, "[F5]")]},
+                         {"heading": "Kiranas still own credit and familiarity",
+                          "paragraphs": [para(120, "[F2]"), para(70, "[F3]")]}],
             "numbers": [{"figure": "74%", "what": "order growth in FY25", "fact": "F2"},
                         {"figure": "5,000", "what": "dark stores", "fact": "F3"},
                         {"figure": "₹520", "what": "average order value", "fact": "F4"},
@@ -185,15 +193,25 @@ def good_article(**over):
 
 
 class Chat:
-    """Fake chat_with_fallback: editor -> writer (scripted drafts) -> critic."""
+    """Fake chat_with_fallback: topic editor, writer (scripted drafts), line editor (scripted or unchanged), critic."""
 
-    def __init__(self, drafts, score=86, fail_writes=0):
-        self.drafts, self.score, self.calls, self.fail_writes = list(drafts), score, [], fail_writes
+    def __init__(self, drafts, score=86, fail_writes=0, edit=None):
+        self.drafts, self.score, self.calls, self.fail_writes, self.edit = list(drafts), score, [], fail_writes, edit
 
     def __call__(self, feature, messages, **_kw):
         system = messages[0]["content"]
         self.calls.append(feature)
-        if "editor of MECE Insights" in system:
+        if "line editor of MECE Insights" in system:
+            self.calls[-1] = "line_edit"
+            body = self.edit(json.loads(messages[1]["content"].split("DRAFT:\n", 1)[1])) if self.edit else \
+                json.loads(messages[1]["content"].split("DRAFT:\n", 1)[1])
+        elif "picture editor of MECE Insights" in system:
+            body = {"hero": {"subject": "Bombay House, the Tata group headquarters in Mumbai",
+                             "search": ["Bombay House Mumbai"], "prompt": "A colonial stone building in Mumbai",
+                             "alt": "Bombay House", "caption": "Where the group is run"},
+                    "inline": [{"after_section": 2, "subject": "Tata Steel Jamshedpur plant", "search": ["Tata Steel Jamshedpur"],
+                                "prompt": "A steel plant at dusk", "alt": "A steel plant", "caption": "The old core"}]}
+        elif "editor of MECE Insights" in system:
             body = {"order": [0], "angle": "How quick commerce makes money in India", "why": "broad"}
         elif feature == "seo_writer":
             if self.fail_writes:
@@ -222,7 +240,7 @@ class Review:
 made_images = []
 
 
-def fake_images(_sb, slug, art):
+def fake_images(_sb, slug, art, **_kw):
     made_images.append((slug, art))
     return {"hero": {"url": f"https://cdn.example/{slug}/hero.webp", "og_url": f"https://cdn.example/{slug}/og.jpg",
                      "width": 2000, "height": 1125, "alt": art["hero"]["alt"], "caption": art["hero"]["caption"],
@@ -269,13 +287,21 @@ def check(name, cond):
 def env(**kv):
     for k in ("DAILY_BLOG_ENABLED", "DAILY_BLOG_AUTOPUBLISH", "DAILY_BLOG_MIN_SCORE", "DAILY_BLOG_WRITER_MODEL",
               "TELEGRAM_BOT_TOKEN", "TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CHAT_ID", "RENDER_EXTERNAL_URL",
-              "DAILY_BLOG_RESEARCH_MODEL", "GEMINI_MODEL"):
+              "DAILY_BLOG_RESEARCH_MODEL", "GEMINI_MODEL", "DAILY_BLOG_MIN_FACTS", "DAILY_BLOG_EDITOR_MODEL",
+              "DAILY_BLOG_CRITIC_MODEL", "DAILY_BLOG_PICTURES", "DAILY_BLOG_IMAGE_MODEL"):
         os.environ.pop(k, None)
+    # the fake research finds 5 linked facts; production needs 6 (checked below)
+    os.environ["DAILY_BLOG_MIN_FACTS"] = "4"
     for k, v in kv.items():
         os.environ[k] = v
 
 
 env()
+# no real model calls from the tests: the named-model chain (Gemini Pro writer, Gemini critic) is empty here, so
+# every call goes to the fake chat
+_orig_writer_models = db.writer_models
+db.writer_models = lambda: []
+db.critic_models = lambda: []
 # ---------------------------------------------------------------------------- topics
 print("topic selection")
 sb = FakeSupabase(base_tables())
@@ -487,7 +513,7 @@ old_post = {"id": "p-old", "slug": "old-post", "title": "How UPI makes money", "
             "agent_meta": {"domain": "finance"}}
 sb = FakeSupabase({"seo_pages": [json.loads(json.dumps(old_post))]})
 res = db.add_images(sb, "p-old", chat=_ArtChat(),
-                    make=lambda s, slug, a: im.make_images(s, slug, a, generate=fake_gen, upload=fake_upload))
+                    make=lambda s, slug, a, **kw: im.make_images(s, slug, a, generate=fake_gen, upload=fake_upload, order=["gemini"], **kw))
 row = sb.tables["seo_pages"][0]
 check("pictures can be added to an older post (art planned from the article)",
       res["ok"] and row["content"]["hero"]["url"].startswith("https://store.example/old-post/hero-")
@@ -522,7 +548,8 @@ seen = []
 
 def thin_then_good(prompt, model):
     seen.append(prompt)
-    return thin if len(seen) <= 4 else fake_grounded(prompt, model)  # the first topic finds nothing
+    first = re.search(r'"([^"]+)"', seen[0]).group(1)
+    return thin if f'"{first}"' in prompt else fake_grounded(prompt, model)  # the first topic finds nothing
 
 
 sb = FakeSupabase(base_tables())
@@ -612,6 +639,217 @@ check("'reject' drops the newest waiting draft", r.get("action") == "rejected" a
 check("commands are read loosely but safely",
       tg.parse_command("Publish!") == "publish" and tg.parse_command("approve it") == "publish"
       and tg.parse_command("yes") == "" and tg.parse_command("/another") == "another")
+
+# ---------------------------------------------------------------------------- voice and depth (v4)
+print("voice and depth")
+env()
+bad = renumber(good_article(title="Tata's Ownership: A Case for Wealth as Public Trust"))
+check("a colon title (the machine pattern) is caught", any(p.startswith("title:") for p in db.check_article(bad, facts, cfg)))
+bad = renumber(good_article(title="Quick Commerce Explained for MBA Aspirants"))
+check("stock title phrasing is caught", any("stock phrasing" in p for p in db.check_article(bad, facts, cfg)))
+bad = renumber(good_article(dek="Learn to analyze quick commerce in interviews."))
+check("a 'Learn to…' dek is caught", any(p.startswith("dek:") for p in db.check_article(bad, facts, cfg)))
+bad = renumber(good_article())
+bad["content"]["sections"][0]["heading"] = "What happened?"
+bad["content"]["sections"][1]["heading"] = "The Way Forward"
+check("label headings are caught", any("headings must say something" in p for p in db.check_article(bad, facts, cfg)))
+bad = renumber(good_article())
+bad["content"]["sections"][2]["paragraphs"] = bad["content"]["sections"][2]["paragraphs"][:1]
+check("a one-paragraph section is caught", any("too thin" in p for p in db.check_article(bad, facts, cfg)))
+bad = renumber(good_article())
+bad["content"]["lede"] += " Additionally, stores matter. Moreover, speed matters."
+check("sentences opening with Additionally/Moreover are caught",
+      any("don't open sentences" in p for p in db.check_article(bad, facts, cfg)))
+ok = renumber(good_article())
+ok["content"]["sections"][4]["paragraphs"][1] += " Realme phones sell on the same apps."
+check("whole-word matching: 'Realme' is not the stock word 'realm'",
+      not any("realm" in p for p in db.check_article(ok, facts, cfg)))
+check("production needs 6 linked facts and 1,300+ words", (os.environ.pop("DAILY_BLOG_MIN_FACTS", None) or True)
+      and db.config()["min_linked_facts"] == 6 and db.config()["min_words"] == 1300)
+env()
+
+
+def humanise(draft):
+    d = json.loads(json.dumps(draft))
+    d["content"]["lede"] = d["content"]["lede"].replace("India's quick-commerce apps", "Quick-commerce apps in India")
+    return d
+
+
+chat = Chat([GOOD], edit=humanise)
+sb = FakeSupabase(base_tables())
+res = db.run_daily(sb, now=NOW, deps=deps(chat, Review()))
+check("every essay gets a line edit for voice, and the edit is kept when it passes the checks",
+      "line_edit" in chat.calls and res["page"]["content"]["lede"].startswith("Quick-commerce apps in India")
+      and res["page"]["agent_meta"]["edited"])
+
+
+def invent(draft):
+    d = json.loads(json.dumps(draft))
+    d["content"]["lede"] += f" Profits were ₹7,777 crore [{fid['74%']}]."
+    return d
+
+
+sb = FakeSupabase(base_tables())
+res = db.run_daily(sb, now=NOW, deps=deps(Chat([GOOD], edit=invent), Review()))
+check("an edit that invents a number is thrown away", "7777" not in json.dumps(res["page"]["content"])
+      and not res["page"]["agent_meta"]["edited"])
+db._discovered.update(at=10 ** 12, all=["gemini-9.1-pro-preview", "gemini-9.1-pro", "gemini-9.1-flash", "gemini-8-pro"])
+check("the writer is the newest Gemini Pro on the key, stable before preview, then the default",
+      _orig_writer_models()[:3] == ["gemini-9.1-pro", "gemini-9.1-pro-preview", "gemini-3.6-flash"])
+env(DAILY_BLOG_WRITER_MODEL="gpt-9, gemini-x")
+check("DAILY_BLOG_WRITER_MODEL wins (comma-separated)", _orig_writer_models() == ["gpt-9", "gemini-x"])
+env()
+db._discovered.update(at=0.0, models=[], all=[])
+
+# ---------------------------------------------------------------------------- real photos
+print("real photos")
+COMMONS = {"query": {"pages": {
+    "11": {"index": 2, "title": "File:Bombay House, Mumbai.jpg", "imageinfo": [{
+        "url": "https://upload.wikimedia.org/wikipedia/commons/a/ab/Bombay_House%2C_Mumbai.jpg",
+        "thumburl": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Bombay_House%2C_Mumbai.jpg/1920px-Bombay_House%2C_Mumbai.jpg",
+        "width": 4000, "height": 2600, "mime": "image/jpeg",
+        "descriptionurl": "https://commons.wikimedia.org/wiki/File:Bombay_House,_Mumbai.jpg",
+        "extmetadata": {"LicenseShortName": {"value": "CC BY-SA 4.0"},
+                        "LicenseUrl": {"value": "https://creativecommons.org/licenses/by-sa/4.0"},
+                        "Artist": {"value": "<a href=\"//commons.wikimedia.org/wiki/User:Ravi\">Ravi K</a>"}}}]},
+    "12": {"index": 1, "title": "File:Tata logo.png", "imageinfo": [{
+        "url": "https://upload.wikimedia.org/wikipedia/commons/c/cd/Tata_logo.png", "width": 2000, "height": 800,
+        "mime": "image/png", "extmetadata": {"LicenseShortName": {"value": "Public domain"}}}]},
+    "13": {"index": 3, "title": "File:Mumbai street.jpg", "imageinfo": [{
+        "url": "https://upload.wikimedia.org/wikipedia/commons/1/12/Mumbai_street.jpg", "width": 3000, "height": 2000,
+        "mime": "image/jpeg", "extmetadata": {"LicenseShortName": {"value": "CC BY-NC-SA 2.0"}}}]},
+    "14": {"index": 4, "title": "File:Tiny.jpg", "imageinfo": [{
+        "url": "https://upload.wikimedia.org/wikipedia/commons/2/23/Tiny.jpg", "width": 400, "height": 300,
+        "mime": "image/jpeg", "extmetadata": {"LicenseShortName": {"value": "CC0"}}}]},
+}}}
+OPENVERSE = {"results": [
+    {"title": "Tata Steel plant at dusk", "url": "https://live.staticflickr.com/1/steel.jpg", "thumbnail": "https://api.openverse.org/v1/images/x/thumb/",
+     "foreign_landing_url": "https://www.flickr.com/photos/a/1", "creator": "Asha", "license": "by", "license_version": "2.0",
+     "license_url": "https://creativecommons.org/licenses/by/2.0/", "source": "flickr", "width": 2048, "height": 1365},
+    {"title": "Steel coils", "url": "https://live.staticflickr.com/1/nc.jpg", "license": "by-nc", "width": 2048, "height": 1365},
+]}
+commons = im.search_commons("Bombay House", http=lambda url, params: COMMONS)
+check("Wikimedia Commons: open licences only, no logos, no small files, credit and licence kept",
+      [c["title"] for c in commons] == ["Bombay House, Mumbai"] and commons[0]["license"] == "CC BY-SA 4.0"
+      and commons[0]["creator"] == "Ravi K" and commons[0]["thumb_url"].endswith("/500px-Bombay_House%2C_Mumbai.jpg"))
+ov = im.search_openverse("Tata Steel", http=lambda url, params: OPENVERSE)
+check("Openverse: commercial-use licences only (no NC), with the source named",
+      len(ov) == 1 and ov[0]["license"] == "CC BY 2.0" and ov[0]["source"] == "Flickr")
+check("licence filter: CC0, public domain, BY, BY-SA yes; NC, ND, GFDL-only no",
+      all(im.license_ok(x) for x in ("CC0", "Public domain", "CC BY 2.0", "CC BY-SA 4.0"))
+      and not any(im.license_ok(x) for x in ("CC BY-NC 2.0", "CC BY-ND 4.0", "GFDL", "")))
+asked = []
+
+
+def fake_vision(prompt, imgs):
+    asked.append((prompt, len(imgs)))
+    return json.dumps({"best": 1 if "Bombay House" in prompt else None, "why": "shows it"})
+
+
+def fetch_png(url, limit=0):
+    return png(2000, 1300)
+
+
+hero_item = {"subject": "Bombay House, the Tata group headquarters", "search": ["Bombay House Mumbai"],
+             "prompt": "A stone building", "alt": "Bombay House", "caption": "Where the group is run"}
+inline_item = {"after_section": 2, "subject": "a steel rolling mill", "search": ["steel mill India"],
+               "prompt": "A steel plant at dusk", "alt": "Steel plant", "caption": "The old core"}
+srch = lambda qs, used=None, errors=None: im.candidates(  # noqa: E731
+    qs, searchers=[lambda q: im.search_commons(q, http=lambda u, p: COMMONS)], used=used, errors=errors)
+pick = lambda c, want, title: im.judge(c, want, title, vision=fake_vision, fetch=fetch_png)  # noqa: E731
+photo = lambda item, title, used, errors=None: im.find_photo(  # noqa: E731
+    item, title, used, search=srch, pick=pick, fetch=fetch_png, errors=errors)
+uploads.clear()
+out = im.make_images(None, "tata-trusts", {"hero": hero_item, "inline": [inline_item]}, title="Who owns Tata Sons",
+                     generate=fake_gen, upload=fake_upload, photo=photo, order=["photos", "gemini"])
+check("a real photo that shows the subject is used, credited with creator, source and licence",
+      out["hero"]["source"] == "photo" and out["hero"]["credit"] == "Photo: Ravi K / Wikimedia Commons, CC BY-SA 4.0"
+      and out["hero"]["license_url"].startswith("https://creativecommons.org") and out["hero"]["og_url"])
+check("the judge is strict: no photo shows the subject -> Gemini makes that picture",
+      out["images"][0]["source"] == "gemini" and out["images"][0]["credit"] == im.CREDIT
+      and any("none showed the subject" in e or "no open-licensed" in e for e in out["errors"]))
+out2 = im.make_images(None, "x", {"hero": dict(hero_item), "inline": [dict(hero_item, after_section=1)]}, title="t",
+                      generate=fake_gen, upload=fake_upload, photo=photo, order=["photos"])
+check("two slots never get the same photo", out2.get("hero") and not out2["images"])
+out3 = im.make_images(None, "y", {"hero": hero_item}, title="t", generate=fake_gen, upload=fake_upload,
+                      photo=photo, order=["gemini"])
+check("DAILY_BLOG_PICTURES=gemini skips the photo search", out3["hero"]["source"] == "gemini")
+
+# ---------------------------------------------------------------------------- rewriting existing posts
+print("rewriting existing posts")
+env(DAILY_BLOG_MIN_FACTS="4")
+old_live = {"id": "p-live", "slug": "tatas-ownership", "kind": "news_case", "status": "published",
+            "title": "Tata's Ownership: A Case for Wealth as Public Trust", "dek": "Learn to analyze Tata's model.",
+            "content": {"intro": "Short.", "sections": [{"heading": "Why it matters", "paragraphs": ["Thin."]}]},
+            "source_refs": [{"label": "Mint", "url": "https://news.example/1"}], "topic": "Quick-commerce apps add dark stores",
+            "published_at": "2026-10-06T03:00:00+00:00", "created_at": "2026-10-06T03:00:00+00:00", "agent_meta": {}}
+tables = base_tables()
+tables["seo_pages"] = [json.loads(json.dumps(old_live))]
+sb = FakeSupabase(tables)
+rev = Review()
+res = db.rewrite_page(sb, "p-live", deps=deps(Chat([GOOD]), rev))
+row = sb.tables["seo_pages"][0]
+check("rewriting a live post keeps the live version until it is approved",
+      res["ok"] and res["live"] and row["title"].startswith("Tata's Ownership") and row["content"]["intro"] == "Short."
+      and row["agent_meta"]["pending_rewrite"]["content"]["format"] == "daily-2"
+      and row["agent_meta"]["pending_rewrite"]["content"].get("hero"))
+check("the rewrite goes to Telegram marked as a rewrite of a live post",
+      rev.sent and rev.sent[-1]["_rewrite_of_live"] and rev.sent[-1]["status"] == "draft")
+done = db.publish_page(sb, "p-live", via="telegram")
+row = sb.tables["seo_pages"][0]
+check("approving swaps the new essay in: same link, same date, old version kept for rollback",
+      row["title"] == GOOD["title"] and row["content"]["format"] == "daily-2" and row["slug"] == "tatas-ownership"
+      and row["published_at"] == "2026-10-06T03:00:00+00:00" and "pending_rewrite" not in row["agent_meta"]
+      and row["agent_meta"]["previous_version"]["title"].startswith("Tata's Ownership"))
+tables = base_tables()
+tables["seo_pages"] = [dict(json.loads(json.dumps(old_live)), id="p-draft", status="draft", published_at=None)]
+sb = FakeSupabase(tables)
+res = db.rewrite_page(sb, "p-draft", deps=deps(Chat([GOOD]), Review()))
+check("rewriting a draft replaces it in place", res["ok"] and not res["live"]
+      and sb.tables["seo_pages"][0]["content"]["format"] == "daily-2" and sb.tables["seo_pages"][0]["status"] == "draft")
+tables = base_tables()
+tables["seo_pages"] = [json.loads(json.dumps(old_live))]
+sb = FakeSupabase(tables)
+res = db.rewrite_page(sb, "p-live", deps=deps(Chat([GOOD]), Review(), grounded=lambda p, m: thin))
+check("no sourced facts -> the post is left exactly as it was", not res["ok"] and "kept as it is" in res["reason"]
+      and "pending_rewrite" not in sb.tables["seo_pages"][0]["agent_meta"])
+res = db.write_on(FakeSupabase(base_tables()), topic="How quick commerce makes money in India",
+                  deps=deps(Chat([GOOD]), Review()))
+check("'Generate a draft' in Admin -> Growth now writes a full essay (same pipeline), as a draft",
+      res["status"] == "draft" and res["page"]["content"]["format"] == "daily-2" and res["page"]["kind"] == "news_case"
+      and res["page"]["agent_meta"]["review"] == "pending")
+tables = base_tables()
+tables["seo_pages"] = [dict(json.loads(json.dumps(old_live)), id=f"p{i}", slug=f"s{i}") for i in range(5)]
+tables["seo_pages"][0]["content"]["hero"] = {"url": "https://x/h.webp"}
+sb = FakeSupabase(tables)
+bf = db.backfill_images(sb, limit=3, chat=_ArtChat(),
+                        make=lambda s, slug, a, **kw: im.make_images(s, slug, a, generate=fake_gen, upload=fake_upload,
+                                                                     order=["gemini"], **kw))
+check("pictures for older posts: only those without one, three per click",
+      len(bf["done"]) == 3 and bf["remaining"] == 1 and all(d["ok"] for d in bf["done"])
+      and "p0" not in [d["id"] for d in bf["done"]])
+
+# Telegram: a rewrite is reviewed like a draft; 'reject' drops the rewrite, never the live post
+env(TELEGRAM_BOT_TOKEN="123:abc", TELEGRAM_ADMIN_CHAT_ID="777", RENDER_EXTERNAL_URL="https://mece-api.onrender.com",
+    DAILY_BLOG_MIN_FACTS="4")
+api.clear()
+tables = base_tables()
+tables["seo_pages"] = [json.loads(json.dumps(old_live))]
+sb = FakeSupabase(tables)
+db.rewrite_page(sb, "p-live", deps=dict(deps(Chat([GOOD]), tg)))
+heads = [p["text"] for m, p in api if m == "sendMessage"]
+check("Telegram says it is a rewrite and the live version stays up", heads and "rewrite of a live post" in heads[0])
+check("a waiting rewrite is something 'publish' can act on", [p["id"] for p in tg.pending_drafts(sb)] == ["p-live"])
+r = tg.handle_update(sb, {"update_id": 50, "message": {"message_id": 60, "chat": {"id": 777}, "text": "reject"}},
+                     run_another=run_another)
+row = sb.tables["seo_pages"][0]
+check("'reject' on a rewrite drops the rewrite and leaves the live post up",
+      r.get("action") == "rewrite_dropped" and row["status"] == "published" and "pending_rewrite" not in row["agent_meta"])
+old_drafts = base_tables()
+old_drafts["seo_pages"] = [dict(json.loads(json.dumps(old_live)), id="p-old-draft", status="draft")]
+check("old drafts that were never sent for review are not targets for 'publish'",
+      tg.pending_drafts(FakeSupabase(old_drafts)) == [])
+
 env()
 
 print(f"\n{passed} checks passed")

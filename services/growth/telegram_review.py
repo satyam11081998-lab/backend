@@ -150,7 +150,9 @@ def render_messages(page: Dict[str, Any]) -> List[str]:
     problems = meta.get("problems") or []
     checks = "all passed ✅" if not problems else (
         "⚠️ " + "; ".join(serious) if serious else f"{len(problems)} style note(s): " + "; ".join(problems[:3]))
-    head = [f"📝 <b>MECE Insights — draft for review</b>", "", f"<b>{_e(page.get('title'))}</b>"]
+    kind = ("rewrite of a live post (the current version stays up until you reply publish)"
+            if page.get("_rewrite_of_live") else "draft for review")
+    head = [f"📝 <b>MECE Insights — {kind}</b>", "", f"<b>{_e(page.get('title'))}</b>"]
     if page.get("dek"):
         head.append(f"<i>{_e(page.get('dek'))}</i>")
     head += ["", f"Score {page.get('quality_score') if page.get('quality_score') is not None else '—'}/100 · "
@@ -294,15 +296,37 @@ def parse_command(text: str) -> str:
     return ""
 
 
+def _sent_at(p: Dict[str, Any]) -> str:
+    return str((((p.get("agent_meta") or {}).get("telegram") or {}).get("sent_at")) or p.get("created_at") or "")
+
+
 def pending_drafts(supabase, days: int = 7) -> List[Dict[str, Any]]:
+    """What a 'publish' reply can act on, newest first: daily drafts, essays written from Admin -> Growth, and
+    rewrites of live posts. Old drafts that were never sent for review are not included."""
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cols = "id, slug, title, status, kind, topic, agent_meta, source_headline_id, created_at"
+    out: List[Dict[str, Any]] = []
     try:
-        r = (supabase.table("seo_pages").select("id, slug, title, status, topic, agent_meta, source_headline_id, created_at")
-             .eq("kind", "daily").eq("status", "draft").gte("created_at", since)
-             .order("created_at", desc=True).limit(20).execute())
-        return [p for p in (r.data or []) if (p.get("agent_meta") or {}).get("review", "pending") == "pending"]
+        r = (supabase.table("seo_pages").select(cols).eq("status", "draft")
+             .order("created_at", desc=True).limit(40).execute())
+        for p in r.data or []:
+            meta = p.get("agent_meta") or {}
+            pending = meta.get("review") == "pending" or (p.get("kind") == "daily" and "review" not in meta)
+            if pending and _sent_at(p) >= since:
+                out.append(p)
     except Exception:
-        return []
+        pass
+    try:
+        r = (supabase.table("seo_pages").select(cols).eq("status", "published")
+             .order("updated_at", desc=True).limit(40).execute())
+        for p in r.data or []:
+            meta = p.get("agent_meta") or {}
+            if meta.get("pending_rewrite") and meta.get("review") == "pending" and _sent_at(p) >= since:
+                out.append(p)
+    except Exception:
+        pass
+    out.sort(key=_sent_at, reverse=True)
+    return out
 
 
 def find_target(supabase, reply_to_id: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -338,11 +362,17 @@ def handle_update(supabase, update: Dict[str, Any], *, run_another: Callable[[Li
             return {"ok": True, "action": "none"}
         done = daily_blog.publish_page(supabase, page["id"], via="telegram")
         if done:
-            send_text(f"✅ Published: {page.get('title')}\n{SITE}/insights/{page.get('slug')}\n"
+            send_text(f"✅ Published: {done.get('title') or page.get('title')}\n{SITE}/insights/{page.get('slug')}\n"
                       "(The Insights list refreshes within a few minutes.)", reply_to=me)
             return {"ok": True, "action": "published", "id": page["id"]}
         send_text("Couldn't publish it (database error). Try again, or publish from Admin → Growth.", reply_to=me)
         return {"ok": False, "action": "publish_failed"}
+    if cmd in ("reject", "another"):
+        page = find_target(supabase, reply_to)
+        if page and (page.get("agent_meta") or {}).get("pending_rewrite"):
+            daily_blog.drop_rewrite(supabase, page["id"], via="telegram")
+            send_text("Dropped the rewrite. The live version stays as it is.", reply_to=me)
+            return {"ok": True, "action": "rewrite_dropped", "id": page["id"]}
     if cmd == "reject":
         page = find_target(supabase, reply_to)
         if not page:
