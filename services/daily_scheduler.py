@@ -10,12 +10,46 @@ no `guesstimates` table, so no FK/constraint exists on it). /daily/today resolve
 that id back out of `cases`. No DB migration required.
 """
 
+import logging
+import os
+
+import httpx
+
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 from services.supabase_client import get_supabase_client
 from services.content_generator import save_generated_content, GeneratorError
 
 IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
+
+logger = logging.getLogger(__name__)
+
+
+def _refresh_frontend_home() -> None:
+    """Tell the website to re-render its home page now that today's pair exists.
+
+    mece.in "/" advertises the daily case + guesstimate and is a cached (ISR)
+    page. Since 2026-10-07 it is re-rendered on demand instead of every 5
+    minutes (to save Vercel CPU), and THIS is the demand: the moment today's
+    row is written, POST /api/revalidate/home with the shared CRON_SECRET.
+    Best-effort only: a failure never fails the schedule, and the page still
+    re-renders on its own within the hour as a fallback.
+    """
+    secret = (os.environ.get("CRON_SECRET") or "").strip()
+    if not secret:
+        return
+    base = (os.environ.get("FRONTEND_URL") or "https://mece.in").rstrip("/")
+    try:
+        r = httpx.post(
+            f"{base}/api/revalidate/home",
+            headers={"x-cron-secret": secret},
+            timeout=8.0,
+            follow_redirects=True,
+        )
+        if r.status_code >= 300:
+            logger.warning("home refresh returned %s (non-fatal)", r.status_code)
+    except Exception as e:  # noqa: BLE001 - must never break scheduling
+        logger.warning("home refresh failed (non-fatal): %s", e)
 
 
 def today_in_ist() -> datetime:
@@ -117,6 +151,9 @@ def fill_daily_schedule() -> Dict[str, Any]:
         ).execute()
     except Exception as e:
         raise RuntimeError(f"Failed to insert daily schedule: {e}")
+
+    # The home page shows today's pair: refresh it now (best-effort).
+    _refresh_frontend_home()
 
     return {
         "status": "ok",
