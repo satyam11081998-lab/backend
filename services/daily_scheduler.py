@@ -38,7 +38,9 @@ def _refresh_frontend_home() -> None:
     secret = (os.environ.get("CRON_SECRET") or "").strip()
     if not secret:
         return
-    base = (os.environ.get("FRONTEND_URL") or "https://mece.in").rstrip("/")
+    # www is the primary domain: https://mece.in answers with a redirect, and a
+    # redirected POST is not guaranteed to stay a POST.
+    base = (os.environ.get("FRONTEND_URL") or "https://www.mece.in").rstrip("/")
     try:
         r = httpx.post(
             f"{base}/api/revalidate/home",
