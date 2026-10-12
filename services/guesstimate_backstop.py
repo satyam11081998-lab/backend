@@ -212,7 +212,9 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
     elif verifiable_steps:
         final_step = verifiable_steps[-1]
     final_value = _to_number(chain.get("finalValue", 0))
-    if final_step and final_step["verifiable"] and _is_finite(final_value) and _is_finite(final_step["computedValue"]):
+    if final_step and final_step["verifiable"] and final_step["ok"] and _is_finite(final_value) and _is_finite(final_step["computedValue"]):
+        # If the final derived step already failed its own claimed-value check, do not
+        # count the same discrepancy twice as a separate final-answer error.
         rel_err = abs(final_step["computedValue"] - final_value) / max(abs(final_value), EPS)
         if rel_err > TOLERANCE:
             findings.append({
@@ -234,17 +236,25 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
             })
             total_cap_factor = 0.35 if oom >= 3 else 0.5
 
-    could_verify = len(verifiable_steps) > 0 or (final_step is not None and final_step["verifiable"])
     arith_findings = [f for f in findings if f["kind"] != "magnitude_implausible"]
     n = len(arith_findings)
+    derived_count = sum(1 for row in resolved if row.get("op") in DERIVED_OPS)
+    verified_count = len(verifiable_steps)
+    coverage = (verified_count / derived_count) if derived_count else None
 
-    if not could_verify:
-        arithmetic_score = None  # defer to LLM's read
-        summary = ("Arithmetic could not be independently recomputed from the steps provided, "
-                   "so the interviewer's assessment stands for this dimension.")
+    if verified_count == 0 or derived_count == 0:
+        arithmetic_score = None  # defer to LLM's read; no arithmetic was independently checked
+        summary = ("Arithmetic could not be independently recomputed from derived steps, "
+                   "so the interviewer's evidence-based assessment stands for this dimension.")
+    elif n == 0 and verified_count < derived_count:
+        # Do not call a partially reconstructed chain "100/100 verified". Keep the LLM's
+        # dimension score until the structured chain actually covers all derived steps.
+        arithmetic_score = None
+        summary = (f"Partial arithmetic verification: {verified_count} of {derived_count} derived steps "
+                   "could be recomputed with no detected mismatch; full-chain correctness is not established.")
     elif n == 0:
         arithmetic_score = 100
-        summary = "Arithmetic verified: every recomputable step checks out within tolerance."
+        summary = "Arithmetic verified: every derived step in the submitted chain recomputes within tolerance."
     else:
         # 0-100 scale (was 1-5). Each independently-found error drops the band.
         arithmetic_score = 60 if n == 1 else 40 if n == 2 else 20
@@ -254,7 +264,9 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
     return {
         "findings": findings,
         "arithmeticScore": arithmetic_score,
-        "verifiableCount": len(verifiable_steps),
+        "verifiableCount": verified_count,
+        "derivedCount": derived_count,
+        "verificationCoverage": round(coverage, 3) if coverage is not None else None,
         "totalCapFactor": total_cap_factor,
         "summary": summary,
         "notChecked": (

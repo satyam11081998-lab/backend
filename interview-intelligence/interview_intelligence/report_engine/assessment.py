@@ -29,6 +29,7 @@ from ..jobs.queue import enqueue, register
 from ..role_taxonomy.library import library
 from ..textutil import truncate
 from ..versions import versions
+from .evidence_gate import has_substantive_candidate_answer
 from . import history
 from .why import explain
 
@@ -69,14 +70,24 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
         ("assemble", "Putting your report together", 1.0),
     ])
     progress.begin(key, "evidence")
-    partial = _ensure_evidence(db, exchanges)
-    db.flush()
-    evidence = list(db.execute(select(EvidenceItem).where(EvidenceItem.session_id == sess.id)).scalars())
+    messages = list(db.execute(select(InterviewMessage).where(InterviewMessage.session_id == sess.id)
+                               .order_by(InterviewMessage.seq)).scalars())
+    substantive_answer = has_substantive_candidate_answer(messages)
+    if substantive_answer:
+        partial = _ensure_evidence(db, exchanges)
+        db.flush()
+        evidence = list(db.execute(select(EvidenceItem).where(EvidenceItem.session_id == sess.id)).scalars())
+    else:
+        # No model calls for greetings/meta-only sessions; ignore stale evidence.
+        partial = ["No substantive candidate answer was captured; competency conclusions are withheld."]
+        for ex in exchanges:
+            if ex.status == "closed" and ex.evidence_status in ("pending", "failed"):
+                ex.evidence_status = "skipped"
+        db.flush()
+        evidence = []
     answered = sum(1 for ex in exchanges if ex.status == "closed")
     progress.fact(key, f"{progress.plural(len(evidence), 'piece')} of evidence from "
                        f"{progress.plural(answered, 'answer')}", step_id="evidence")
-    messages = list(db.execute(select(InterviewMessage).where(InterviewMessage.session_id == sess.id)
-                               .order_by(InterviewMessage.seq)).scalars())
     ended_early = sess.ended_reason in ENDED_EARLY
     manipulation = any((m.meta or {}).get("injection_flags") for m in messages if m.role == "candidate")
     stuffing_x = {str(ex.id) for ex in exchanges if ((ex.metrics or {}).get("stuffing") or {}).get("flag")}
@@ -102,10 +113,18 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
         if any(str(e.exchange_id) in stuffing_x for e in items):
             comp_flags.append("keyword-dense answer with little substance — verify application")
         comp_open_k = open_k and any(e.cv_consistency == "inconsistent" for e in items)
-        ev, gflags, conf, basis = assess(ctx=ctx, comp=comp, rubric=bp_row.rubric.get(cid, {}), items=items,
-                                         exchanges_testing=testing, ended_early=ended_early,
-                                         open_contradiction=comp_open_k, contradictions=len(state.get("contradictions", [])),
-                                         flags=comp_flags)
+        if substantive_answer:
+            ev, gflags, conf, basis = assess(ctx=ctx, comp=comp, rubric=bp_row.rubric.get(cid, {}), items=items,
+                                             exchanges_testing=testing, ended_early=ended_early,
+                                             open_contradiction=comp_open_k, contradictions=len(state.get("contradictions", [])),
+                                             flags=comp_flags)
+        else:
+            from ..evaluation_engine.schemas import CompetencyEvaluation
+            ev = CompetencyEvaluation(competency_id=cid, evidence_state="not_sufficiently_tested", score=None,
+                rationale="No substantive candidate answer was captured for this interview.", evidence_refs=[],
+                strengths=[], gaps=[], missing_evidence=["A substantive response demonstrating this competency"])
+            gflags, conf, basis = ["no_substantive_candidate_answer"], "low", {
+                "exchanges_testing": 0, "evidence_items": 0, "ended_early": ended_early}
         results[cid] = {"comp": comp, "ev": ev, "flags": gflags, "confidence": conf, "basis": basis, "items": items,
                         "testing": testing, "open_k": comp_open_k}
 
@@ -121,7 +140,7 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
                                       f"{tested_n} with enough evidence to score"]), step_id="score")
     progress.detail(key, "")
     progress.begin(key, "check")
-    findings = qa_judge(ctx, [_view(c) for c in results])
+    findings = qa_judge(ctx, [_view(c) for c in results]) if substantive_answer else []
     for f in findings:
         cid = f.get("competency_id")
         if cid in results and f.get("severity") == "high" and "qa_rerun" not in results[cid]["flags"]:
@@ -193,13 +212,16 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
         "claims": [{"ref": c.claim_key, "text": c.text, "status": c.verification_status} for c in claims],
     }
     progress.begin(key, "feedback")
-    bundle, fb_report = write_feedback(ctx, payload, e_refs={e.ref for e in evidence}, x_refs=set(x_of.values()),
-                                       c_refs={c.claim_key for c in claims}, metrics=metrics_map,
-                                       assessments={a["competency_id"]: a for a in assessments})
-    if bundle is None:
-        partial.append("feedback could not be generated; assessments and evidence are shown without narrative")
-    elif fb_report.get("dropped"):
-        partial.append(f"{len(fb_report['dropped'])} feedback item(s) withheld because they failed quality checks")
+    if substantive_answer:
+        bundle, fb_report = write_feedback(ctx, payload, e_refs={e.ref for e in evidence}, x_refs=set(x_of.values()),
+                                           c_refs={c.claim_key for c in claims}, metrics=metrics_map,
+                                           assessments={a["competency_id"]: a for a in assessments})
+        if bundle is None:
+            partial.append("feedback could not be generated; assessments and evidence are shown without narrative")
+        elif fb_report.get("dropped"):
+            partial.append(f"{len(fb_report['dropped'])} feedback item(s) withheld because they failed quality checks")
+    else:
+        bundle, fb_report = None, {"dropped": []}
     db.execute(delete(FeedbackItem).where(FeedbackItem.session_id == sess.id))
     if bundle:
         for s in bundle.strengths:

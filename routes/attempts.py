@@ -23,7 +23,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Callable, Tuple
-from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Form, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Header, UploadFile, File, Form, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -1306,6 +1306,7 @@ async def upload_file(
 def submit_attempt(
     attempt_id: str,
     body: SubmitRequest,
+    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
 ) -> SubmitResponse:
     supabase = get_supabase_client()
@@ -1430,12 +1431,12 @@ def submit_attempt(
     # Best-effort inside the helper; never fails a scored submit.
     bank_figures(supabase, attempt["case_id"], _figures, submission_id, feedback["score"])
 
-    # Silent self-improvement: if this scored session clears the bar, bank an
-    # anonymised exemplar for THIS case so future scoring calibrates against real
-    # strong answers. Fully non-blocking — never affects the response or the score.
+    # Schedule optional exemplar distillation after the response is sent. The former
+    # direct call added a second model call to the submit critical path.
     try:
         from services.exemplar_bank import maybe_capture_exemplar
-        maybe_capture_exemplar(
+        background_tasks.add_task(
+            maybe_capture_exemplar,
             case_id=attempt["case_id"],
             submission_id=submission_id,
             case_content=llm_case_content(case),
@@ -1444,7 +1445,7 @@ def submit_attempt(
             user_id=user_id,
         )
     except Exception as _e:
-        print(f"WARN: exemplar capture skipped: {_e}")
+        print(f"WARN: exemplar capture could not be scheduled: {_e}")
 
     # Mark the attempt submitted.
     supabase.table("attempts").update(
