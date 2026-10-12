@@ -185,40 +185,40 @@ def generate_brief(
     except (json.JSONDecodeError, ValueError) as e:
         raise BriefGenerationError(f"Model returned invalid JSON: {e}")
     
-    # Validate required fields and provide defensive fallbacks
-    required_keys = [
-        "summary", "gd_type", "likely_questions", "smart_angles",
-        "data_points", "opening_lines", "counter_arguments", "closing_lines"
-    ]
-    missing = [k for k in required_keys if k not in parsed]
-    if missing:
-        raise BriefGenerationError(f"Brief missing keys: {missing}")
-    
-    # Validate gd_type is one of the allowed values
+    summary = str(parsed.get("summary") or headline_title).strip()
+    if not summary:
+        raise BriefGenerationError("Brief missing summary")
+
     allowed_types = {"Abstract", "Case-based", "Opinion", "Trend-analytical"}
-    gd_type = str(parsed["gd_type"]).strip()
-    if gd_type not in allowed_types:
-        # Defensive: pick closest match or default
-        gd_type_lower = gd_type.lower()
-        if "abstract" in gd_type_lower:
-            gd_type = "Abstract"
-        elif "case" in gd_type_lower:
-            gd_type = "Case-based"
-        elif "opinion" in gd_type_lower or "ban" in gd_type_lower:
-            gd_type = "Opinion"
-        elif "trend" in gd_type_lower or "predict" in gd_type_lower:
-            gd_type = "Trend-analytical"
-        else:
-            gd_type = "Case-based"  # safe default
-    
-    # Build validated brief
+    gd_type_raw = str(parsed.get("gd_type") or "Case-based").strip()
+    gd_type_lower = gd_type_raw.lower()
+    if "abstract" in gd_type_lower:
+        gd_type = "Abstract"
+    elif "case" in gd_type_lower:
+        gd_type = "Case-based"
+    elif "opinion" in gd_type_lower or "ban" in gd_type_lower:
+        gd_type = "Opinion"
+    elif "trend" in gd_type_lower or "predict" in gd_type_lower:
+        gd_type = "Trend-analytical"
+    else:
+        gd_type = "Case-based"
+
+    def _get_list(key_names: List[str], max_items: int) -> List[str]:
+        for k in key_names:
+            v = parsed.get(k)
+            if isinstance(v, list) and v:
+                return [str(x).strip() for x in v if str(x).strip()][:max_items]
+            elif isinstance(v, str) and v.strip():
+                return [v.strip()]
+        return []
+
     return {
-        "summary": str(parsed["summary"]).strip(),
+        "summary": summary,
         "gd_type": gd_type,
-        "likely_questions": [str(q).strip() for q in parsed["likely_questions"] if str(q).strip()][:3],
-        "smart_angles": [str(a).strip() for a in parsed["smart_angles"] if str(a).strip()][:5],
-        "data_points": [str(d).strip() for d in parsed["data_points"] if str(d).strip()][:5],
-        "opening_lines": [str(o).strip() for o in parsed["opening_lines"] if str(o).strip()][:3],
-        "counter_arguments": [str(c).strip() for c in parsed["counter_arguments"] if str(c).strip()][:4],
-        "closing_lines": [str(c).strip() for c in parsed["closing_lines"] if str(c).strip()][:3],
+        "likely_questions": _get_list(["likely_questions", "questions"], 3),
+        "smart_angles": _get_list(["smart_angles", "angles", "points_for"], 5),
+        "data_points": _get_list(["data_points", "data", "facts"], 5),
+        "opening_lines": _get_list(["opening_lines", "openings", "how_to_open"], 3),
+        "counter_arguments": _get_list(["counter_arguments", "counterarguments", "counters", "points_against"], 4),
+        "closing_lines": _get_list(["closing_lines", "closings", "how_to_close"], 3),
     }

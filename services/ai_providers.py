@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 
 from services.supabase_client import get_supabase_client
 
-load_dotenv()
+load_dotenv(override=True)
 
 _OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 _GROQ_KEY = os.getenv("GROQ_API_KEY")
@@ -55,7 +55,7 @@ _gemini_client = (
 _GROQ_LLM = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
 # Same env var as deck_ai_gemini.py on purpose: Google retires model names
 # without notice, and one rename should fix every caller.
-_GEMINI_LLM = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+_GEMINI_LLM = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 # feature -> spec. `providers` is the ordered list the admin may choose from.
 FEATURES: Dict[str, Dict[str, Any]] = {
@@ -185,24 +185,28 @@ def _kwargs_for(provider: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Per-provider adjustment of the call kwargs. Never mutates the caller's dict."""
     if provider != "gemini":
         return kwargs
-    rf = kwargs.get("response_format")
-    if not (isinstance(rf, dict) and rf.get("type") == "json_object"):
-        return kwargs
     adjusted = dict(kwargs)
-    adjusted.pop("response_format", None)
-    # Headroom. Without the json_object constraint the model is freer to open with
-    # a sentence or a ```json fence, and those tokens come out of max_tokens — a
-    # budget tuned for a terse OpenAI reply can truncate mid-object, which the
-    # tolerant parser cannot repair. Free tier, so the extra tokens cost nothing.
+    rf = kwargs.get("response_format")
+    is_json = isinstance(rf, dict) and rf.get("type") == "json_object"
+    if is_json:
+        adjusted.pop("response_format", None)
+    # Headroom: Reasoning/thinking tokens in Gemini count toward max_tokens.
+    # A standard max_tokens budget (e.g. 1600) gets starved by thinking tokens
+    # (~1500-2000 tokens), causing truncation and invalid JSON.
+    # Providing ample tokens ensures thinking never starves the actual response.
     if isinstance(adjusted.get("max_tokens"), int):
-        adjusted["max_tokens"] = int(adjusted["max_tokens"] * 1.5)
-    messages = list(adjusted.get("messages") or [])
-    if messages and messages[0].get("role") == "system":
-        head = dict(messages[0])
-        head["content"] = f"{head.get('content', '')}\n\n{_JSON_ONLY_NUDGE}"
-        messages[0] = head
+        adjusted["max_tokens"] = max(int(adjusted["max_tokens"]) + 6000, 8192)
     else:
-        messages.insert(0, {"role": "system", "content": _JSON_ONLY_NUDGE})
+        adjusted["max_tokens"] = 8192
+
+    messages = list(adjusted.get("messages") or [])
+    if is_json:
+        if messages and messages[0].get("role") == "system":
+            head = dict(messages[0])
+            head["content"] = f"{head.get('content', '')}\n\n{_JSON_ONLY_NUDGE}"
+            messages[0] = head
+        else:
+            messages.insert(0, {"role": "system", "content": _JSON_ONLY_NUDGE})
     adjusted["messages"] = messages
     return adjusted
 
@@ -314,7 +318,21 @@ def chat_with_fallback(feature: str, **kwargs) -> Tuple[Any, str, str]:
                 print(f"[ai_providers] {feature}: falling through to {provider} ({model})")
             if provider == "gemini" and feature in _BULK_FEATURES:
                 _throttle_gemini()
-            return cli.chat.completions.create(model=model, **_kwargs_for(provider, kwargs)), model, provider
+            resp = cli.chat.completions.create(model=model, **_kwargs_for(provider, kwargs))
+
+            # Defensive verification: If caller requested JSON, verify completion is not truncated and parses
+            rf = kwargs.get("response_format")
+            if isinstance(rf, dict) and rf.get("type") == "json_object":
+                choice = resp.choices[0]
+                if choice.finish_reason == "length":
+                    raise ValueError(f"{provider} ({model}) truncated output (finish_reason=length)")
+                content = choice.message.content or ""
+                if not content.strip():
+                    raise ValueError(f"{provider} ({model}) returned empty response")
+                from services.model_json import parse_model_json
+                parse_model_json(content)
+
+            return resp, model, provider
         except Exception as e:  # noqa: BLE001 — any failure is a reason to try the next link
             last_error = e
             print(f"[ai_providers] {provider} failed for {feature}: {type(e).__name__}: {e}")

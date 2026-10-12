@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from routes import submit, news, cron, daily, transcribe, attempts, vision, usage, deck_vault, speak, realtime
 import os
 
-load_dotenv()
+load_dotenv(override=True)
 
 # MECE Interviewer V11 is the only interviewer, on every path. The frozen
 # engine's non-adaptive branch used the static prompt that has been removed
