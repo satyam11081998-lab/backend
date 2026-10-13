@@ -59,9 +59,9 @@ structures or quantifies the problem scores LOW.
 - Penalise, and name in red_flags, any of: keyword/framework stuffing; a memorised framework force-fit \
 with no case-specific adaptation; restating the prompt back as if it were analysis; claiming a \
 calculation without showing it; internal contradictions; recommendations with no supporting logic.
-- Be strict, direct, and criterion-referenced. There is NO target score distribution or preferred score band.
-  Score each dimension against its anchors and actual evidence; do not cluster scores near a midpoint or adjust them
-  because of what other candidates usually score.
+- Be strict, direct, and criterion-referenced. Score each dimension against its anchors and the actual
+  evidence, never against what other candidates usually score. Do NOT cluster scores near 70: reserve 80+
+  for answers that would genuinely impress an interviewer, and let weak answers score weak.
 - breakdown values MUST sum to score, each within its dimension's max.
 
 If the caller marks the answer as THIN (short/underdeveloped), do not invent strengths to fill the \

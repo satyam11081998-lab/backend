@@ -113,18 +113,14 @@ def run_assessment(db: Session, sess: InterviewSession) -> None:
         if any(str(e.exchange_id) in stuffing_x for e in items):
             comp_flags.append("keyword-dense answer with little substance — verify application")
         comp_open_k = open_k and any(e.cv_consistency == "inconsistent" for e in items)
-        if substantive_answer:
-            ev, gflags, conf, basis = assess(ctx=ctx, comp=comp, rubric=bp_row.rubric.get(cid, {}), items=items,
-                                             exchanges_testing=testing, ended_early=ended_early,
-                                             open_contradiction=comp_open_k, contradictions=len(state.get("contradictions", [])),
-                                             flags=comp_flags)
-        else:
-            from ..evaluation_engine.schemas import CompetencyEvaluation
-            ev = CompetencyEvaluation(competency_id=cid, evidence_state="not_sufficiently_tested", score=None,
-                rationale="No substantive candidate answer was captured for this interview.", evidence_refs=[],
-                strengths=[], gaps=[], missing_evidence=["A substantive response demonstrating this competency"])
-            gflags, conf, basis = ["no_substantive_candidate_answer"], "low", {
-                "exchanges_testing": 0, "evidence_items": 0, "ended_early": ended_early}
+        # With no substantive answer, evidence is empty, so assess() already short-circuits to
+        # not_sufficiently_tested WITHOUT a model call and builds the standard confidence basis.
+        ev, gflags, conf, basis = assess(ctx=ctx, comp=comp, rubric=bp_row.rubric.get(cid, {}), items=items,
+                                         exchanges_testing=testing, ended_early=ended_early,
+                                         open_contradiction=comp_open_k, contradictions=len(state.get("contradictions", [])),
+                                         flags=comp_flags)
+        if not substantive_answer and "no_substantive_candidate_answer" not in gflags:
+            gflags = list(gflags) + ["no_substantive_candidate_answer"]
         results[cid] = {"comp": comp, "ev": ev, "flags": gflags, "confidence": conf, "basis": basis, "items": items,
                         "testing": testing, "open_k": comp_open_k}
 

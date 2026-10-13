@@ -247,9 +247,10 @@ def run_backstop(chain: Dict[str, Any], band: Optional[Dict[str, float]] = None)
         summary = ("Arithmetic could not be independently recomputed from derived steps, "
                    "so the interviewer's evidence-based assessment stands for this dimension.")
     elif n == 0 and verified_count < derived_count:
-        # Do not call a partially reconstructed chain "100/100 verified". Keep the LLM's
-        # dimension score until the structured chain actually covers all derived steps.
-        arithmetic_score = None
+        # Do not call a partially reconstructed chain "100/100 verified". But when most of the chain
+        # WAS checked and nothing mismatched, still credit the candidate -- a parser gap is not their
+        # error. Below that bar, defer to the LLM's read rather than guessing.
+        arithmetic_score = 90 if (coverage is not None and coverage >= 0.8) else None
         summary = (f"Partial arithmetic verification: {verified_count} of {derived_count} derived steps "
                    "could be recomputed with no detected mismatch; full-chain correctness is not established.")
     elif n == 0:
