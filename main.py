@@ -98,6 +98,12 @@ from routes import broadcast as _broadcast
 app.include_router(_broadcast.router)
 from routes import voice_coach as _voice_coach
 app.include_router(_voice_coach.router)
+# Admin interviewer arena (/admin/arena): blind A/B of two frozen prompt variants
+# on a real case. Admin-gated, budget-gated, and isolated from live user data --
+# it creates no attempt, spends no clarification quota and persists no learner
+# profile. See services/arena.py for the isolation contract.
+from routes import arena as _arena
+app.include_router(_arena.router)
 
 # Interview Intelligence: its own package in ./interview-intelligence, mounted at /ii.
 # Dormant until II_DATABASE_URL is set; nothing of it loads until the first /ii call.
