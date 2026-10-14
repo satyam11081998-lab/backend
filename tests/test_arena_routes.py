@@ -74,8 +74,12 @@ TURN_OUT = {
     "reply": "Which unit are you sizing in?",
     "raw_reply": "Which unit are you sizing in?",
     "silent": False, "error": None, "prompt_consulted": True, "enforced": False,
+    # Mirrors services.arena.run_turn exactly: a stub narrower than the real shape
+    # would let a contract test pass while the page renders blanks.
     "control": {"mode": "HINT", "function": "MICRO_HINT", "render": "model",
-                "intervention": "micro_hint", "materiality": "material"},
+                "reason": "help_requested", "intervention": "micro_hint",
+                "materiality": "material", "skill": None, "error_kind": None,
+                "hint": "1", "fallback": False},
     "violations": [], "metrics": {"chars": 30, "words": 6, "sentences": 1, "questions": 1},
     "latency_ms": 700, "model": "gpt-4o-mini", "provider": "openai", "next_state": {"hint_level": 1},
 }
@@ -266,3 +270,59 @@ def test_every_endpoint_is_admin_gated():
     for route in ar.router.routes:
         src = inspect.getsource(route.endpoint)
         assert "_require_admin" in src, f"{route.path} is not admin-gated"
+
+
+# --------------------------------------------------------------------- contract
+
+# The admin page (frontend app/(app)/admin/arena/page.tsx) reads these exact keys.
+# They are pinned here because the two repos deploy independently: a renamed field
+# would ship a blank panel, not a build error.
+ARM_KEYS = {
+    "reply", "raw_reply", "silent", "error", "prompt_consulted", "enforced",
+    "control", "violations", "metrics", "latency_ms", "model", "provider", "next_state",
+}
+CONTROL_KEYS = {
+    "mode", "function", "render", "reason", "intervention", "materiality",
+    "skill", "error_kind", "hint", "fallback",
+}
+TURN_KEYS = {
+    "session_id", "turn_index", "left", "right", "comparable",
+    "not_comparable_reason", "replies_identical", "self_noise_run",
+}
+SESSION_KEYS = {"session_id", "case", "teaching_policy", "model_mode", "blinded", "self_noise_run"}
+VOTE_KEYS = {"persisted", "detail", "reveal", "session_votes", "small_n_warning"}
+CONFIG_KEYS = {
+    "variants", "default_arm_a", "default_arm_b", "model_modes", "default_model_mode",
+    "teaching_policies", "seed_scenarios", "votes_persisted", "persistence_note", "limits",
+}
+
+
+def test_response_shapes_match_what_the_admin_page_reads(client):
+    assert set(client.get("/admin/arena/config").json()) == CONFIG_KEYS
+    s = _start(client)
+    assert set(s) == SESSION_KEYS
+    assert set(s["case"]) == {"id", "title", "type", "difficulty", "content"}
+    t = client.post("/admin/arena/turn", json={
+        "session_id": s["session_id"], "message": "help", "left": {}, "right": {}}).json()
+    assert set(t) == TURN_KEYS
+    for side in ("left", "right"):
+        assert set(t[side]) == ARM_KEYS, side
+        assert set(t[side]["control"]) == CONTROL_KEYS, side
+        assert set(t[side]["metrics"]) == {"chars", "words", "sentences", "questions"}
+    v = client.post("/admin/arena/vote", json={
+        "session_id": s["session_id"], "turn_index": 1, "choice": "tie"}).json()
+    assert set(v) == VOTE_KEYS
+    assert set(v["reveal"]) == {"left", "right", "chosen_variant"}
+    assert set(v["reveal"]["left"]) == {"variant_id", "label", "origin", "frozen"}
+
+
+def test_the_real_run_turn_emits_exactly_the_contracted_arm_keys():
+    """The route strips variant_id; everything else must match the pinned contract,
+    checked against services.arena itself rather than the test's stub."""
+    import inspect
+    from services import arena as arena_mod
+    src = inspect.getsource(arena_mod.run_turn)
+    returned = {line.split('"')[1] for line in src.splitlines()
+                if line.strip().startswith('"') and '":' in line}
+    assert ARM_KEYS <= returned, ARM_KEYS - returned
+    assert "variant_id" in returned  # stripped by the route, present at source
