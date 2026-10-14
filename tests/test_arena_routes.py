@@ -56,6 +56,7 @@ class _Query(_Exec):
 class _FakeSB:
     inserted: list = []
     votes_table_missing = False
+    vote_rows: list = []
 
     def table(self, name):
         if name == "cases":
@@ -64,8 +65,8 @@ class _FakeSB:
             return _Query([{"is_admin": True}])
         if name == "arena_votes":
             if _FakeSB.votes_table_missing:
-                return _Query([])
-            return _Query([])
+                raise RuntimeError('relation "arena_votes" does not exist')
+            return _Query(list(_FakeSB.vote_rows))
         return _Query([])
 
 
@@ -91,6 +92,7 @@ def client(monkeypatch):
 
     _FakeSB.inserted = []
     _FakeSB.votes_table_missing = False
+    _FakeSB.vote_rows = []
     ar._SESSIONS.clear()
     monkeypatch.setattr(ar, "get_supabase_client", lambda: _FakeSB())
     monkeypatch.setattr(ar, "_require_admin", lambda authorization: "admin-1")
@@ -326,3 +328,135 @@ def test_the_real_run_turn_emits_exactly_the_contracted_arm_keys():
                 if line.strip().startswith('"') and '":' in line}
     assert ARM_KEYS <= returned, ARM_KEYS - returned
     assert "variant_id" in returned  # stripped by the route, present at source
+
+
+# ----------------------------------------------------------------------- results
+
+def _vote(left, right, choice, chosen=None, lfp="aaaaaaaaaaaa", rfp="bbbbbbbbbbbb", ct="profitability"):
+    return {"left_variant": left, "right_variant": right, "choice": choice,
+            "chosen_variant": chosen, "left_fingerprint": lfp, "right_fingerprint": rfp,
+            "case_type": ct}
+
+
+def test_results_say_so_when_there_is_no_table(client):
+    _FakeSB.votes_table_missing = True
+    body = client.get("/admin/arena/results").json()
+    assert body["available"] is False
+    assert "2026-10-14_arena_votes.sql" in body["note"]
+    assert body["total_votes"] == 0 and body["pairs"] == []
+
+
+def test_self_noise_votes_are_never_pooled_into_win_rates(client):
+    """Votes on two identical arms measure the judge. Counting them as wins would
+    invent a winner out of pure noise."""
+    _FakeSB.vote_rows = (
+        [_vote("live", "live", "left", "live") for _ in range(5)]
+        + [_vote("live", "live", "tie") for _ in range(3)]
+    )
+    body = client.get("/admin/arena/results").json()
+    assert body["pairs"] == [], "self-noise leaked into the pair tally"
+    assert body["self_noise"]["votes"] == 8
+    assert body["self_noise"]["left"] == 5
+    assert "noise floor" in body["self_noise"]["note"]
+
+
+def test_a_clean_self_noise_run_is_reported_as_reassurance(client):
+    _FakeSB.vote_rows = [_vote("live", "live", "tie") for _ in range(6)]
+    body = client.get("/admin/arena/results").json()
+    assert "not inventing differences" in body["self_noise"]["note"]
+
+
+def test_no_winner_is_named_below_the_minimum_n(client):
+    _FakeSB.vote_rows = [
+        _vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14")
+        for _ in range(3)
+    ]
+    body = client.get("/admin/arena/results").json()
+    pair = body["pairs"][0]
+    assert pair["decided_votes"] == 3
+    assert "Too few to call" in pair["verdict"]
+    assert body["min_n_for_a_verdict"] == 12
+
+
+def test_a_clear_lead_is_named_and_a_narrow_one_is_hedged(client):
+    _FakeSB.vote_rows = (
+        [_vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14") for _ in range(12)]
+        + [_vote("baseline-main", "patched-2026-10-14", "left", "baseline-main") for _ in range(2)]
+    )
+    body = client.get("/admin/arena/results").json()
+    v = body["pairs"][0]["verdict"]
+    assert "patched-2026-10-14 leads 12-2" in v and "86%" in v
+    assert "noise floor" not in v
+
+    _FakeSB.vote_rows = (
+        [_vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14") for _ in range(7)]
+        + [_vote("baseline-main", "patched-2026-10-14", "left", "baseline-main") for _ in range(6)]
+    )
+    v2 = client.get("/admin/arena/results").json()["pairs"][0]["verdict"]
+    assert "noise floor could explain it" in v2
+
+
+def test_the_same_pair_pools_regardless_of_which_side_it_rendered_on(client):
+    """Sides are randomised per session; if A-vs-B and B-vs-A made separate buckets
+    every tally would be split in half and never reach a verdict."""
+    _FakeSB.vote_rows = (
+        [_vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14",
+               lfp="aaaaaaaaaaaa", rfp="bbbbbbbbbbbb") for _ in range(6)]
+        + [_vote("patched-2026-10-14", "baseline-main", "left", "patched-2026-10-14",
+                 lfp="bbbbbbbbbbbb", rfp="aaaaaaaaaaaa") for _ in range(6)]
+    )
+    body = client.get("/admin/arena/results").json()
+    assert len(body["pairs"]) == 1
+    assert body["pairs"][0]["decided_votes"] == 12
+    assert "patched-2026-10-14 leads 12-0" in body["pairs"][0]["verdict"]
+
+
+def test_votes_against_a_different_snapshot_are_not_averaged_together(client):
+    """A re-pinned baseline is a different baseline. Pooling it would hide the change."""
+    _FakeSB.vote_rows = (
+        [_vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14",
+               lfp="oldoldoldold") for _ in range(6)]
+        + [_vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14",
+                 lfp="newnewnewnew") for _ in range(6)]
+    )
+    body = client.get("/admin/arena/results").json()
+    assert len(body["pairs"]) == 2, "two different snapshots were pooled as one experiment"
+    assert all("Too few to call" in p["verdict"] for p in body["pairs"])
+
+
+def test_position_bias_is_surfaced(client):
+    _FakeSB.vote_rows = [
+        _vote("baseline-main", "patched-2026-10-14", "left", "baseline-main") for _ in range(14)
+    ] + [_vote("baseline-main", "patched-2026-10-14", "right", "patched-2026-10-14") for _ in range(2)]
+    body = client.get("/admin/arena/results").json()
+    assert body["position"]["left"] == 14 and body["position"]["right"] == 2
+    assert "position bias" in body["position"]["note"]
+
+
+def test_ties_and_both_bad_are_counted_but_do_not_decide(client):
+    _FakeSB.vote_rows = (
+        [_vote("baseline-main", "patched-2026-10-14", "tie") for _ in range(4)]
+        + [_vote("baseline-main", "patched-2026-10-14", "both_bad") for _ in range(2)]
+    )
+    pair = client.get("/admin/arena/results").json()["pairs"][0]
+    assert pair["votes"] == 6 and pair["ties"] == 4 and pair["both_bad"] == 2
+    assert pair["decided_votes"] == 0
+    assert all(v["wins"] == 0 for v in pair["variants"])
+
+
+RESULTS_KEYS = {"available", "note", "total_votes", "min_n_for_a_verdict", "pairs",
+                "self_noise", "position"}
+PAIR_KEYS = {"variants", "votes", "ties", "both_bad", "by_case_type", "decided_votes", "verdict"}
+
+
+def test_results_shape_matches_what_the_panel_reads(client):
+    _FakeSB.vote_rows = [_vote("baseline-main", "patched-2026-10-14", "left", "baseline-main")]
+    body = client.get("/admin/arena/results").json()
+    assert set(body) == RESULTS_KEYS
+    assert set(body["pairs"][0]) == PAIR_KEYS
+    assert set(body["pairs"][0]["variants"][0]) == {"id", "fingerprint", "wins"}
+    assert set(body["position"]) == {"left", "right", "tie", "both_bad", "note"}
+    # the unavailable branch keeps the fields the panel dereferences
+    _FakeSB.votes_table_missing = True
+    missing = client.get("/admin/arena/results").json()
+    assert {"available", "note", "total_votes", "pairs", "self_noise", "position"} <= set(missing)

@@ -404,3 +404,127 @@ def arena_vote(
 def _variant_label(variant_id: str) -> Dict[str, Any]:
     spec = registry.VARIANTS[variant_id]
     return {"label": spec["label"], "origin": spec["origin"], "frozen": bool(spec["frozen"])}
+
+
+# --------------------------------------------------------------------------- results
+
+@router.get("/results")
+def arena_results(
+    limit: int = 1000,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Tally of recorded votes.
+
+    Three things this deliberately does NOT do, because each would manufacture a
+    conclusion that is not in the data:
+
+      * it does not pool SELF-NOISE runs (both arms the same variant) into win
+        rates. Those votes measure the judge, so they are reported separately as
+        your own noise floor -- the number a real result has to beat.
+      * it does not pool votes cast against DIFFERENT SNAPSHOTS of the same variant
+        id. Pairs are keyed by content fingerprint, so a re-snapshot starts a fresh
+        bucket instead of silently averaging two experiments.
+      * it does not name a winner below a minimum n, and it reports the position
+        split so a left/right habit cannot pass itself off as a preference.
+    """
+    _require_admin(authorization)
+    try:
+        rows = (get_supabase_client().table("arena_votes")
+                .select("*").order("created_at", desc=True)
+                .limit(max(1, min(limit, 5000))).execute().data) or []
+    except Exception:
+        return {
+            "available": False,
+            "note": ("No vote history: run migrations/2026-10-14_arena_votes.sql. "
+                     "The arena works without it, but nothing is being tallied."),
+            "total_votes": 0, "pairs": [], "self_noise": None, "position": None,
+        }
+
+    def _fp(row: Dict[str, Any], side: str) -> str:
+        return (row.get(f"{side}_fingerprint") or "live")[:12]
+
+    pairs: Dict[tuple, Dict[str, Any]] = {}
+    self_noise = {"votes": 0, "left": 0, "right": 0, "tie": 0, "both_bad": 0}
+    position = {"left": 0, "right": 0, "tie": 0, "both_bad": 0}
+
+    for r in rows:
+        lv, rv = r.get("left_variant"), r.get("right_variant")
+        choice = r.get("choice")
+        if choice in position:
+            position[choice] += 1
+        if lv == rv:
+            self_noise["votes"] += 1
+            if choice in self_noise:
+                self_noise[choice] += 1
+            continue
+        # Order-independent key, so A-vs-B and B-vs-A accumulate together, but
+        # fingerprint-sensitive, so a re-snapshot does not.
+        key = tuple(sorted([(lv, _fp(r, "left")), (rv, _fp(r, "right"))]))
+        bucket = pairs.setdefault(key, {
+            "variants": [
+                {"id": key[0][0], "fingerprint": key[0][1], "wins": 0},
+                {"id": key[1][0], "fingerprint": key[1][1], "wins": 0},
+            ],
+            "votes": 0, "ties": 0, "both_bad": 0, "by_case_type": {},
+        })
+        bucket["votes"] += 1
+        if choice == "tie":
+            bucket["ties"] += 1
+        elif choice == "both_bad":
+            bucket["both_bad"] += 1
+        else:
+            winner = r.get("chosen_variant")
+            for v in bucket["variants"]:
+                if v["id"] == winner:
+                    v["wins"] += 1
+        ct = r.get("case_type") or "unknown"
+        bucket["by_case_type"][ct] = bucket["by_case_type"].get(ct, 0) + 1
+
+    MIN_N = 12
+    out_pairs = []
+    for bucket in pairs.values():
+        decided = sum(v["wins"] for v in bucket["variants"])
+        leader = max(bucket["variants"], key=lambda v: v["wins"]) if decided else None
+        runner = min(bucket["variants"], key=lambda v: v["wins"]) if decided else None
+        verdict = None
+        if decided < MIN_N:
+            verdict = (f"Only {decided} decided vote(s). Too few to call -- judge a variant on "
+                       f"{MIN_N}+ across different scenario shapes.")
+        elif leader and runner and leader["wins"] == runner["wins"]:
+            verdict = "Dead level on decided votes."
+        elif leader:
+            share = leader["wins"] / decided
+            verdict = (f"{leader['id']} leads {leader['wins']}-{runner['wins']} "
+                       f"({share:.0%} of decided votes).")
+            if share < 0.65:
+                verdict += " Close enough that your own noise floor could explain it."
+        out_pairs.append({**bucket, "decided_votes": decided, "verdict": verdict})
+
+    decided_sides = position["left"] + position["right"]
+    position_note = None
+    if decided_sides >= 10:
+        left_share = position["left"] / decided_sides
+        if left_share >= 0.7 or left_share <= 0.3:
+            position_note = (f"You picked the left pane {left_share:.0%} of the time across all "
+                             "sessions. Sides are randomised per session, so a split this lopsided "
+                             "suggests position bias rather than a prompt difference.")
+    if self_noise["votes"] >= 4:
+        picked = self_noise["left"] + self_noise["right"]
+        if picked:
+            self_noise["note"] = (
+                f"On {self_noise['votes']} self-noise turns (identical arms) you still picked a "
+                f"side {picked} time(s). That is your noise floor: a real result needs to beat it.")
+        else:
+            self_noise["note"] = (
+                f"On {self_noise['votes']} self-noise turns you called every one a tie or both-bad. "
+                "Good -- your judgements are not inventing differences.")
+
+    return {
+        "available": True,
+        "note": None,
+        "total_votes": len(rows),
+        "min_n_for_a_verdict": MIN_N,
+        "pairs": sorted(out_pairs, key=lambda p: -p["votes"]),
+        "self_noise": self_noise,
+        "position": {**position, "note": position_note},
+    }
