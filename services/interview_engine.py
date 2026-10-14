@@ -69,7 +69,8 @@ def _resolve_adaptive_llm():
 
 def _build_adaptive_messages(case_content, case_type, transcript, new_user_message,
                              clarifications_exhausted, signals, mode, instruction, allow_questions,
-                             policy, prior_state, outcome, packet=None, function=None):
+                             policy, prior_state, outcome, packet=None, function=None,
+                             messages_builder=None):
     # V12: the control packet carries the deterministic read of the learner (it
     # replaces the SESSION SIGNALS lines); the learner-profile block is unchanged.
     head = (build_mode_block(mode, instruction, allow_questions, packet, function) if packet
@@ -81,7 +82,12 @@ def _build_adaptive_messages(case_content, case_type, transcript, new_user_messa
     # must never see (and copy) that protocol label.
     transcript = [dict(t, content=strip_say_label(t.get("content") or "")) if t.get("role") == "assistant" else t
                   for t in transcript]
-    return build_adaptive_interviewer_messages(
+    # messages_builder lets the admin arena swap ONLY the prompt layer for a frozen
+    # variant (prompts/variants/) while every other part of the turn -- signals,
+    # gates, response function, control packet -- stays this exact code path. An
+    # arena that reimplemented the turn would measure a fiction. Default is live.
+    build = messages_builder or build_adaptive_interviewer_messages
+    return build(
         case_content=case_content,
         case_type=case_type,
         transcript=transcript,
@@ -107,7 +113,8 @@ def _recent_lines(transcript) -> List[str]:
 
 
 def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarifications_exhausted,
-                        teaching_policy, prior_state, channel, is_voice_partial) -> Dict[str, Any]:
+                        teaching_policy, prior_state, channel, is_voice_partial,
+                        messages_builder=None) -> Dict[str, Any]:
     """Signals -> gates -> response function -> (for model turns) control packet + messages."""
     policy = _teaching_policy(teaching_policy)
     signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state,
@@ -132,7 +139,7 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
         "messages": _build_adaptive_messages(
             case_content, case_type, tlist, new_user_message, clarifications_exhausted,
             signals, mode, instruction, allow_questions, policy, prior_state, outcome,
-            packet=packet, function=fn),
+            packet=packet, function=fn, messages_builder=messages_builder),
     })
     return plan
 
@@ -379,15 +386,21 @@ def complete_interviewer_reply(
     prior_state: Optional[dict] = None,
     control_out: Optional[dict] = None,
     channel: str = "text",
-    is_voice_partial: bool = False
+    is_voice_partial: bool = False,
+    messages_builder=None,
+    llm_override=None,
+    usage_out: Optional[dict] = None,
 ) -> str:
+    """messages_builder / llm_override are used ONLY by the admin arena
+    (services/arena.py) to pin the prompt layer and the model per arm. Both default
+    to None, which is the live production behaviour, unchanged."""
     adaptive = _adaptive_enabled()
     transcript = list(transcript)
     
     if adaptive:
         plan = _plan_adaptive_turn(case_content, case_type, transcript, new_user_message,
                                    clarifications_exhausted, teaching_policy, prior_state,
-                                   channel, is_voice_partial)
+                                   channel, is_voice_partial, messages_builder=messages_builder)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]
@@ -410,13 +423,13 @@ def complete_interviewer_reply(
 
         allow_questions = plan["allow_questions"]
         messages = plan["messages"]
-        cli, model, provider = _resolve_adaptive_llm()
+        cli, model, provider = llm_override or _resolve_adaptive_llm()
     else:
         messages = build_interviewer_messages(
             case_content=case_content, case_type=case_type, transcript=transcript,
             new_user_message=new_user_message, clarifications_exhausted=clarifications_exhausted
         )
-        cli, model, provider = resolve_llm("interviewer")
+        cli, model, provider = llm_override or resolve_llm("interviewer")
 
     def _complete(c, m):
         return c.chat.completions.create(
@@ -428,17 +441,27 @@ def complete_interviewer_reply(
             max_tokens=180,
         )
 
+    used_model, used_provider = model, provider
     try:
         resp = _complete(cli, model)
     except Exception as e:
         if provider != "openai":
             try:
                 resp = _complete(openai_client(), INTERVIEWER_MODEL)
+                used_model, used_provider = INTERVIEWER_MODEL, "openai"
             except Exception as e2:
                 raise InterviewEngineError(f"OpenAI call failed: {e2}")
         else:
             raise InterviewEngineError(f"OpenAI call failed: {e}")
-            
+
+    # The arena logs this spend itself (the caller here does not), so it needs the
+    # real response: estimated tokens would make arena cost invisible to the daily
+    # kill switch, which reads ai_usage_log.
+    if usage_out is not None:
+        usage_out["response"] = resp
+        usage_out["model"] = used_model
+        usage_out["provider"] = used_provider
+
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text = parse_control_tag(text)
