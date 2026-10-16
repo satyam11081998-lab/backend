@@ -252,3 +252,35 @@ def test_unknown_variant_is_refused_before_any_model_spend(arena):
     with pytest.raises(KeyError):
         _run(arena, variant_id="does-not-exist")
     assert not arena._test_logged
+
+
+# ------------------------------------------------- the whole prompt layer, per arm
+
+def test_each_arm_briefs_the_model_with_its_own_packet_rules(arena):
+    """v1 built the packet rules from the deployed module for BOTH arms, so the
+    branch arm never ran the branch's rules."""
+    from prompts.variants import registry
+    ids = ("baseline-main", "patched-2026-10-14")
+    for vid in ids:
+        arena._test_sink.clear()
+        _run(arena, variant_id=vid)
+        own = registry.get_variant(vid)["module"].PACKET_RULES
+        other = registry.get_variant(ids[1] if vid == ids[0] else ids[0])["module"].PACKET_RULES
+        systems = [m["content"] for call in arena._test_sink
+                   for m in call["messages"] if m["role"] == "system"]
+        assert any("INTERVIEWER CONTROL PACKET" in s and own in s for s in systems), vid
+        assert not any(other in s for s in systems), f"{vid} was briefed with the other arm's rules"
+
+
+def test_each_arm_runs_its_own_context_assessor(arena, monkeypatch):
+    """The assessor feeds the response-function DECISION, not just the wording. v1 ran
+    the deployed assessor for both arms."""
+    from prompts.variants import registry
+    from services import interview_engine as eng
+    monkeypatch.setattr(eng, "needs_contextual_assessment", lambda sig: True)
+    for vid in ("baseline-main", "patched-2026-10-14"):
+        arena._test_sink.clear()
+        _run(arena, variant_id=vid)
+        calls = [c for c in arena._test_sink if c.get("response_format")]
+        assert calls, f"{vid}: its assessor never ran"
+        assert calls[0]["messages"][0]["content"] == registry.get_variant(vid)["module"]._ASSESSOR_PROMPT

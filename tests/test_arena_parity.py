@@ -104,9 +104,9 @@ def _production(eng, transcript, message):
     return text, ctl
 
 
-def _arena(arena_mod, transcript, message, model_mode="openai-mini"):
+def _arena(arena_mod, transcript, message, model_mode="openai-mini", variant_id="live"):
     return arena_mod.run_turn(
-        case_content=CASE, case_type="profitability", variant_id="live",
+        case_content=CASE, case_type="profitability", variant_id=variant_id,
         transcript=transcript, new_user_message=message, prior_state={},
         teaching_policy="coached", model_mode=model_mode, user_id="admin-1",
     )
@@ -245,3 +245,17 @@ def test_opening_note_matches_the_row_production_seeds():
     assert '"kind": "system_note"' in src
     row = ar.opening_transcript({"title": "Spice Express"})[0]
     assert row == NOTE
+
+
+@pytest.mark.parametrize("name,transcript,message,expect_fn", LANES, ids=[l[0] for l in LANES])
+def test_the_frozen_main_arm_is_byte_identical_to_production(wired, name, transcript, message, expect_fn):
+    """While main's prompt layer is unchanged, the FROZEN main arm -- its own
+    interviewer prompt, packet rules and assessor -- must say exactly what production
+    says. That is the proof that arm A is the existing interviewer, not a copy of it."""
+    from prompts.variants import registry
+    if registry.live_matches() != "baseline-main":
+        pytest.skip("the deployed prompt layer is no longer main @ 5f66b3b")
+    prod_text, _ = _production(wired["eng"], transcript, message)
+    out = _arena(wired["arena"], transcript, message, variant_id="baseline-main")
+    assert out["error"] is None, out["error"]
+    assert out["reply"] == prod_text, f"{name}: frozen main says {out['reply']!r}, production {prod_text!r}"

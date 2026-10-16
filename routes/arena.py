@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -174,36 +175,81 @@ def _persistence_status() -> tuple[bool, str]:
 
 # --------------------------------------------------------------------------- cases
 
+# Light columns only: the picker never needs a brief, and pulling `content` for the
+# whole library would ship megabytes to list titles. `market` (migration 0070) and
+# `unlisted` (0065) are selected defensively -- a database without them still lists.
+_CASE_COLUMNS = "id,title,type,difficulty,market,unlisted,is_active,created_at"
+_CASE_COLUMNS_MIN = "id,title,type,difficulty,is_active,created_at"
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _like_term(term: str) -> str:
+    """Escape LIKE wildcards so a search for "20%" means the text, not a pattern."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("/cases")
 def arena_cases(
     q: Optional[str] = None,
     case_type: Optional[str] = None,
+    market: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    """Read-only case picker. Any case or guesstimate in the live library."""
+    """Search the WHOLE case library: every case and guesstimate, active or not,
+    listed or unlisted, India or US. The filter runs in the database, newest first,
+    a page at a time -- v1 fetched 200 arbitrary rows and filtered those, so most of
+    the library could never be picked. A pasted case id matches that case exactly."""
     _require_admin(authorization)
     sb = get_supabase_client()
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    term = (q or "").strip()
+
+    def _run(columns: str, with_market: bool):
+        qry = sb.table("cases").select(columns, count="exact")
+        if term:
+            qry = qry.eq("id", term) if _UUID_RE.match(term) else qry.ilike("title", f"%{_like_term(term)}%")
+        if case_type and case_type != "all":
+            qry = qry.eq("type", case_type)
+        if with_market and market and market != "all":
+            qry = qry.eq("market", market)
+        return qry.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+
+    markets_supported = True
     try:
-        rows = (sb.table("cases").select("*").limit(max(1, min(limit, 200))).execute().data) or []
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Could not read cases: {type(e).__name__}")
-    out = []
-    for r in rows:
-        if case_type and str(r.get("type") or "").lower() != case_type.lower():
-            continue
-        title = str(r.get("title") or "")
-        if q and q.lower() not in title.lower():
-            continue
-        out.append({
-            "id": r.get("id"),
-            "title": title,
-            "type": r.get("type"),
-            "difficulty": r.get("difficulty"),
-            "market": r.get("market"),
-            "content_chars": len(str(r.get("content") or "")),
-        })
-    return {"cases": out, "count": len(out)}
+        res = _run(_CASE_COLUMNS, True)
+    except Exception:  # noqa: BLE001 -- a column a migration adds is missing here
+        markets_supported = False
+        try:
+            res = _run(_CASE_COLUMNS_MIN, False)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Could not read cases: {type(e).__name__}")
+
+    rows = res.data or []
+    total = getattr(res, "count", None)
+    if total is None:
+        total = offset + len(rows)
+    out = [{
+        "id": r.get("id"),
+        "title": str(r.get("title") or ""),
+        "type": r.get("type"),
+        "difficulty": r.get("difficulty"),
+        "market": r.get("market"),
+        "unlisted": r.get("unlisted"),
+        "is_active": r.get("is_active"),
+        "created_at": r.get("created_at"),
+    } for r in rows]
+    return {
+        "cases": out,
+        "count": len(out),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(out) < total,
+        "markets_supported": markets_supported,
+    }
 
 
 # --------------------------------------------------------------------------- session

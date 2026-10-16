@@ -12,8 +12,9 @@ Everything except the prompt layer. Each arm runs
 services/interview_engine.stream_interviewer_reply -- the SAME generator the live text
 route consumes -- and joins it exactly as that route does. Session signals, the
 intervention gate, the response-function decision, the control packet, the presence
-lane, tag stripping, the leak guard and mode enforcement are all that code path. Only
-`messages_builder` (and the pinned model) differ per arm.
+lane, tag stripping, the leak guard and mode enforcement are all that code path. What
+differs per arm is the variant's prompt layer -- interviewer prompt, packet rules and
+context assessor (prompts/variants/registry.py) -- and the pinned model.
 
 Why the streaming path and not complete_interviewer_reply (v1 of this module used
 that): the two post-process differently. In the question-allowed functions (OPEN,
@@ -124,6 +125,9 @@ def run_turn(
     """One interviewer turn for ONE arm, on the production path. Never raises: an
     arm that fails returns an error row so the other arm's reply is still usable."""
     builder = registry.get_builder(variant_id)  # KeyError -> 400 at the route
+    # The rest of the variant's prompt layer: packet rules + context assessor. None for
+    # `live`. The assessor gets THIS module's client, so faking it here fakes both.
+    overrides = registry.get_overrides(variant_id, client_factory=lambda: openai_client())
     llm_override = _resolve_llm_override(model_mode)
     control: Dict[str, Any] = {}
     usage: Dict[str, Any] = {}
@@ -146,6 +150,7 @@ def run_turn(
             control_out=control,
             channel="text",
             messages_builder=builder,
+            prompt_overrides=overrides,
             llm_override=llm_override,
             usage_out=usage,
         )).strip()

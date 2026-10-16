@@ -31,16 +31,32 @@ class _Exec:
 
 
 class _Query(_Exec):
+    calls: list = []          # every builder call, so a test can see the SQL it built
+    fail_on_columns = None    # a column name whose presence in select() raises
+
     def select(self, *a, **k):
+        _Query.calls.append(("select", a, k))
+        if _Query.fail_on_columns and a and _Query.fail_on_columns in a[0]:
+            raise RuntimeError(f'column cases.{_Query.fail_on_columns} does not exist')
         return self
 
     def eq(self, *a, **k):
+        _Query.calls.append(("eq", a))
+        return self
+
+    def ilike(self, *a, **k):
+        _Query.calls.append(("ilike", a))
+        return self
+
+    def range(self, *a, **k):
+        _Query.calls.append(("range", a))
         return self
 
     def limit(self, *a, **k):
         return self
 
     def order(self, *a, **k):
+        _Query.calls.append(("order", a, k))
         return self
 
     def single(self):
@@ -93,6 +109,8 @@ def client(monkeypatch):
     _FakeSB.inserted = []
     _FakeSB.votes_table_missing = False
     _FakeSB.vote_rows = []
+    _Query.calls = []
+    _Query.fail_on_columns = None
     ar._SESSIONS.clear()
     monkeypatch.setattr(ar, "get_supabase_client", lambda: _FakeSB())
     monkeypatch.setattr(ar, "_require_admin", lambda authorization: "admin-1")
@@ -542,3 +560,57 @@ def test_both_arms_run_at_the_same_time(client, monkeypatch):
         "session_id": s["session_id"], "message": "help", "left": {}, "right": {}})
     assert r.status_code == 200, r.text
     assert r.json()["left"]["reply"] and r.json()["right"]["reply"]
+
+
+# ------------------------------------------------------------------- case search
+# "Any case or guesstimate": v1 fetched 200 arbitrary rows and filtered THOSE in
+# Python, so most of a 500+ item library could never be picked.
+
+CASES_KEYS = {"cases", "count", "total", "offset", "limit", "has_more", "markets_supported"}
+CASE_ROW_KEYS = {"id", "title", "type", "difficulty", "market", "unlisted", "is_active", "created_at"}
+
+
+def test_case_search_runs_in_the_database_over_the_whole_library(client):
+    r = client.get("/admin/arena/cases?q=EV chargers&case_type=guesstimate&market=IN&limit=50&offset=100")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == CASES_KEYS
+    assert all(set(row) == CASE_ROW_KEYS for row in body["cases"])
+    calls = _Query.calls
+    assert ("ilike", ("title", "%EV chargers%")) in calls
+    assert ("eq", ("type", "guesstimate")) in calls
+    assert ("eq", ("market", "IN")) in calls
+    assert ("range", (100, 149)) in calls
+    assert any(c[0] == "order" and c[1] == ("created_at",) and c[2].get("desc") for c in calls)
+    select = next(c for c in calls if c[0] == "select")
+    assert "content" not in select[1][0], "the picker must not ship every brief"
+    assert select[2].get("count") == "exact"
+    # no is_active / unlisted filter: inactive and unlisted cases are testable too
+    assert not any(c[0] == "eq" and c[1][0] in ("is_active", "unlisted") for c in calls)
+
+
+def test_a_pasted_case_id_matches_that_case_exactly(client):
+    cid = "3f2c1a9e-4b7d-4c1e-9a2b-1234567890ab"
+    client.get(f"/admin/arena/cases?q={cid}")
+    assert ("eq", ("id", cid)) in _Query.calls
+    assert not any(c[0] == "ilike" for c in _Query.calls)
+
+
+def test_search_text_is_not_treated_as_a_pattern(client):
+    client.get("/admin/arena/cases?q=20%25_off")
+    assert ("ilike", ("title", "%20\\%\\_off%")) in _Query.calls
+
+
+def test_page_size_is_clamped_and_no_filter_means_everything(client):
+    client.get("/admin/arena/cases?limit=5000")
+    assert ("range", (0, 199)) in _Query.calls
+    assert not any(c[0] in ("eq", "ilike") for c in _Query.calls)
+
+
+def test_a_database_without_the_market_column_still_lists_cases(client):
+    _Query.fail_on_columns = "market"
+    r = client.get("/admin/arena/cases?market=US")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["markets_supported"] is False
+    assert not any(c[0] == "eq" and c[1][0] == "market" for c in _Query.calls)

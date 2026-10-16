@@ -70,10 +70,11 @@ def _resolve_adaptive_llm():
 def _build_adaptive_messages(case_content, case_type, transcript, new_user_message,
                              clarifications_exhausted, signals, mode, instruction, allow_questions,
                              policy, prior_state, outcome, packet=None, function=None,
-                             messages_builder=None):
+                             messages_builder=None, packet_rules=None):
     # V12: the control packet carries the deterministic read of the learner (it
     # replaces the SESSION SIGNALS lines); the learner-profile block is unchanged.
-    head = (build_mode_block(mode, instruction, allow_questions, packet, function) if packet
+    head = (build_mode_block(mode, instruction, allow_questions, packet, function,
+                             packet_rules=packet_rules) if packet
             else build_signal_block(signals) + "\n\n" + build_mode_block(mode, instruction, allow_questions))
     block = (head
              + "\n\n" + build_learning_block(
@@ -129,13 +130,19 @@ def _recent_lines(transcript) -> List[str]:
 
 def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarifications_exhausted,
                         teaching_policy, prior_state, channel, is_voice_partial,
-                        messages_builder=None) -> Dict[str, Any]:
-    """Signals -> gates -> response function -> (for model turns) control packet + messages."""
+                        messages_builder=None, prompt_overrides=None) -> Dict[str, Any]:
+    """Signals -> gates -> response function -> (for model turns) control packet + messages.
+
+    messages_builder / prompt_overrides are the admin arena's seam (services/arena.py):
+    a frozen variant's interviewer prompt, packet rules and context assessor. None --
+    every production caller -- is the deployed prompt layer, unchanged."""
+    overrides = prompt_overrides or {}
     policy = _teaching_policy(teaching_policy)
     signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state,
                               channel=channel, is_voice_partial=is_voice_partial)
     if needs_contextual_assessment(signals):
-        signals.update(assess_context_with_llm(tlist, new_user_message, case_content))
+        assessor = overrides.get("assessor") or assess_context_with_llm
+        signals.update(assessor(tlist, new_user_message, case_content))
     decision = decide_response(signals)
     plan = {"policy": policy, "signals": signals, "decision": decision,
             "mode": decision["mode"], "function": decision["function"], "reason": decision["reason"]}
@@ -154,7 +161,8 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
         "messages": _build_adaptive_messages(
             case_content, case_type, tlist, new_user_message, clarifications_exhausted,
             signals, mode, instruction, allow_questions, policy, prior_state, outcome,
-            packet=packet, function=fn, messages_builder=messages_builder),
+            packet=packet, function=fn, messages_builder=messages_builder,
+            packet_rules=overrides.get("packet_rules")),
     })
     return plan
 
@@ -246,12 +254,14 @@ def stream_interviewer_reply(
     messages_builder=None,
     llm_override=None,
     usage_out: Optional[dict] = None,
+    prompt_overrides: Optional[dict] = None,
 ) -> Generator[str, None, None]:
     """The production turn: /attempts/{id}/messages (text, SSE) and the voice route.
 
-    messages_builder / llm_override / usage_out exist ONLY for the admin arena
-    (services/arena.py), so it can run THIS path -- the one users get -- with a
-    frozen prompt variant and a pinned model per arm. All three default to None,
+    messages_builder / prompt_overrides / llm_override / usage_out exist ONLY for the
+    admin arena (services/arena.py), so it can run THIS path -- the one users get --
+    with a frozen prompt layer (interviewer prompt, packet rules, context assessor)
+    and a pinned model per arm. All four default to None,
     which is the live behaviour, unchanged. When usage_out is given the caller takes
     over usage logging (see _record_or_log) and receives the raw model text.
     """
@@ -262,7 +272,8 @@ def stream_interviewer_reply(
         tlist = list(transcript)
         plan = _plan_adaptive_turn(case_content, case_type, tlist, new_user_message,
                                    clarifications_exhausted, teaching_policy, prior_state,
-                                   channel, is_voice_partial, messages_builder=messages_builder)
+                                   channel, is_voice_partial, messages_builder=messages_builder,
+                                   prompt_overrides=prompt_overrides)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]
@@ -440,6 +451,7 @@ def complete_interviewer_reply(
     messages_builder=None,
     llm_override=None,
     usage_out: Optional[dict] = None,
+    prompt_overrides: Optional[dict] = None,
 ) -> str:
     """messages_builder / llm_override are used ONLY by the admin arena
     (services/arena.py) to pin the prompt layer and the model per arm. Both default
@@ -450,7 +462,8 @@ def complete_interviewer_reply(
     if adaptive:
         plan = _plan_adaptive_turn(case_content, case_type, transcript, new_user_message,
                                    clarifications_exhausted, teaching_policy, prior_state,
-                                   channel, is_voice_partial, messages_builder=messages_builder)
+                                   channel, is_voice_partial, messages_builder=messages_builder,
+                                   prompt_overrides=prompt_overrides)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]

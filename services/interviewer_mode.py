@@ -168,7 +168,10 @@ _PACKET_RULES = (
 
 def build_mode_block(mode: str, instruction: str, allow_questions: bool,
                      control_packet: Optional[Dict[str, Any]] = None,
-                     function: Optional[str] = None) -> str:
+                     function: Optional[str] = None,
+                     packet_rules: Optional[str] = None) -> str:
+    # packet_rules: the admin arena passes a frozen variant's rules here; None (every
+    # production caller) means this module's _PACKET_RULES, unchanged.
     q_str = "YES (max 1)" if allow_questions else "NO (do not ask follow-ups)"
     head = f"YOUR MOVE THIS TURN: {mode}"
     if function and function != mode:
@@ -179,7 +182,7 @@ def build_mode_block(mode: str, instruction: str, allow_questions: bool,
     if control_packet:
         block += ("\n\nINTERVIEWER CONTROL PACKET (decision brief for this turn):\n"
                   + json.dumps(control_packet, ensure_ascii=False)
-                  + "\n" + _PACKET_RULES)
+                  + "\n" + (_PACKET_RULES if packet_rules is None else packet_rules))
     return block
 
 # -----------------------------------------------------------------------------
