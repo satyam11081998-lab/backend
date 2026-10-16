@@ -8,11 +8,20 @@ same case and the same candidate turn, and reports both a subjective reply and
 objective per-reply signals.
 
 WHAT IS SHARED WITH PRODUCTION (deliberately)
-Everything except the prompt layer: session signals, the intervention gate, the
-response-function decision, the control packet, tag parsing, mode enforcement and
-reply sanitising all run through services/interview_engine.complete_interviewer_reply.
-Only `messages_builder` differs per arm. An arena that reimplemented the turn would
-measure a fiction, so it does not.
+Everything except the prompt layer. Each arm runs
+services/interview_engine.stream_interviewer_reply -- the SAME generator the live text
+route consumes -- and joins it exactly as that route does. Session signals, the
+intervention gate, the response-function decision, the control packet, the presence
+lane, tag stripping, the leak guard and mode enforcement are all that code path. Only
+`messages_builder` (and the pinned model) differ per arm.
+
+Why the streaming path and not complete_interviewer_reply (v1 of this module used
+that): the two post-process differently. In the question-allowed functions (OPEN,
+TARGETED_QUESTION, PROBE, RETHINK_CUE ...) production streams the reply straight to
+the candidate with NO sanitize_reply, so a stacked second question or a praise opener
+reaches the user. complete_interviewer_reply sanitises every reply, so the arena
+showed a cleaner interviewer than users get -- on exactly the turns worth judging.
+tests/test_arena_isolation.py now pins arena text == production text on such a turn.
 
 WHAT IS ISOLATED (deliberately)
   * no attempts / attempt_messages row is created or touched
@@ -33,11 +42,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from prompts.variants import registry
-from services.ai_providers import openai_client, resolve_llm
+from services.ai_providers import openai_client
 from services.ai_usage import log_ai_usage
 from services.interview_engine import (
     InterviewEngineError,
-    complete_interviewer_reply,
+    stream_interviewer_reply,
 )
 from services.interviewer_decision import (
     detect_violations,
@@ -112,8 +121,8 @@ def run_turn(
     clarifications_exhausted: bool = False,
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """One interviewer turn for ONE arm. Never raises: an arm that fails returns an
-    error row so the other arm's reply is still usable and comparable."""
+    """One interviewer turn for ONE arm, on the production path. Never raises: an
+    arm that fails returns an error row so the other arm's reply is still usable."""
     builder = registry.get_builder(variant_id)  # KeyError -> 400 at the route
     llm_override = _resolve_llm_override(model_mode)
     control: Dict[str, Any] = {}
@@ -122,11 +131,15 @@ def run_turn(
     error = None
     text = ""
     try:
-        text = complete_interviewer_reply(
+        # Consumed exactly as the live text route consumes it: every chunk, joined,
+        # stripped. usage_out makes the engine hand its model calls (and the raw model
+        # text) back here instead of logging them as production traffic.
+        text = "".join(stream_interviewer_reply(
             case_content=case_content,
             case_type=case_type,
             transcript=transcript,
             new_user_message=new_user_message,
+            user_id=user_id,
             clarifications_exhausted=clarifications_exhausted,
             teaching_policy=teaching_policy,
             prior_state=prior_state,
@@ -135,49 +148,53 @@ def run_turn(
             messages_builder=builder,
             llm_override=llm_override,
             usage_out=usage,
-        )
+        )).strip()
     except InterviewEngineError as e:
         error = f"interviewer failed: {e}"
     except Exception as e:  # noqa: BLE001
         error = f"{type(e).__name__}: {e}"
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
-    # Log real token usage so arena spend is visible to the daily kill switch.
-    if usage.get("response") is not None:
+    # Every model call the turn made, with real token counts, under the arena's own
+    # endpoint so the daily kill switch sees it without it counting as production
+    # interviewer traffic. The deterministic lanes record a zero-cost "local" call;
+    # nothing was spent, so nothing is logged.
+    spent_calls = [c for c in (usage.get("calls") or []) if c.get("model") != "local"]
+    for call in spent_calls:
         log_ai_usage(
             user_id=user_id,
             endpoint=ARENA_ENDPOINT,
-            model=usage.get("model") or "",
-            response=usage["response"],
-            latency_ms=latency_ms,
+            model=call.get("model") or "",
+            response=call.get("response"),
+            latency_ms=call.get("latency_ms"),
             success=error is None,
-            meta={"arena_variant": variant_id, "model_mode": model_mode},
+            meta={"arena_variant": variant_id, "model_mode": model_mode,
+                  "engine_endpoint": call.get("endpoint")},
         )
 
     silent = _is_silence(control, text)
     tag = control.get("tag") or {}
     # CRITICAL for interpreting a comparison: V11 decides many turns in a
     # DETERMINISTIC lane -- "silent" (say nothing) or "fast" (a canned beat like
-    # "Mm-hm. Go on."). Those lanes never build a prompt, so on such a turn BOTH
-    # arms emit byte-identical text and the variant had no effect whatsoever.
-    # Reading that as "the prompts are equivalent" is the easiest wrong conclusion
-    # this tool could invite, so every arm reports whether its prompt was consulted.
+    # "Go ahead."). Those lanes never build a prompt, so on such a turn BOTH arms
+    # emit byte-identical text and the variant had no effect whatsoever. Reading
+    # that as "the prompts are equivalent" is the easiest wrong conclusion this tool
+    # could invite, so every arm reports whether its prompt was consulted.
     prompt_consulted = str(control.get("render") or "") == "model"
 
-    # What the MODEL actually said, before enforce_mode/sanitise rewrote it. In some
-    # modes (HINT especially) the enforcer replaces the reply outright, so a visible
-    # difference between the arms can be the enforcer's doing and not the prompt's.
-    # Showing both is the only way to attribute a change to the right layer.
+    # What the MODEL said, before production's post-processing (tag strip, leak
+    # guard, enforce_mode in the no-question functions, the presence-line filter).
+    # Where that post-processing rewrote the reply, the visible difference between
+    # arms is not the prompt's doing, so both texts are shown.
     raw_reply = ""
-    resp = usage.get("response")
-    if resp is not None:
+    if usage.get("raw_text"):
         try:
-            _, raw_reply = parse_control_tag((resp.choices[0].message.content or "").strip())
+            _, raw_reply = parse_control_tag(str(usage["raw_text"]).strip())
             raw_reply = (raw_reply or "").strip()
         except Exception:  # noqa: BLE001
             raw_reply = ""
-    # Next state for THIS arm only. compute_signals and update_session_state are both
-    # pure; nothing here is written to the database.
+    # Next state for THIS arm only, folded the way production folds it after a turn
+    # (compute_signals + update_session_state, both pure). Nothing is written.
     next_state = prior_state or {}
     if not error and (tag or control.get("function")):
         try:
@@ -206,12 +223,15 @@ def run_turn(
             "hint": tag.get("hint"),
             "fallback": bool(control.get("fallback")),
         },
-        # Deterministic guardrail breaches: objective, taste-free, and the fastest
-        # way to see a regression the eye would miss.
+        # Deterministic guardrail breaches, measured on the text the candidate would
+        # actually receive: objective, taste-free, and the fastest way to see a
+        # regression the eye would miss.
         "violations": detect_violations(text, teaching_policy, tag) if text else [],
         "metrics": _reply_metrics(text),
         "latency_ms": latency_ms,
-        "model": usage.get("model") or (llm_override[1] if llm_override else resolve_llm("interviewer")[1]),
-        "provider": usage.get("provider") or (llm_override[2] if llm_override else None),
+        # None when no model ran (a deterministic lane), rather than naming a model
+        # that never answered.
+        "model": usage.get("model") if spent_calls else None,
+        "provider": usage.get("provider") if spent_calls else None,
         "next_state": next_state,
     }

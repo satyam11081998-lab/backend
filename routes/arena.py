@@ -20,6 +20,7 @@ import os
 import random
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException
@@ -29,6 +30,7 @@ from prompts.variants import registry
 from services.ai_usage import assert_daily_budget
 from services.arena import DEFAULT_MODEL_MODE, model_modes, run_turn
 from services.auth import get_verified_user, is_guest_user
+from services.clarification_counter import count_clarifications
 from services.markets import llm_case_content
 from services.rate_limit import check_rate_limit
 from services.supabase_client import get_supabase_client
@@ -42,6 +44,34 @@ _SESSION_CAP = 200
 
 # session_id -> {sides: {"left": variant_id, "right": variant_id}, ...}
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+# Both arms of a turn run at once: each is one or two model calls, and running them
+# one after the other made every turn wait for both. Latency is still measured per
+# arm, inside run_turn.
+_ARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="arena-arm")
+
+# --- production parity ------------------------------------------------------------
+# Two things every real attempt has that v1 of the arena left out. Both are copied
+# from routes/attempts.py rather than imported (importing that route drags the whole
+# attempts stack into this one), and tests/test_arena_parity.py reads attempts.py and
+# fails the moment either copy drifts.
+#
+# 1. The clarifying-question quota by plan (contract C9). When it runs out, the
+#    interviewer is told so and declines in character -- different behaviour, and
+#    most users are on the free plan's 7.
+CLARIFICATION_QUOTA = {"free": 7, "lite": 12, "pro": 20}
+DEFAULT_TIER = "free"
+
+
+# 2. The system note seeded as the first row of every attempt. The interviewer reads
+#    it on every turn (and the variants differ in how they treat a system turn), so a
+#    conversation without it is not the production conversation.
+def opening_transcript(case: Dict[str, Any]) -> List[Dict[str, str]]:
+    return [{
+        "role": "system",
+        "kind": "system_note",
+        "content": f"Case ready: {case.get('title')}. Ask any clarifying questions before structuring.",
+    }]
 
 
 def _require_admin(authorization: Optional[str]) -> str:
@@ -120,6 +150,9 @@ def arena_config(authorization: Optional[str] = Header(default=None)) -> Dict[st
         "model_modes": model_modes(),
         "default_model_mode": DEFAULT_MODEL_MODE,
         "teaching_policies": ["coached", "exam"],
+        # The plan the simulated candidate is on: sets the clarifying-question quota.
+        "tiers": [{"id": t, "quota": q} for t, q in CLARIFICATION_QUOTA.items()],
+        "default_tier": DEFAULT_TIER,
         "seed_scenarios": _seed_scenarios(),
         "votes_persisted": persisted,
         "persistence_note": reason,
@@ -181,6 +214,7 @@ class StartArenaRequest(BaseModel):
     variant_b: str
     model_mode: str = DEFAULT_MODEL_MODE
     teaching_policy: str = "coached"
+    tier: str = DEFAULT_TIER
 
 
 @router.post("/session")
@@ -195,6 +229,8 @@ def start_session(
             raise HTTPException(status_code=400, detail=f"Unknown variant: {vid}")
     if body.teaching_policy not in ("coached", "exam"):
         raise HTTPException(status_code=400, detail="teaching_policy must be coached or exam")
+    if body.tier not in CLARIFICATION_QUOTA:
+        raise HTTPException(status_code=400, detail="tier must be free, lite or pro")
 
     sb = get_supabase_client()
     try:
@@ -218,6 +254,9 @@ def start_session(
         "sides": {"left": pair[0], "right": pair[1]},
         "model_mode": body.model_mode,
         "teaching_policy": body.teaching_policy,
+        "tier": body.tier,
+        "clar_quota": CLARIFICATION_QUOTA[body.tier],
+        "clar_used": 0,
         "turns": 0,
         "votes": 0,
     }
@@ -234,6 +273,15 @@ def start_session(
         },
         "teaching_policy": body.teaching_policy,
         "model_mode": body.model_mode,
+        # What a real attempt starts with. The client seeds BOTH arms with it, so
+        # every turn the interviewer reads the same conversation production would.
+        "opening_transcript": opening_transcript(case),
+        "clarification": {
+            "tier": body.tier,
+            "quota": CLARIFICATION_QUOTA[body.tier],
+            "used": 0,
+            "remaining": CLARIFICATION_QUOTA[body.tier],
+        },
         # Deliberately absent: which variant is on which side.
         "blinded": True,
         "self_noise_run": body.variant_a == body.variant_b,
@@ -292,22 +340,41 @@ def arena_turn(
     case_content = llm_case_content(case)
     case_type = case.get("type") or sess.get("case_type") or "profitability"
 
+    # Clarifying-question quota, computed the way post_message computes it: the
+    # same counter, spent before the model call, and "exhausted" only on a turn that
+    # asks for something once the quota is gone. Both arms receive the same
+    # candidate turn, so one count serves both.
+    quota = int(sess.get("clar_quota") or CLARIFICATION_QUOTA[DEFAULT_TIER])
+    used = int(sess.get("clar_used") or 0)
+    clar_count = count_clarifications(msg, "text")
+    quota_exhausted = (quota - used) <= 0
+    clarifications_spent = clar_count > 0 and quota_exhausted
+    if clar_count > 0 and not quota_exhausted:
+        used = min(quota, used + clar_count)
+    sess["clar_used"] = used
+    exhausted_for_turn = clarifications_spent or bool(body.clarifications_exhausted)
+
+    arm_inputs = {"left": body.left, "right": body.right}
+    futures = {
+        side: _ARM_POOL.submit(
+            run_turn,
+            case_content=case_content,
+            case_type=case_type,
+            variant_id=sess["sides"][side],
+            transcript=_clean_transcript(arm_inputs[side].transcript),
+            new_user_message=msg,
+            prior_state=arm_inputs[side].prior_state,
+            teaching_policy=sess["teaching_policy"],
+            model_mode=sess["model_mode"],
+            clarifications_exhausted=exhausted_for_turn,
+            user_id=uid,
+        )
+        for side in ("left", "right")
+    }
     results: Dict[str, Any] = {}
-    for side, arm_in in (("left", body.left), ("right", body.right)):
-        variant_id = sess["sides"][side]
+    for side, fut in futures.items():
         try:
-            out = run_turn(
-                case_content=case_content,
-                case_type=case_type,
-                variant_id=variant_id,
-                transcript=_clean_transcript(arm_in.transcript),
-                new_user_message=msg,
-                prior_state=arm_in.prior_state,
-                teaching_policy=sess["teaching_policy"],
-                model_mode=sess["model_mode"],
-                clarifications_exhausted=bool(body.clarifications_exhausted),
-                user_id=uid,
-            )
+            out = fut.result()
         except KeyError:
             raise HTTPException(status_code=400, detail=f"Unknown variant on {side}")
         # Strip the one field that would break the blind.
@@ -331,6 +398,14 @@ def arena_turn(
         ),
         "replies_identical": identical,
         "self_noise_run": sess["sides"]["left"] == sess["sides"]["right"],
+        "clarification": {
+            "counted": clar_count,
+            "quota": quota,
+            "used": used,
+            "remaining": max(0, quota - used),
+            # True when this turn ran with the "you are out of questions" directive.
+            "exhausted_this_turn": exhausted_for_turn,
+        },
     }
 
 

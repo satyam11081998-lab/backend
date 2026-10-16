@@ -107,6 +107,21 @@ class _NoUsage:
     id = None
 
 
+def _record_or_log(usage_out, *, user_id, endpoint, model, response, latency_ms, provider=None):
+    """Production (usage_out is None): log_ai_usage with exactly the arguments it
+    always had. Admin arena (usage_out is a dict): hand the call to the caller
+    instead, which logs it under its own endpoint -- so arena spend stays visible to
+    the daily kill switch without being counted as production interviewer traffic."""
+    if usage_out is None:
+        log_ai_usage(user_id=user_id, endpoint=endpoint, model=model,
+                     response=response, latency_ms=latency_ms)
+        return
+    usage_out.setdefault("calls", []).append({
+        "endpoint": endpoint, "model": model, "provider": provider,
+        "response": response, "latency_ms": latency_ms,
+    })
+
+
 def _recent_lines(transcript) -> List[str]:
     return [(t.get("content") or "").strip() for t in transcript
             if t.get("role") == "assistant" and (t.get("content") or "").strip()][-3:]
@@ -155,15 +170,19 @@ def _set_control(control_out, plan, tag, render):
     control_out["reason"] = plan["reason"]
 
 
-def _contextual_line(plan, new_user_message, channel, user_id) -> Dict[str, Any]:
+def _contextual_line(plan, new_user_message, channel, user_id,
+                     llm=None, usage_out=None) -> Dict[str, Any]:
     """Word a contextual presence beat from the control packet.
 
     One model call; one regeneration if the line is unusable (leaked metadata,
     empty after the question/claim filter, or picks up nothing the candidate
     said); then a plain fast-lane hand-back. A presence beat never becomes an
     error and never becomes a stock line while the model can do better.
+
+    llm / usage_out are for the admin arena only (pin the model per arm, take over
+    usage logging); both default to None, which is the production behaviour.
     """
-    cli, model, provider = _resolve_adaptive_llm()
+    cli, model, provider = llm or _resolve_adaptive_llm()
     messages = list(plan["messages"])
     max_sent = plan["packet"]["interviewer_control"]["response_generation"]["target_sentence_count"]
     tag: Dict[str, str] = {}
@@ -180,9 +199,12 @@ def _contextual_line(plan, new_user_message, channel, user_id) -> Dict[str, Any]
             print(f"[interviewer] contextual_generation_failed function={plan['function']} "
                   f"error={type(e).__name__}")
             break
-        log_ai_usage(user_id=user_id, endpoint="/attempts/messages/contextual", model=model,
-                     response=resp, latency_ms=int((time.time() - t0) * 1000))
+        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages/contextual",
+                       model=model, response=resp, latency_ms=int((time.time() - t0) * 1000),
+                       provider=provider)
         raw = (resp.choices[0].message.content or "").strip()
+        if usage_out is not None:
+            usage_out.update(raw_text=raw, model=model, provider=provider)
         tag, clean = parse_control_tag(raw)
         line, problems = validate_contextual_line(clean, new_user_message, channel, max_sent)
         if line and not problems:
@@ -220,15 +242,27 @@ def stream_interviewer_reply(
     prior_state: Optional[dict] = None,
     control_out: Optional[dict] = None,
     channel: str = "text",
-    is_voice_partial: bool = False
+    is_voice_partial: bool = False,
+    messages_builder=None,
+    llm_override=None,
+    usage_out: Optional[dict] = None,
 ) -> Generator[str, None, None]:
+    """The production turn: /attempts/{id}/messages (text, SSE) and the voice route.
+
+    messages_builder / llm_override / usage_out exist ONLY for the admin arena
+    (services/arena.py), so it can run THIS path -- the one users get -- with a
+    frozen prompt variant and a pinned model per arm. All three default to None,
+    which is the live behaviour, unchanged. When usage_out is given the caller takes
+    over usage logging (see _record_or_log) and receives the raw model text.
+    """
     adaptive = _adaptive_enabled()
+    fell_back = False
     
     if adaptive:
         tlist = list(transcript)
         plan = _plan_adaptive_turn(case_content, case_type, tlist, new_user_message,
                                    clarifications_exhausted, teaching_policy, prior_state,
-                                   channel, is_voice_partial)
+                                   channel, is_voice_partial, messages_builder=messages_builder)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]
@@ -238,8 +272,9 @@ def stream_interviewer_reply(
             t0 = time.time()
             _set_control(control_out, plan, {"mode": "NO_OUTPUT", "intervention": "silence"}, "silent")
             yield ""
-            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_silence", model="local",
-                         response=_NoUsage(), latency_ms=max(1, int((time.time() - t0) * 1000)))
+            _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages/fastlane_silence",
+                           model="local", response=_NoUsage(),
+                           latency_ms=max(1, int((time.time() - t0) * 1000)))
             return
 
         # FAST LANE: a minimal turn gets a minimal beat (0 tokens). Only SHORT_ACK /
@@ -253,13 +288,15 @@ def stream_interviewer_reply(
                 yield fast_event_dict["data"]["text"]
             else:
                 yield json.dumps(fast_event_dict)
-            log_ai_usage(user_id=user_id, endpoint="/attempts/messages/fastlane_event", model="local",
-                         response=_NoUsage(), latency_ms=max(1, int((time.time() - t0) * 1000)))
+            _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages/fastlane_event",
+                           model="local", response=_NoUsage(),
+                           latency_ms=max(1, int((time.time() - t0) * 1000)))
             return
 
         # CONTEXTUAL PRESENCE: the model words the beat from the control packet.
         if function in CONTEXTUAL_PRESENCE:
-            out = _contextual_line(plan, new_user_message, channel, user_id)
+            out = _contextual_line(plan, new_user_message, channel, user_id,
+                                   llm=llm_override, usage_out=usage_out)
             _set_control(control_out, plan, out["tag"], "fast" if out["fallback"] else "model")
             if control_out is not None and out["fallback"]:
                 control_out["fallback"] = True
@@ -270,13 +307,13 @@ def stream_interviewer_reply(
         # briefed by the control packet.
         allow_questions = plan["allow_questions"]
         messages = plan["messages"]
-        cli, model, provider = _resolve_adaptive_llm()
+        cli, model, provider = llm_override or _resolve_adaptive_llm()
     else:
         messages = build_interviewer_messages(
             case_content=case_content, case_type=case_type, transcript=transcript,
             new_user_message=new_user_message, clarifications_exhausted=clarifications_exhausted
         )
-        cli, model, provider = resolve_llm("interviewer")
+        cli, model, provider = llm_override or resolve_llm("interviewer")
 
     def _complete(c, m):
         return c.chat.completions.create(
@@ -309,6 +346,7 @@ def stream_interviewer_reply(
         except Exception as e:
             if provider != "openai":
                 cli, model = openai_client(), INTERVIEWER_MODEL
+                fell_back = True
                 resp = _complete(cli, model)
             else:
                 raise InterviewEngineError(f"OpenAI call failed: {e}")
@@ -319,10 +357,14 @@ def stream_interviewer_reply(
         
         if control_out is not None:
             _set_control(control_out, plan, tag or {}, "model")
+        if usage_out is not None:
+            usage_out.update(raw_text=raw_text, model=model,
+                             provider="openai" if fell_back else provider)
             
         yield final_text
-        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
-                     response=resp, latency_ms=int((time.time() - t0) * 1000))
+        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages", model=model,
+                       response=resp, latency_ms=int((time.time() - t0) * 1000),
+                       provider="openai" if fell_back else provider)
         return
 
     # STANDARD STREAMING
@@ -331,6 +373,7 @@ def stream_interviewer_reply(
     except Exception as e:
         if provider != "openai":
             cli, model = openai_client(), INTERVIEWER_MODEL
+            fell_back = True
             try:
                 stream = _open_stream(cli, model)
             except Exception as e2:
@@ -345,6 +388,7 @@ def stream_interviewer_reply(
     final = _U()
     stripper = StreamTagStripper() if adaptive else None
     guard = StreamLeakGuard() if adaptive else None
+    raw_parts: Optional[List[str]] = [] if usage_out is not None else None
     try:
         for chunk in stream:
             if getattr(chunk, "usage", None):
@@ -356,6 +400,8 @@ def stream_interviewer_reply(
             except (AttributeError, IndexError):
                 token = None
             if token:
+                if raw_parts is not None:
+                    raw_parts.append(token)
                 if stripper is not None:
                     for _out in stripper.feed(token):
                         yield from guard.feed(_out)
@@ -372,8 +418,12 @@ def stream_interviewer_reply(
     except Exception as e:
         raise InterviewEngineError(f"Stream interrupted: {e}")
     finally:
-        log_ai_usage(user_id=user_id, endpoint="/attempts/messages", model=model,
-                     response=final, latency_ms=int((time.time() - t0) * 1000))
+        if usage_out is not None:
+            usage_out.update(raw_text="".join(raw_parts or []), model=model,
+                             provider="openai" if fell_back else provider)
+        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages", model=model,
+                       response=final, latency_ms=int((time.time() - t0) * 1000),
+                       provider="openai" if fell_back else provider)
 
 
 def complete_interviewer_reply(

@@ -48,6 +48,15 @@ class _FakeCompletions:
 
     def create(self, **kwargs):
         self._sink.append(kwargs)
+        if kwargs.get("stream"):
+            # The arena now runs the production STREAMING path, which asks for a
+            # stream on question-allowed turns.
+            c = self._content
+            toks = [c[i:i + 7] for i in range(0, len(c), 7)]
+            chunks = [type("K", (), {"choices": [type("Ch", (), {"delta": _Msg(t)})()],
+                                     "usage": None, "id": "fake-1"})() for t in toks]
+            chunks.append(type("K", (), {"choices": [], "usage": _Usage(), "id": "fake-1"})())
+            return iter(chunks)
         return _Resp(self._content)
 
 
@@ -209,8 +218,10 @@ def test_violations_are_reported_for_an_offending_reply(arena, monkeypatch):
     monkeypatch.setattr(eng, "_resolve_adaptive_llm", lambda: (client, "gpt-4o-mini", "openai"))
     monkeypatch.setattr(arena, "openai_client", lambda: client)
     out = _run(arena)
-    # detect_violations runs on the SHIPPED reply -- the same text production logs a
-    # violation against -- so whatever the sanitiser removed is legitimately gone.
+    # MODEL_TURN routes to a no-question function, where production ALSO runs the
+    # sanitiser (enforce_mode) -- so here the gush is legitimately gone from the
+    # shipped text. On question-allowed turns production does not sanitise; that
+    # case is pinned in tests/test_arena_parity.py.
     assert "banned_isnt_specified" in out["violations"]
     assert "Great job" not in out["reply"], "the sanitiser should have removed the gush"
     # The gush and the double question survive in the raw model text, which is why

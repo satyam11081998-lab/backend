@@ -289,14 +289,17 @@ CONTROL_KEYS = {
 }
 TURN_KEYS = {
     "session_id", "turn_index", "left", "right", "comparable",
-    "not_comparable_reason", "replies_identical", "self_noise_run",
+    "not_comparable_reason", "replies_identical", "self_noise_run", "clarification",
 }
-SESSION_KEYS = {"session_id", "case", "teaching_policy", "model_mode", "blinded", "self_noise_run"}
+TURN_CLARIFICATION_KEYS = {"counted", "quota", "used", "remaining", "exhausted_this_turn"}
+SESSION_KEYS = {"session_id", "case", "teaching_policy", "model_mode", "blinded", "self_noise_run",
+                "opening_transcript", "clarification"}
+SESSION_CLARIFICATION_KEYS = {"tier", "quota", "used", "remaining"}
 VOTE_KEYS = {"persisted", "detail", "reveal", "session_votes", "small_n_warning"}
 CONFIG_KEYS = {
     "variants", "live_matches", "default_arm_a", "default_arm_b", "model_modes",
     "default_model_mode", "teaching_policies", "seed_scenarios", "votes_persisted",
-    "persistence_note", "limits",
+    "persistence_note", "limits", "tiers", "default_tier",
 }
 
 
@@ -305,9 +308,12 @@ def test_response_shapes_match_what_the_admin_page_reads(client):
     s = _start(client)
     assert set(s) == SESSION_KEYS
     assert set(s["case"]) == {"id", "title", "type", "difficulty", "content"}
+    assert set(s["clarification"]) == SESSION_CLARIFICATION_KEYS
+    assert all(set(r) == {"role", "kind", "content"} for r in s["opening_transcript"])
     t = client.post("/admin/arena/turn", json={
         "session_id": s["session_id"], "message": "help", "left": {}, "right": {}}).json()
     assert set(t) == TURN_KEYS
+    assert set(t["clarification"]) == TURN_CLARIFICATION_KEYS
     for side in ("left", "right"):
         assert set(t[side]) == ARM_KEYS, side
         assert set(t[side]["control"]) == CONTROL_KEYS, side
@@ -461,3 +467,78 @@ def test_results_shape_matches_what_the_panel_reads(client):
     _FakeSB.votes_table_missing = True
     missing = client.get("/admin/arena/results").json()
     assert {"available", "note", "total_votes", "pairs", "self_noise", "position"} <= set(missing)
+
+
+# ------------------------------------------------------------- production parity
+
+def test_session_opens_with_the_note_every_real_attempt_starts_with(client):
+    s = _start(client)
+    assert s["opening_transcript"] == [{
+        "role": "system", "kind": "system_note",
+        "content": "Case ready: Spice Express. Ask any clarifying questions before structuring."}]
+    # Free is the default: it is the plan most real candidates are on.
+    assert s["clarification"] == {"tier": "free", "quota": 7, "used": 0, "remaining": 7}
+
+
+def test_the_opening_note_reaches_both_arms_as_a_system_turn(client):
+    s = _start(client)
+    note = s["opening_transcript"]
+    client.post("/admin/arena/turn", json={
+        "session_id": s["session_id"], "message": "help",
+        "left": {"transcript": note}, "right": {"transcript": note}})
+    for call in client.calls:
+        assert call["transcript"][0] == note[0], "system_note lost on the way to the engine"
+
+
+def test_quota_is_spent_like_production_and_exhaustion_reaches_both_arms(client):
+    s = _start(client)  # free: 7
+    def turn(msg):
+        client.calls.clear()
+        return client.post("/admin/arena/turn", json={
+            "session_id": s["session_id"], "message": msg, "left": {}, "right": {}}).json()
+
+    t1 = turn("What is the market? Which cities? How many outlets? Delivery share? AOV? Margin? Growth?")
+    assert t1["clarification"]["counted"] == 7
+    assert t1["clarification"]["remaining"] == 0
+    # The quota is spent BY this turn, so this turn is still answered normally.
+    assert t1["clarification"]["exhausted_this_turn"] is False
+    assert all(c["clarifications_exhausted"] is False for c in client.calls)
+
+    t2 = turn("And what is the rent per outlet?")
+    assert t2["clarification"]["exhausted_this_turn"] is True
+    assert len(client.calls) == 2
+    assert all(c["clarifications_exhausted"] is True for c in client.calls)
+
+    # A statement asks for nothing, so it never triggers the directive.
+    t3 = turn("I'll assume rent is 15% of revenue and move on.")
+    assert t3["clarification"]["counted"] == 0
+    assert t3["clarification"]["exhausted_this_turn"] is False
+
+
+def test_a_higher_plan_gets_the_higher_quota(client):
+    r = client.post("/admin/arena/session", json={
+        "case_id": "case-1", "variant_a": "live", "variant_b": "baseline-main", "tier": "pro"})
+    assert r.status_code == 200
+    assert r.json()["clarification"]["quota"] == 20
+    assert client.post("/admin/arena/session", json={
+        "case_id": "case-1", "variant_a": "live", "variant_b": "live",
+        "tier": "platinum"}).status_code == 400
+
+
+def test_both_arms_run_at_the_same_time(client, monkeypatch):
+    """Each arm waits at a two-party barrier. Run one after the other, the first arm
+    would wait alone until the barrier times out -- so this passes only if the two
+    arms really are in flight together."""
+    import threading
+    barrier = threading.Barrier(2, timeout=3)
+
+    def _concurrent_arm(**kw):
+        barrier.wait()
+        return dict(TURN_OUT, variant_id=kw["variant_id"])
+
+    monkeypatch.setattr(client.mod, "run_turn", _concurrent_arm)
+    s = _start(client)
+    r = client.post("/admin/arena/turn", json={
+        "session_id": s["session_id"], "message": "help", "left": {}, "right": {}})
+    assert r.status_code == 200, r.text
+    assert r.json()["left"]["reply"] and r.json()["right"]["reply"]
