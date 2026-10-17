@@ -735,3 +735,21 @@ def test_judge_failure_is_reported_not_passed(client, monkeypatch):
     r = client.post("/admin/arena/judge", json={"scenario_id": "wants_to_stop_frustrated", "reply": "ok"}).json()
     assert r["pass"] is False and r["judge_pass"] is None and "judge error" in r["why"]
     assert client.post("/admin/arena/judge", json={"scenario_id": "nope", "reply": "x"}).status_code == 404
+
+
+def test_case_endpoint_returns_the_brief_and_the_production_opening_note(client):
+    r = client.get("/admin/arena/case?case_id=case-1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"case", "opening_transcript"}
+    assert set(body["case"]) == {"id", "title", "type", "difficulty", "content"}
+    assert body["case"]["content"] == CASE["content"]
+    assert body["opening_transcript"] == client.mod.opening_transcript(CASE)
+
+
+def test_case_endpoint_404s_a_missing_case(client, monkeypatch):
+    class _Empty:
+        def table(self, name):
+            return _Query([])
+    monkeypatch.setattr(client.mod, "get_supabase_client", lambda: _Empty())
+    assert client.get("/admin/arena/case?case_id=nope").status_code == 404

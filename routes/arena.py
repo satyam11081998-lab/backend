@@ -760,6 +760,34 @@ def scenario_case_content(case_type: str) -> str:
     return f"A {case_type} case for practice on MECE."
 
 
+@router.get("/case")
+def arena_case(
+    case_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """One case with its brief, plus the opening note every real attempt starts with
+    -- what the Current vs New panel shows above both panes and seeds both with. Read
+    from the live database; both builds share it."""
+    _require_admin(authorization)
+    try:
+        case = (get_supabase_client().table("cases").select("*")
+                .eq("id", case_id).single().execute().data) or None
+    except Exception:  # noqa: BLE001
+        case = None
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return {
+        "case": {
+            "id": case.get("id"),
+            "title": case.get("title"),
+            "type": case.get("type"),
+            "difficulty": case.get("difficulty"),
+            "content": case.get("content"),
+        },
+        "opening_transcript": opening_transcript(case),
+    }
+
+
 class ArmTurnRequest(BaseModel):
     message: str
     case_id: Optional[str] = None          # a real case or guesstimate ...
