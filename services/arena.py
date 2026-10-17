@@ -55,6 +55,7 @@ from services.interviewer_decision import (
     update_session_state,
 )
 from services.session_signals import compute_signals
+from services.voice_lane import VoiceTurnError, interpret_voice_turn
 
 ARENA_ENDPOINT = "/admin/arena/turn"
 
@@ -121,9 +122,14 @@ def run_turn(
     model_mode: str = DEFAULT_MODEL_MODE,
     clarifications_exhausted: bool = False,
     user_id: Optional[str] = None,
+    channel: str = "text",
 ) -> Dict[str, Any]:
     """One interviewer turn for ONE arm, on the production path. Never raises: an
-    arm that fails returns an error row so the other arm's reply is still usable."""
+    arm that fails returns an error row so the other arm's reply is still usable.
+
+    channel="voice" runs the voice route's path instead: the engine's voice channel,
+    then services/voice_lane.interpret_voice_turn -- the same function
+    /voice-decision uses -- so `reply` is what a voice session would SAY."""
     builder = registry.get_builder(variant_id)  # KeyError -> 400 at the route
     # The rest of the variant's prompt layer: packet rules + context assessor. None for
     # `live`. The assessor gets THIS module's client, so faking it here fakes both.
@@ -134,11 +140,12 @@ def run_turn(
     t0 = time.perf_counter()
     error = None
     text = ""
+    voice = None
     try:
         # Consumed exactly as the live text route consumes it: every chunk, joined,
         # stripped. usage_out makes the engine hand its model calls (and the raw model
         # text) back here instead of logging them as production traffic.
-        text = "".join(stream_interviewer_reply(
+        parts = list(stream_interviewer_reply(
             case_content=case_content,
             case_type=case_type,
             transcript=transcript,
@@ -148,12 +155,21 @@ def run_turn(
             teaching_policy=teaching_policy,
             prior_state=prior_state,
             control_out=control,
-            channel="text",
+            channel=channel,
             messages_builder=builder,
             prompt_overrides=overrides,
             llm_override=llm_override,
             usage_out=usage,
-        )).strip()
+        ))
+        if channel == "voice":
+            lane, say, event = interpret_voice_turn(control, parts)
+            voice = {"lane": lane, "say": say, "event": event}
+            text = say or ""
+        else:
+            text = "".join(parts).strip()
+    except VoiceTurnError as e:
+        # The voice route answers this with a 502: show it as the arm's error.
+        error = f"voice turn unusable (the route would answer 502): {e}"
     except InterviewEngineError as e:
         error = f"interviewer failed: {e}"
     except Exception as e:  # noqa: BLE001
@@ -239,4 +255,7 @@ def run_turn(
         "model": usage.get("model") if spent_calls else None,
         "provider": usage.get("provider") if spent_calls else None,
         "next_state": next_state,
+        # Voice path only: the lane (SILENCE / PRESENCE / SUBSTANTIVE) and the event
+        # the client would receive. None on the text path.
+        "voice": voice,
     }

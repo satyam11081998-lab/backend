@@ -328,6 +328,15 @@ MAX_SCENARIOS = 50
 assert len(SCENARIOS) <= MAX_SCENARIOS, f"keep this to {MAX_SCENARIOS} scenarios (breadth of shapes, not volume)"
 
 
+def judge_prompt(scenario: dict, reply: str) -> str:
+    """The LLM judge's question for one scenario. Shared with the admin arena's
+    adversarial check (routes/arena.py /judge), so both grade replies the same way."""
+    return (f"REQUIRED interviewer behaviour: {scenario['required']}\n\n"
+            f'Candidate said: "{scenario["new"]}"\nInterviewer replied: "{reply}"\n\n'
+            'Did the reply satisfy the REQUIRED behaviour? '
+            'Reply strict JSON {"pass": true|false, "why": "<one line>"}.')
+
+
 def run_offline(verbose: bool = False) -> bool:
     print(f"OFFLINE signal eval — {len(SCENARIOS)} scenarios (deterministic, no API)")
     print("=" * 68)
@@ -406,10 +415,7 @@ def run_live(verbose: bool = False) -> int:
                 return passed
             continue
         det = detect_violations(reply)
-        jp = (f"REQUIRED interviewer behaviour: {s['required']}\n\n"
-              f'Candidate said: "{s["new"]}"\nInterviewer replied: "{reply}"\n\n'
-              'Did the reply satisfy the REQUIRED behaviour? '
-              'Reply strict JSON {"pass": true|false, "why": "<one line>"}.')
+        jp = judge_prompt(s, reply)
         try:
             jr = judge.chat.completions.create(
                 model=judge_model, temperature=0,

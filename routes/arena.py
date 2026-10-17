@@ -16,22 +16,26 @@ the repo anyway.
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from prompts.variants import registry
-from services.ai_usage import assert_daily_budget
+from services.ai_providers import openai_client
+from services.ai_usage import assert_daily_budget, log_ai_usage
 from services.arena import DEFAULT_MODEL_MODE, model_modes, run_turn
 from services.auth import get_verified_user, is_guest_user
 from services.clarification_counter import count_clarifications
+from services.interviewer_decision import detect_violations
 from services.markets import llm_case_content
 from services.rate_limit import check_rate_limit
 from services.supabase_client import get_supabase_client
@@ -130,6 +134,9 @@ def _seed_scenarios() -> List[Dict[str, Any]]:
             "turns": len(s.get("transcript") or []),
             "new_message": s.get("new") or "",
             "transcript": s.get("transcript") or [],
+            # What a good reply must do -- the adversarial check shows it next to
+            # each build's reply, and the judge grades against it.
+            "required": s.get("required") or "",
         })
     return out
 
@@ -158,6 +165,10 @@ def arena_config(authorization: Optional[str] = Header(default=None)) -> Dict[st
         "votes_persisted": persisted,
         "persistence_note": reason,
         "limits": {"max_transcript_turns": MAX_TRANSCRIPT_TURNS, "max_message_chars": MAX_MESSAGE_CHARS},
+        # Which code this backend runs, and where the candidate build lives (if set
+        # on this service as ARENA_CANDIDATE_URL; the page also lets you type it).
+        "build": build_info(),
+        "candidate_url": (os.getenv("ARENA_CANDIDATE_URL") or "").strip() or None,
     }
 
 
@@ -652,4 +663,244 @@ def arena_results(
         "pairs": sorted(out_pairs, key=lambda p: -p["votes"]),
         "self_noise": self_noise,
         "position": {**position, "note": position_note},
+    }
+
+
+# =========================================================================== builds
+# CURRENT vs NEW. The admin page runs one conversation against TWO deployments: the
+# live backend (main) for the left pane and the candidate backend (the `candidate`
+# branch, a second Render service) for the right. Each pane calls /arm-turn on its
+# OWN backend, so each side runs its own code end to end -- prompts, signals,
+# decision logic, voice path, everything -- which a prompt snapshot cannot do.
+
+_STARTED_AT = time.time()
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _git_ref() -> Tuple[str, str]:
+    """(commit, branch) this process is running. Render sets RENDER_GIT_COMMIT and
+    RENDER_GIT_BRANCH; locally the .git files are read directly -- no subprocess, no
+    git lock, works in a worktree."""
+    commit = (os.getenv("RENDER_GIT_COMMIT") or "").strip()
+    branch = (os.getenv("RENDER_GIT_BRANCH") or "").strip()
+    if commit and branch:
+        return commit, branch
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        gitdir = os.path.join(root, ".git")
+        if os.path.isfile(gitdir):  # a worktree: ".git" is a file pointing at the real dir
+            gitdir = _read(gitdir).split(":", 1)[1].strip()
+            if not os.path.isabs(gitdir):
+                gitdir = os.path.normpath(os.path.join(root, gitdir))
+        common = gitdir
+        if os.path.exists(os.path.join(gitdir, "commondir")):
+            common = os.path.normpath(os.path.join(gitdir, _read(os.path.join(gitdir, "commondir"))))
+        head = _read(os.path.join(gitdir, "HEAD"))
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            branch = branch or ref.split("refs/heads/", 1)[-1]
+            for base in (gitdir, common):
+                if os.path.exists(os.path.join(base, ref)):
+                    commit = commit or _read(os.path.join(base, ref))
+                    break
+            else:
+                packed = os.path.join(common, "packed-refs")
+                if os.path.exists(packed):
+                    for line in _read(packed).splitlines():
+                        if line.endswith(" " + ref):
+                            commit = commit or line.split()[0]
+        else:
+            commit, branch = commit or head, branch or "(detached)"
+    except Exception:  # noqa: BLE001
+        pass
+    return commit or "unknown", branch or "unknown"
+
+
+def build_info() -> Dict[str, Any]:
+    commit, branch = _git_ref()
+    return {
+        "commit": commit[:12],
+        "branch": branch,
+        "service": os.getenv("RENDER_SERVICE_NAME") or "local",
+        # "current" on main, "candidate" anywhere else; ARENA_BUILD_ROLE overrides.
+        "role": os.getenv("ARENA_BUILD_ROLE") or ("current" if branch == "main" else "candidate"),
+        # Which frozen snapshot this deployment's prompt layer equals, if any.
+        "prompt_layer": registry.live_matches(),
+        "started_at": datetime.fromtimestamp(_STARTED_AT, tz=timezone.utc).isoformat(),
+    }
+
+
+@router.get("/build")
+def arena_build(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    """Which code this backend is running. The page shows it on each pane, so you
+    always know which commit answered."""
+    _require_admin(authorization)
+    return {"build": build_info()}
+
+
+def _scenario(scenario_id: str) -> Dict[str, Any]:
+    try:
+        from tools.eval_interviewer_behavior import SCENARIOS
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="The adversarial scenario set is not available on this build.")
+    for s in SCENARIOS:
+        if s.get("id") == scenario_id:
+            return s
+    raise HTTPException(status_code=404, detail=f"Unknown scenario: {scenario_id}")
+
+
+def scenario_case_content(case_type: str) -> str:
+    """The case text the behavioural eval gives the interviewer for a scenario
+    (tools/eval_interviewer_behavior.py run_live), so the arena's adversarial check
+    asks exactly what the eval asks. Pinned to the eval by test."""
+    return f"A {case_type} case for practice on MECE."
+
+
+class ArmTurnRequest(BaseModel):
+    message: str
+    case_id: Optional[str] = None          # a real case or guesstimate ...
+    scenario_id: Optional[str] = None      # ... or one of the 50 adversarial scenarios
+    transcript: List[Dict[str, Any]] = Field(default_factory=list)
+    prior_state: Optional[Dict[str, Any]] = None
+    variant: str = "live"                  # this build's own prompt layer, by default
+    model_mode: str = DEFAULT_MODEL_MODE
+    teaching_policy: str = "coached"
+    channel: str = "text"                  # "text" (chat) or "voice" (the voice route's path)
+    tier: str = DEFAULT_TIER
+    clar_used: int = 0                     # questions this pane has already spent
+    clarifications_exhausted: bool = False
+
+
+@router.post("/arm-turn")
+def arena_arm_turn(
+    body: ArmTurnRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """ONE interviewer turn on THIS deployment's engine -- the building block of the
+    Current vs New panel. Stateless on purpose: the page holds the transcript, the
+    learner state and the question count, so a restart, a sleeping free-tier service
+    waking up, or a second worker loses nothing. Not blinded: the panel is labelled,
+    because you want to know which side is the new build."""
+    uid = _require_admin(authorization)
+    msg = (body.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="message is required")
+    if len(msg) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=400, detail=f"message over {MAX_MESSAGE_CHARS} chars")
+    if body.channel not in ("text", "voice"):
+        raise HTTPException(status_code=400, detail="channel must be text or voice")
+    if body.tier not in CLARIFICATION_QUOTA:
+        raise HTTPException(status_code=400, detail="tier must be free, lite or pro")
+    if body.teaching_policy not in ("coached", "exam"):
+        raise HTTPException(status_code=400, detail="teaching_policy must be coached or exam")
+    if body.variant not in registry.VARIANTS:
+        raise HTTPException(status_code=400, detail=f"Unknown variant: {body.variant}")
+    if not body.case_id and not body.scenario_id:
+        raise HTTPException(status_code=400, detail="case_id or scenario_id is required")
+    # Spend checks before any model call.
+    assert_daily_budget()
+    check_rate_limit(f"arena:arm:{uid}", max_calls=300, window_seconds=600)
+
+    if body.scenario_id:
+        s = _scenario(body.scenario_id)
+        case_type = s.get("case_type") or "profitability"
+        case_content = scenario_case_content(case_type)
+    else:
+        try:
+            case = (get_supabase_client().table("cases").select("*")
+                    .eq("id", body.case_id).single().execute().data) or None
+        except Exception:  # noqa: BLE001
+            case = None
+        if not case:
+            raise HTTPException(status_code=404, detail="Case not found")
+        case_content = llm_case_content(case)
+        case_type = case.get("type") or "profitability"
+
+    # Same quota rule as post_message, on this pane's own count.
+    quota = CLARIFICATION_QUOTA[body.tier]
+    used = max(0, min(int(body.clar_used or 0), quota))
+    clar_count = count_clarifications(msg, "text")
+    quota_exhausted = (quota - used) <= 0
+    clarifications_spent = clar_count > 0 and quota_exhausted
+    if clar_count > 0 and not quota_exhausted:
+        used = min(quota, used + clar_count)
+    exhausted_for_turn = clarifications_spent or bool(body.clarifications_exhausted)
+
+    out = run_turn(
+        case_content=case_content,
+        case_type=case_type,
+        variant_id=body.variant,
+        transcript=_clean_transcript(body.transcript),
+        new_user_message=msg,
+        prior_state=body.prior_state,
+        teaching_policy=body.teaching_policy,
+        model_mode=body.model_mode,
+        clarifications_exhausted=exhausted_for_turn,
+        user_id=uid,
+        channel=body.channel,
+    )
+    return {
+        "build": build_info(),
+        "channel": body.channel,
+        "arm": out,
+        "clarification": {
+            "counted": clar_count,
+            "quota": quota,
+            "used": used,
+            "remaining": max(0, quota - used),
+            "exhausted_this_turn": exhausted_for_turn,
+        },
+    }
+
+
+class JudgeRequest(BaseModel):
+    scenario_id: str
+    reply: str = ""
+
+
+@router.post("/judge")
+def arena_judge(
+    body: JudgeRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """The behavioural eval's own LLM judge (same prompt, same model) for one reply.
+    The page sends BOTH builds' replies to the SAME backend's judge, so the two are
+    graded by one judge, not by two judges that might disagree."""
+    uid = _require_admin(authorization)
+    s = _scenario(body.scenario_id)
+    assert_daily_budget()
+    check_rate_limit(f"arena:judge:{uid}", max_calls=300, window_seconds=600)
+    from tools.eval_interviewer_behavior import judge_prompt
+
+    reply = body.reply or ""
+    violations = detect_violations(reply) if reply.strip() else []
+    model = os.getenv("JUDGE_MODEL", "gpt-4o")
+    verdict: Dict[str, Any] = {"pass": None, "why": "judge unavailable"}
+    cli = openai_client()
+    if cli is not None:
+        t0 = time.time()
+        try:
+            jr = cli.chat.completions.create(
+                model=model, temperature=0,
+                messages=[{"role": "user", "content": judge_prompt(s, reply)}],
+                response_format={"type": "json_object"})
+            log_ai_usage(user_id=uid, endpoint="/admin/arena/judge", model=model, response=jr,
+                         latency_ms=int((time.time() - t0) * 1000))
+            verdict = json.loads(jr.choices[0].message.content or "{}")
+        except Exception as e:  # noqa: BLE001
+            verdict = {"pass": None, "why": f"judge error: {type(e).__name__}"}
+    judge_pass = verdict.get("pass")
+    return {
+        "scenario_id": body.scenario_id,
+        "required": s.get("required") or "",
+        # The eval's rule: the judge passes it AND no deterministic guardrail fired.
+        "pass": bool(judge_pass) and not violations,
+        "judge_pass": judge_pass,
+        "why": verdict.get("why"),
+        "violations": violations,
+        "model": model,
     }

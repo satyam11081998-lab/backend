@@ -259,3 +259,33 @@ def test_the_frozen_main_arm_is_byte_identical_to_production(wired, name, transc
     out = _arena(wired["arena"], transcript, message, variant_id="baseline-main")
     assert out["error"] is None, out["error"]
     assert out["reply"] == prod_text, f"{name}: frozen main says {out['reply']!r}, production {prod_text!r}"
+
+
+# ----------------------------------------------------------------------- voice path
+
+@pytest.mark.parametrize("name,transcript,message,expect_fn", LANES, ids=[l[0] for l in LANES])
+def test_the_voice_path_says_exactly_what_the_voice_route_would(wired, name, transcript, message, expect_fn):
+    """channel="voice": the engine's voice channel, then the SAME interpreter
+    /voice-decision uses (services/voice_lane.py)."""
+    from services.voice_lane import VoiceTurnError, interpret_voice_turn
+    ctl = {}
+    parts = list(wired["eng"].stream_interviewer_reply(
+        case_content=CASE, case_type="profitability", transcript=transcript,
+        new_user_message=message, user_id="user-1", teaching_policy=None,
+        prior_state={}, control_out=ctl, channel="voice"))
+    try:
+        lane, say, _event = interpret_voice_turn(ctl, parts)
+        route_error = None
+    except VoiceTurnError as e:
+        lane, say, route_error = None, None, str(e)
+    out = wired["arena"].run_turn(
+        case_content=CASE, case_type="profitability", variant_id="live",
+        transcript=transcript, new_user_message=message, prior_state={},
+        teaching_policy="coached", model_mode="openai-mini", user_id="admin-1", channel="voice")
+    if route_error:
+        assert out["error"] and route_error in out["error"]
+        return
+    assert out["error"] is None, out["error"]
+    assert out["voice"]["lane"] == lane
+    assert out["reply"] == (say or ""), f"{name}: arena says {out['reply']!r}, the voice route {say!r}"
+    assert "{" not in out["reply"], "a fast-lane JSON event must be unpacked, not shown raw"

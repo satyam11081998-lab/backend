@@ -99,6 +99,7 @@ TURN_OUT = {
                 "hint": "1", "fallback": False},
     "violations": [], "metrics": {"chars": 30, "words": 6, "sentences": 1, "questions": 1},
     "latency_ms": 700, "model": "gpt-4o-mini", "provider": "openai", "next_state": {"hint_level": 1},
+    "voice": None,
 }
 
 
@@ -300,6 +301,7 @@ def test_every_endpoint_is_admin_gated():
 ARM_KEYS = {
     "reply", "raw_reply", "silent", "error", "prompt_consulted", "enforced",
     "control", "violations", "metrics", "latency_ms", "model", "provider", "next_state",
+    "voice",
 }
 CONTROL_KEYS = {
     "mode", "function", "render", "reason", "intervention", "materiality",
@@ -317,7 +319,7 @@ VOTE_KEYS = {"persisted", "detail", "reveal", "session_votes", "small_n_warning"
 CONFIG_KEYS = {
     "variants", "live_matches", "default_arm_a", "default_arm_b", "model_modes",
     "default_model_mode", "teaching_policies", "seed_scenarios", "votes_persisted",
-    "persistence_note", "limits", "tiers", "default_tier",
+    "persistence_note", "limits", "tiers", "default_tier", "build", "candidate_url",
 }
 
 
@@ -614,3 +616,122 @@ def test_a_database_without_the_market_column_still_lists_cases(client):
     body = r.json()
     assert body["markets_supported"] is False
     assert not any(c[0] == "eq" and c[1][0] == "market" for c in _Query.calls)
+
+
+# ------------------------------------------------------------- current vs new builds
+
+BUILD_KEYS = {"commit", "branch", "service", "role", "prompt_layer", "started_at"}
+ARM_TURN_KEYS = {"build", "channel", "arm", "clarification"}
+
+
+def _arm(client, **over):
+    body = {"message": "help na i'm not getting this", "case_id": "case-1"}
+    body.update(over)
+    return client.post("/admin/arena/arm-turn", json=body)
+
+
+def test_arm_turn_runs_this_builds_engine_and_says_which_build_answered(client):
+    r = _arm(client)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == ARM_TURN_KEYS
+    assert set(body["build"]) == BUILD_KEYS
+    assert set(body["arm"]) == ARM_KEYS | {"variant_id"}   # labelled panel: not stripped
+    call = client.calls[-1]
+    assert call["variant_id"] == "live", "a build compares its OWN deployed prompt layer by default"
+    assert call["channel"] == "text"
+    assert client.spent["budget_checked"] == 1
+
+
+def test_arm_turn_is_stateless_about_the_question_count(client):
+    """Each pane keeps its own count, so a restart or a second worker loses nothing."""
+    r = _arm(client, message="What is the market size?", tier="free", clar_used=7).json()
+    assert r["clarification"]["exhausted_this_turn"] is True
+    assert client.calls[-1]["clarifications_exhausted"] is True
+    r = _arm(client, message="What is the market size? And the growth?", tier="pro", clar_used=3).json()
+    assert r["clarification"] == {"counted": 2, "quota": 20, "used": 5, "remaining": 15,
+                                  "exhausted_this_turn": False}
+    # a forged count cannot go negative or past the quota
+    r = _arm(client, message="ok", tier="free", clar_used=999).json()
+    assert r["clarification"]["used"] == 7
+
+
+def test_arm_turn_voice_channel_reaches_the_engine(client):
+    _arm(client, channel="voice")
+    assert client.calls[-1]["channel"] == "voice"
+
+
+def test_arm_turn_can_run_an_adversarial_scenario_with_the_evals_own_case_text(client):
+    r = _arm(client, case_id=None, scenario_id="wants_to_stop_frustrated",
+             message="ugh this is getting irritating, leave it na i don't want to continue")
+    assert r.status_code == 200, r.text
+    call = client.calls[-1]
+    assert call["case_content"] == "A profitability case for practice on MECE."
+    assert call["case_type"] == "profitability"
+
+
+def test_arm_turn_validates_before_any_spend(client):
+    for over in ({"message": "  "}, {"channel": "telepathy"}, {"tier": "gold"},
+                 {"variant": "nope"}, {"case_id": None}, {"message": "x" * 5000},
+                 {"teaching_policy": "freestyle"}):
+        assert _arm(client, **over).status_code == 400, over
+    assert client.calls == [] and client.spent["budget_checked"] == 0
+    assert _arm(client, case_id=None, scenario_id="no-such-scenario").status_code == 404
+
+
+def test_build_endpoint_and_config_say_which_code_is_running(client):
+    b = client.get("/admin/arena/build").json()["build"]
+    assert set(b) == BUILD_KEYS and b["role"] in ("current", "candidate")
+    cfg = client.get("/admin/arena/config").json()
+    assert set(cfg["build"]) == BUILD_KEYS
+    assert "candidate_url" in cfg
+    assert all(s["required"] for s in cfg["seed_scenarios"]), "the check needs each scenario's rule"
+
+
+def test_the_scenario_case_text_is_the_evals(client):
+    src = open("tools/eval_interviewer_behavior.py", encoding="utf-8").read()
+    assert 'case_content=f"A {s[\'case_type\']} case for practice on MECE."' in src
+    assert client.mod.scenario_case_content("growth") == "A growth case for practice on MECE."
+
+
+class _JudgeClient:
+    def __init__(self, verdict, sink):
+        outer = self
+        self.verdict, self.sink = verdict, sink
+
+        class _C:
+            @staticmethod
+            def create(**kw):
+                outer.sink.append(kw)
+                msg = type("M", (), {"content": json.dumps(outer.verdict)})()
+                return type("R", (), {"choices": [type("Ch", (), {"message": msg})()], "usage": None, "id": "j"})()
+        self.chat = type("Chat", (), {"completions": _C()})()
+
+
+def test_judge_grades_with_the_evals_prompt_and_rule(client, monkeypatch):
+    sink = []
+    monkeypatch.setattr(client.mod, "openai_client", lambda: _JudgeClient({"pass": True, "why": "closed"}, sink))
+    monkeypatch.setattr(client.mod, "log_ai_usage", lambda **kw: None)
+    from tools.eval_interviewer_behavior import judge_prompt, SCENARIOS
+    s = next(x for x in SCENARIOS if x["id"] == "wants_to_stop_frustrated")
+    r = client.post("/admin/arena/judge", json={"scenario_id": s["id"], "reply": "Okay, we can stop here."}).json()
+    assert r["pass"] is True and r["judge_pass"] is True and r["violations"] == []
+    assert sink[-1]["messages"][0]["content"] == judge_prompt(s, "Okay, we can stop here.")
+    assert sink[-1]["temperature"] == 0
+    # a deterministic guardrail breach fails it even when the judge says pass
+    r = client.post("/admin/arena/judge", json={
+        "scenario_id": s["id"], "reply": "That isn't specified. What now? And then?"}).json()
+    assert r["judge_pass"] is True and r["pass"] is False and r["violations"]
+
+
+def test_judge_failure_is_reported_not_passed(client, monkeypatch):
+    class _Boom:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kw):
+                    raise RuntimeError("down")
+    monkeypatch.setattr(client.mod, "openai_client", lambda: _Boom())
+    r = client.post("/admin/arena/judge", json={"scenario_id": "wants_to_stop_frustrated", "reply": "ok"}).json()
+    assert r["pass"] is False and r["judge_pass"] is None and "judge error" in r["why"]
+    assert client.post("/admin/arena/judge", json={"scenario_id": "nope", "reply": "x"}).status_code == 404

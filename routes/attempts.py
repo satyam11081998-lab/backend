@@ -524,18 +524,10 @@ def _settle_deferred(attempt_id: str, user_id: str, discard_ids=(), apply_pendin
 
 
 def _is_v11_silence(ctl: Dict[str, Any], chunks: List[str]) -> bool:
-    """True only for V11's deliberate SILENCE lane.
-
-    The frozen engine marks it in control_out as mode NO_OUTPUT with a
-    `silence` intervention and yields nothing. Anything else that comes back
-    empty is NOT silence and must not be swallowed as if it were.
-    """
-    tag = ctl.get("tag") or {}
-    return (
-        ctl.get("mode") == "NO_OUTPUT"
-        and tag.get("intervention") == "silence"
-        and not any((c or "").strip() for c in chunks)
-    )
+    """True only for V11's deliberate SILENCE lane (moved to services/voice_lane.py,
+    unchanged, so the admin arena's voice path shares it)."""
+    from services.voice_lane import is_v11_silence
+    return is_v11_silence(ctl, chunks)
 
 
 def _fold_session_state(
@@ -1012,36 +1004,13 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
         raise HTTPException(status_code=502, detail=str(e)[:200])
     engine_ms = _ms(t_engine)
 
-    tag = ctl.get("tag") or {}
-    event = None
-    if _is_v11_silence(ctl, parts):
-        lane, say = "SILENCE", None
-    elif ctl.get("lane") == "PRESENCE" and ctl.get("render") == "model":
-        # V12 contextual presence: a model-worded acknowledgement of the candidate's
-        # own work. Same shape as a fast-lane beat so every client handles it.
-        lane = "PRESENCE"
-        say = "".join(parts).strip()
-        if not say:
-            raise HTTPException(status_code=502, detail="The interviewer presence event had no line.")
-        event = {"event_type": "interviewer_presence",
-                 "data": {"mode": ctl.get("function") or "PRESENCE", "code": "CTX", "text": say}}
-    elif tag.get("intervention") == "fast_lane":
-        lane = "PRESENCE"
-        raw = "".join(parts).strip()
-        try:
-            event = json.loads(raw)
-            say = str(((event or {}).get("data") or {}).get("text") or "").strip() or None
-        except (TypeError, ValueError):
-            event, say = None, raw or None
-        if not say:
-            raise HTTPException(status_code=502, detail="The interviewer presence event had no line.")
-    else:
-        lane = "SUBSTANTIVE"
-        say = "".join(parts).strip()
-        if not say:
-            # Not V11 silence (checked above) -- an empty substantive reply is an
-            # error, never something to quietly treat as "say nothing".
-            raise HTTPException(status_code=502, detail="The interviewer produced no content for this turn.")
+    # (lane, say, event) -- shared with the admin arena's voice path, so the arena
+    # shows exactly what this route would make a voice session say.
+    from services.voice_lane import VoiceTurnError, interpret_voice_turn
+    try:
+        lane, say, event = interpret_voice_turn(ctl, parts)
+    except VoiceTurnError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
     if not body.is_partial:
         fold_args = (supabase, attempt_id, transcript, body.content,
