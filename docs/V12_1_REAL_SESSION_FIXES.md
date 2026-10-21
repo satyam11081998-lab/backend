@@ -114,6 +114,62 @@ before the reply. It fires only on chat turns that state a NEW derived figure th
 could not check itself. That is about a quarter of such turns in the synthetic sets, and fewer
 in real sessions. To turn it off: `INTERVIEWER_NUMBERS_AUDIT=off`.
 
+## Arena adversarial run (Oct 21) — the 16 scenarios New still failed
+Run: 50 scenarios, chat, gpt-4o judge. Current (main) 30, New (candidate @ 653f2a0) 34,
+5 regressions, 9 improvements. Every scenario New still failed is now pinned in
+`tests/test_v121_arena_adversarial.py`.
+
+| Scenario | What New did | What changed |
+|---|---|---|
+| help_when_stuck_with_work (R) | generic profit tree, too long | help with real working on the table gets a hint ON that working; Python solves their equation (`0.95S - 2 = 0.80(S-2)` -> S ≈ 2.67, verified) so the interviewer can say it holds. Teaching from scratch only after a hint on it failed. |
+| wants_solution_outright (R), semantic_repetition_guard | right content, flagged too long | numbered lists become arrow lines; prose capped at 5 sentences (non-stream) and 4 + the final question (stream, `StreamShapeGuard`); sentence targets lowered. |
+| correct_but_uncertain_do_not_derail (R) | "let's refine it, break it down" | FOLLOW_UP_ANSWER: an unsure but workable figure is carried forward, never interrogated. |
+| asks_same_thing_twice (R) | repeated "start with the population" | `already_tried` = the pointer that did not land; TEACH_STEP switches method (bottom-up from one household / shop / day). |
+| sanity_check_absent (R) | invented "0.5 orders per person, plausible" | "small town" / "village" size ranges; `implied_verdict` ("looks high") for orders a day per person, durables per person, more users than people; an implausible or unchecked guesstimate final gets ONE sanity check before the close. |
+| factor_1000_unit_error | "corrected" to 0.5 crore litres (also wrong) | unit restatements checked in code: "5 crore ml is 50,000 litres (1,000 ml make a litre)". |
+| double_count_error | vague | `services/logic_check.py`: the whole population added on top of its own segments. |
+| confidently_wrong_penetration | "Does that number look right?" | "100% / everyone buys it daily" named; SANITY_CHECK must test it against a real counter-case. |
+| contradicts_established_fact | "That's an interesting insight" | established facts (brief, interviewer lines, confirmed candidate lines) vs the turn's claim: "volumes are flat" vs "selling fewer units". |
+| (all corrections) | statement only | CORRECT_AND_CONTINUE may ask ONE targeted question ("How many ml make a litre?"). |
+| explain_why_meta | repair (assessor said stuck) | EXPLAIN_WHY: one line on why it matters, hand back. Decided before the assessor. |
+| product_ux_question | a hint (assessor said help) | PRODUCT_HELP from `PRODUCT_FACTS`. |
+| too_many_questions_back_off | more guidance | HOLD_SPACE: a fixed "Fair enough. It's all yours; I'll hold my questions."; the next turn asks nothing. |
+| productive_thinking_pause | "Alright, continue." | "Take your time." |
+| own_facts_competitors | "about 15 competitors" | ANSWER_DIRECT gives a usable shape (main players and their shares). |
+| good_answer_should_advance | judged as praise | REFLECT_PROGRESS: neutral line + the concrete next step inside their approach. |
+
+The voice playbook got the same four behaviours (take your time, back off, why-asked, app questions).
+On the 330 real turns none of the new checks fire and no route changes; the 152 correct lines stay unflagged.
+
+**Independent adversarial review of these fixes (before commit).** About 1,100 inputs. What it
+broke in the first version, now fixed and pinned in the test file:
+- Correct algebra called wrong: scales and comma groups inside an equation ("4N = 1.2 crore,
+  N = 30 lakh", "5P = 25,000"), unit letters read as unknowns ("1 M = 10 L, so 5 M = 50 L",
+  "1 h = 60 min"). Equations are now solved in real units, unit letters are never unknowns,
+  "so 5 M = 50" is never taken as the solution, and a solved equation overrides the chain
+  reader's fragments inside it ("(1-0.2) = 0.8, not 80").
+- The contradiction check fired on correct reasoning (23 of 62): negations after the claim,
+  self-corrections, regions and channels, competitors, other periods, goals, comparisons,
+  other cost lines. It now needs a claim about OUR total in this period, skips all of those,
+  ignores industry facts, and never contradicts on costs (too many sub-lines).
+- Double count and "everyone daily" fired on sanity checks and business assumptions: the
+  whole place must be what is added, and "everyone" must mean people in general, not shops,
+  riders, a target segment, someone else's claim, or a share ("out of 100%, 40% buy").
+- Plausible finals told "looks high" (rides, tickets, UPI transactions a day; passengers or
+  visitors a year; phones in use): only orders/deliveries a day, durables per person and a
+  count of people above the population can be called high; a final with no base closes normally.
+- Case questions sent to PRODUCT_HELP / EXPLAIN_WHY ("results of the survey", "why is it
+  important for the client to grow"): the app question must be about MY results / Submit /
+  ending the session; a topic "why X?" must name a topic from your last line, never after "Go on.".
+- Shaping cut at "Rs." and dropped the figure, broke a long sentence mid-word, lost a question
+  followed by a list. The splitter now protects abbreviations, domains, ellipses and list
+  markers; a sentence goes out or is held whole; the cap keeps the question; "Rs. 300" ships as
+  "Rs 300". 400 generated replies x 25 chunkings: no difference by chunking, nothing over five
+  sentences, no question lost.
+- Exam policy no longer carries the corrected figure (in a correction or a hint on their working).
+- After a space request every function is told the same thing (no question), and the first
+  "i dont know" is never treated as an already-tried pointer.
+
 ## Intentional test changes
 - `test_response_functions`: help with nothing on the table -> TEACH_STEP (help after work
   still MICRO_HINT); a bare number in chat is model-worded (voice keeps SHORT_ACK); the
@@ -125,6 +181,12 @@ in real sessions. To turn it off: `INTERVIEWER_NUMBERS_AUDIT=off`.
   and the marin voice are pinned.
 - `test_interviewer_mode` (legacy V10 vocabulary): new routes appear for help/stuck
   (TEACH), finals (FINAL_REVIEW) and "how did I do" (SESSION_STATUS). This is intended.
+  After the arena run: "why are you asking" -> EXPLAIN_WHY and "where are my results" ->
+  PRODUCT_HELP (the legacy file expects ANSWER_DIRECT); "too many questions" now matches
+  its HOLD_SPACE. 29 legacy mismatches, all from intended routes.
+- `test_arena_isolation::test_violations_are_reported_for_an_offending_reply`: the shipped
+  reply is now capped at five sentences, so `too_long` is reported on the raw model text,
+  not on what ships.
 - Offline eval (`tools/eval_interviewer_behavior.py`): 17 signal mismatches against 16 before.
   The new one is `frustration_change_strategy`: "you're going round and round, not helping" is
   no longer read as a help request (the word "helping"). It routes to REPAIR, which is the

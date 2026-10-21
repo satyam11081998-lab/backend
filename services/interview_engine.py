@@ -34,10 +34,11 @@ from services.interviewer_decision import (
     assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event,
     decide_response, build_interviewer_control_packet, validate_contextual_line,
     CONTEXTUAL_PRESENCE, scrub_control_leak, StreamLeakGuard,
-    StreamReplyGuard, looks_like_refusal, is_praise_only, strip_all_questions, strip_solicitations,
+    StreamReplyGuard, StreamShapeGuard, looks_like_refusal, is_praise_only, strip_all_questions, strip_solicitations,
     _filter_lines,
 )
 from services import numbers_check
+from services import logic_check
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 from prompts.voice_renderer import strip_say_label
 
@@ -136,7 +137,7 @@ def _recent_lines(transcript) -> List[str]:
 # assessor (an extra model call) is skipped for them, and can never overwrite them.
 _DECIDED_KEYS = ("wants_to_exit", "asks_session_status", "wants_case_restate", "complains_unanswered",
                  "math_issue", "final_declared", "concept_asked", "wants_next_step", "stuck_blank",
-                 "wants_teaching")
+                 "wants_teaching", "logic_issue", "asks_product_help", "asks_why_asked", "asks_for_space")
 _ASSESSOR_WEAK_INTENTS = ("answering", "working", "unknown", "hypothesis")
 
 
@@ -188,10 +189,17 @@ def _annotate_turn(signals, tlist, msg, case_content, case_type, prior_state, ov
             def auditor(t, m, c):
                 return numbers_check.audit_turn(t, m, c, client=cli, record=_record)
         numbers_check.merge_audit(signals, auditor(tlist, msg, case_content))
-    if signals.get("math_issue"):
+    if not signals.get("math_issue"):
+        signals.update(logic_check.check_logic(tlist, msg, case_content))
+    if signals.get("math_issue") or (signals.get("logic_issue") or {}).get("kind") in ("double_count",
+                                                                                      "contradiction"):
         signals["error_materiality"] = "material"
     if signals.get("final_declared") or signals.get("asks_session_status") or signals.get("concept_asked"):
         signals["final_context"] = numbers_check.final_context(tlist, msg, case_content)
+    try:
+        _annotate_help_and_finals(signals, tlist, msg, case_content, case_type)
+    except Exception as e:  # noqa: BLE001 - an annotation must never break a turn
+        print(f"[interviewer] help/final annotation skipped: {type(e).__name__}")
     # The reference figure is shared only AFTER a real final answer (a number in THIS
     # message, or a final already given), and never in exam policy.
     final_now = signals.get("final_declared") and re.search(r"\d", msg or "")
@@ -209,6 +217,68 @@ def _annotate_turn(signals, tlist, msg, case_content, case_type, prior_state, ov
         ideas = [re.sub(r"\s+", " ", (t.get("content") or "")).strip()[:140]
                  for t in tlist if (t.get("role") or "user") == "user"][-4:]
         signals["candidate_ideas"] = ideas + [re.sub(r"\s+", " ", msg).strip()[:140]]
+
+
+_GUIDANCE_RE = re.compile(r"(?i)\b(?:start|begin|anchor\w*|try|think about|consider|break\w*|split|population|"
+                          r"top[- ]down|bottom[- ]up|first step|look at|focus on|segment\w*)\b")
+# Working, not a recap with figures in it: a calculation between two numbers, or an
+# equation ("0.95S - 2 = 0.80(S-2)", "40 cr x 50 = 2000 cr", "30% of 2 cr").
+_WORKING_RE = re.compile(r"(?i)\d\s*(?:%|lakhs?|crores?|cr|k|mn|bn|m|b|million|billion|thousand)?\s*"
+                         r"(?:[x×*/+=]|-(?=\s*\d)|\btimes\b|\binto\b|\bdivided by\b|\bmultiplied by\b)\s*\(?\s*\d"
+                         r"|\d\s*%\s*of\s*\d|\d[A-Za-z]\s*[-+]\s*\d")
+_RECAP_RE = re.compile(r"(?i)^\s*(?:so\s+)?(?:to\s+recap|recap|given|to\s+summari[sz]e|summary|so\s+we\s+have|"
+                       r"the\s+case\s+says|from\s+the\s+(?:case|brief|prompt))\b")
+_SELF_CHECKED_RE = re.compile(r"(?i)\bsanity\b|\bper (?:person|capita|household)\b|\b(?:one|1) (?:in|for) every\b|"
+                              r"\bwhich (?:seems|looks|sounds) (?:right|reasonable|plausible|fine)\b")
+
+
+def _gist_line(text: str, limit: int = 200) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    return t if len(t) <= limit else t[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _annotate_help_and_finals(signals, tlist, msg, case_content, case_type) -> None:
+    """Arena adversarial run (Oct 21): help on THEIR working, a teaching pointer that
+    changes method when the last one did not land, the question a 'why are you asking'
+    refers to, and one sanity check on a final that cannot stand as given."""
+    asst = [t.get("content") or "" for t in tlist if t.get("role") == "assistant"]
+    last_asst = asst[-1].strip() if asst else ""
+    helpish = (signals.get("help_requested") or signals.get("stuck_blank") or signals.get("wants_teaching")
+               or signals.get("frustration_explicit") or signals.get("asks_if_correct")
+               or signals.get("intent") == "asking_for_help")
+    if helpish and signals.get("work_so_far") and not re.search(r"\d", msg or ""):
+        users = [(i, t.get("content") or "") for i, t in enumerate(tlist) if (t.get("role") or "user") == "user"]
+        for i, c in reversed(users[-4:]):
+            if _WORKING_RE.search(numbers_check._normalize(c)) and not _RECAP_RE.search(c):
+                signals["latest_work"] = _gist_line(c)
+                chk = numbers_check.check_turn(tlist[:i], c, case_content, {})
+                if chk.get("math_issue"):
+                    from services.interviewer_decision import exam_safe_issue
+                    signals["latest_work_check"] = {"issue": chk["math_issue"].get("message"),
+                                                    "exam": exam_safe_issue(chk["math_issue"])}
+                elif chk.get("math_verified"):
+                    signals["latest_work_check"] = {"verified": chk["math_verified"][0]}
+                break
+    # "already tried": the interviewer's last line was a pointer given in reply to an
+    # earlier help ask (not the opening question or the brief), and they are still stuck.
+    helped_before = (signals.get("help_streak", 0) >= 2
+                     or any(f in ("MICRO_HINT", "TEACH_STEP", "REPAIR_AND_RESET")
+                            for f in list(signals.get("recent_functions") or [])[-1:]))
+    pointer = [x for x in re.split(r"(?<=[.!?])\s+", last_asst) if x.strip() and not x.rstrip().endswith("?")]
+    if (helped_before and (signals.get("help_requested") or signals.get("stuck_blank") or signals.get("wants_teaching"))
+            and any(_GUIDANCE_RE.search(x) for x in pointer)):
+        signals["already_tried"] = _gist_line(last_asst, 160)
+    if signals.get("asks_why_asked") and last_asst:
+        signals["why_target"] = _gist_line(last_asst, 160)
+    if (signals.get("final_declared") and (case_type or "").lower() == "guesstimate"
+            and re.search(r"\d", msg or "") and not _SELF_CHECKED_RE.search(msg or "")
+            and "SANITY_CHECK" not in list(signals.get("recent_functions") or [])[-2:]
+            and not re.search(r"(?i)\bsanity\b|\bdoes that (?:number )?(?:look|seem|sound)\b", last_asst)):
+        fc = signals.get("final_context") or {}
+        # only a final that fails a check computed in code; a final with nothing to check
+        # it against (tennis balls in a bus, one store's revenue) closes as before
+        if fc.get("implied_verdict"):
+            signals["final_needs_check"] = True
 
 
 def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarifications_exhausted,
@@ -237,7 +307,15 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
         return plan
     fn, mode = decision["function"], decision["mode"]
     allow_questions = ALLOW_QUESTIONS.get(fn, ALLOW_QUESTIONS.get(mode, False))
+    suppressed = bool(signals.get("space_requested_recently") and not signals.get("asks_interviewer")
+                      and fn not in ("TEACH_STEP", "OPEN"))
+    if suppressed:
+        allow_questions = False  # "too many questions, just let me solve": keep the promise
+        signals["questions_suppressed"] = True
     instruction = get_function_instruction(fn, mode, policy, new_user_message, signals)
+    if suppressed:
+        instruction += (" OVERRIDE: the candidate asked you to stop asking questions. Do all of the above as "
+                        "plain statements - no question at all this turn.")
     packet = build_interviewer_control_packet(signals, decision, candidate_text=new_user_message,
                                               recent_lines=_recent_lines(tlist),
                                               allow_questions=allow_questions)
@@ -555,10 +633,20 @@ def stream_interviewer_reply(
     stripper = StreamTagStripper() if adaptive else None
     guard = StreamLeakGuard() if adaptive else None
     reply_guard = StreamReplyGuard() if adaptive else None
+    # V12.1 (arena adversarial run): lists become short lines and prose stops after four
+    # sentences (the final question still goes out). Chat only; voice has its own limits.
+    shape_guard = StreamShapeGuard(budget=4) if (adaptive and channel == "text") else None
+
+    def _shaped(piece):
+        if shape_guard is None:
+            yield piece
+        else:
+            yield from shape_guard.feed(piece)
 
     def _guarded(piece):
         for _o in guard.feed(piece):
-            yield from reply_guard.feed(_o)
+            for _p in reply_guard.feed(_o):
+                yield from _shaped(_p)
     raw_parts: Optional[List[str]] = [] if usage_out is not None else None
     try:
         for chunk in stream:
@@ -583,10 +671,15 @@ def stream_interviewer_reply(
                 yield from _guarded(_out)
             held = guard.flush(fallback=enforce_mode("", mode, False, policy))
             if held:
-                yield from reply_guard.feed(held)
+                for _p in reply_guard.feed(held):
+                    yield from _shaped(_p)
             tail = reply_guard.flush()
             if tail:
-                yield tail
+                yield from _shaped(tail)
+            if shape_guard is not None:
+                rest = shape_guard.flush()
+                if rest:
+                    yield rest
             if not reply_guard.emitted.strip():
                 # Only praise came back: never an empty bubble.
                 yield enforce_mode("", mode, False, policy)
@@ -670,7 +763,9 @@ def complete_interviewer_reply(
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
             presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
-            max_tokens=180,
+            max_tokens=(260 if adaptive and function in ("TEACH_STEP", "EXPLAIN_FORMAT", "DELIVER_SOLUTION",
+                                                         "RESTATE_CASE", "FINAL_REVIEW", "SESSION_STATUS")
+                        else 180),
         )
 
     used_model, used_provider = model, provider

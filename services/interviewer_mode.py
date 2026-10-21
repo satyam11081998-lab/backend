@@ -15,7 +15,9 @@ ALLOW_QUESTIONS: Dict[str, bool] = {
     "DATA_REVEAL": False,
     "TARGETED_PROBE": True,
     "RETHINK_CUE": True,
-    "CORRECT_MATERIAL": False,
+    # V12.1 (arena adversarial run): a correction points at the step and asks ONE
+    # targeted question so the candidate fixes it ("How many ml make a litre?").
+    "CORRECT_MATERIAL": True,
     "HINT": False,
     "STRUCTURAL_HINT": False,
     "REPAIR": False,
@@ -40,7 +42,7 @@ ALLOW_QUESTIONS: Dict[str, bool] = {
     "VALIDATE_AND_HAND_BACK": False,
     "TARGETED_QUESTION": True,
     "MICRO_HINT": False,
-    "CORRECT_AND_CONTINUE": False,
+    "CORRECT_AND_CONTINUE": True,
     "REPAIR_AND_RESET": False,
     "CONTINUE_AS_AGREED": True,
     # V12.1
@@ -54,6 +56,9 @@ ALLOW_QUESTIONS: Dict[str, bool] = {
     "SESSION_STATUS": False,
     "FOLLOW_UP_ANSWER": True,
     "FOLLOW_UP": True,
+    "PRODUCT_HELP": False,
+    "EXPLAIN_WHY": False,
+    "HOLD_SPACE": False,
 }
 
 Q_BUDGET: Dict[str, int] = {k: (1 if v else 0) for k, v in ALLOW_QUESTIONS.items()}
@@ -78,20 +83,36 @@ def get_modality_instruction(mode: str, policy: str, new_message: str, signals: 
                 "Do not ask generic questions like 'What else?' or 'Why?'.")
                 
     if mode == "RETHINK_CUE":
-        return ("Trigger self-correction on a suspicious estimate. "
-                "Ask a lightweight challenge (e.g., 'Does that number look right to you?' or 'Walk me through that assumption'). "
-                "Do not give the correct number.")
+        return ("Make the candidate sanity-check this number or claim themselves; do not fix it for them. Point "
+                "at the concrete thing: candidate_state.detected_issue, if present, names the assumption (for "
+                "example everyone buying it every day); case_context.implied_check, if present, is the exact "
+                "implication (and implied_verdict, if present, says it looks high). Then ask ONE short, specific "
+                "question that makes them test it against something real: a group who would not do it (infants, "
+                "people with no shop nearby), or the size of the place (shape: 'A small town has about 50,000 to "
+                "2 lakh people - does 90,000 orders a day fit that?'). If no_base_for_check is true, ask how many "
+                "people or households that number needs, given the place. Never a bare 'Does that number look "
+                "right to you?', never give the correct number, never call it plausible. Two sentences at most.")
                 
     if mode == "CORRECT_MATERIAL":
-        return ("There is a real slip in the candidate's work. If candidate_state.detected_issue is in the "
-                "packet, it was computed exactly in code: point at that exact step in plain words - what they "
-                "wrote and what it actually comes to - and let them carry on from the corrected figure. "
-                "Otherwise name the one material issue precisely (the unit, the denominator, the double count). "
-                "No praise first, no lecture, do not redo the rest of their calculation. Stop.")
+        return ("There is a real slip in the candidate's work. candidate_state.detected_issue, when present, was "
+                "computed in code and is exact. Point at that exact step in their own words and name the kind of "
+                "slip (a unit, a double count, a figure that contradicts something already established, an "
+                "arithmetic step). Then ask ONE short, targeted question that lets them fix it themselves - for "
+                "example 'How many ml make a litre?', 'Aren't the families and singles already inside the city "
+                "population?', 'If volumes are flat, can fewer units explain the drop?'. If your recent lines "
+                "already pointed at this same step, give the corrected figure from detected_issue instead and "
+                "let them carry on. Never compute a corrected figure yourself: use only figures in detected_issue. "
+                "With no detected_issue, name the one material issue precisely (the unit, the denominator, the "
+                "overlap). No praise first, no lecture, do not redo the rest of their calculation. Two sentences.")
                 
     if mode == "HINT" or mode == "STRUCTURAL_HINT":
-        return ("Provide ONE concise directional hint tied to their current work. Stop. "
-                "Do not append a probing question. Do not ask what they want to do next.")
+        return ("Provide ONE concise directional hint tied to their own work. If candidate_state.latest_work is "
+                "present, the hint is ON that working: first say in a few words whether it holds "
+                "(latest_work_check 'verified' -> the maths holds, say so plainly; 'issue' -> name the step that "
+                "is off), then point to the very next move with it (what to do with the result, or which piece "
+                "to check). If they complained that you are not telling them what is wrong, answer that first. "
+                "One or two sentences. Do not restart the case or lay out a generic framework. Do not append a "
+                "probing question. Do not ask what they want to do next.")
                 
     if mode == "TRANSITION":
         return ("Move the candidate cleanly to the next analytical stage. "
@@ -109,7 +130,10 @@ def get_modality_instruction(mode: str, policy: str, new_message: str, signals: 
                 "and never tell them to 'make reasonable assumptions' instead. If case_context.unanswered_questions "
                 "is present, they are telling you that you skipped those: answer each one now, one short line each. "
                 "If they ask whether their maths is right and arithmetic_check is 'verified', say yes, the maths "
-                "checks out; if it is 'issue', say which step is off. Then hand back in a few words. Do not solve "
+                "checks out; if it is 'issue', say which step is off. Give a figure in a shape they can use: for "
+                "competitors, how many main players and roughly what share they hold (e.g. 'three big players "
+                "with about 70% between them, the rest fragmented'); for a market, its size and growth; for a "
+                "population, the number and what it covers. Then hand back in a few words. Do not solve "
                 "the next analytical step for them, and never deflect with 'let's focus on structuring first'. Stop.")
                 
     if mode == "DELIVER_SOLUTION":
@@ -118,7 +142,8 @@ def get_modality_instruction(mode: str, policy: str, new_message: str, signals: 
                 "side that moved'), and if visual_structure_allowed is true lay the skeleton out on 3-5 short "
                 "lines joined by arrows (→) using this case's terms. Then do the first step with them. Do NOT "
                 "work through to the final answer - mention that the full worked answer is on their results "
-                "page after they submit. Be concise.")
+                "page after they submit. At most three short sentences besides the arrow lines; no numbered "
+                "lists.")
                 
     if mode == "OPEN":
         return ("Kick the case off. If their first message asks you something, answer it FIRST, directly, as a "
@@ -150,9 +175,12 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
         "floor back so they continue. Do not grade it, do not repeat their arithmetic, do not add "
         "analysis of your own. No question."),
     "REFLECT_PROGRESS": (
-        "The candidate just made a distinction or laid out a structure. Reflect back, in your own "
-        "words, what it separates or what angle it adds, then let them carry it forward. Do not add "
-        "branches they did not mention and do not grade it. No question."),
+        "The candidate just made a distinction or laid out a plan. In one short, neutral sentence say what "
+        "it separates or what they are about to check - no evaluative words (smart, good, insightful, "
+        "effective, 'zeroing in'). Then name the concrete next step INSIDE their approach as an instruction: "
+        "what to compute, compare or check next (e.g. 'Compare raw material cost per unit now against last "
+        "year.'). Do not add branches they did not mention and do not grade it. No question, and never end "
+        "on a vague 'take it forward from here'."),
     "ACKNOWLEDGE_AND_ORIENT": (
         "The candidate just completed a step. Name the step they completed (not their arithmetic), "
         "then point them to the next part of THEIR OWN plan (conversation_memory.candidate_plan, if "
@@ -192,11 +220,17 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
         "share who buy, then how often'; 'Profit is revenue minus cost - let's find which side moved'). "
         "If case_context.teach_focus is 'structure', group THE CANDIDATE'S OWN ideas "
         "(case_context.candidate_ideas) into 2-4 clear buckets and name the gap. "
-        "2) If visual_structure_allowed is true, lay the skeleton out on 3-5 short lines joined by arrows "
+        "If case_context.already_tried is present, they already got that pointer and are still stuck: do "
+        "NOT repeat it or start from the same anchor. Switch method: build it bottom-up from ONE thing they "
+        "can picture (one household, one shop, one day), put a number on it together, then show how it "
+        "scales up to the whole market. "
+        "If candidate_state.latest_work is present, build on THEIR working instead of starting over. "
+        "2) If visual_structure_allowed is true, lay the skeleton out on 3-4 short lines joined by arrows "
         "(→), filled with this case's terms and any numbers already on the table (use "
-        "case_context.reference_facts for a starting figure); no bullets, no markdown. "
+        "case_context.reference_facts for a starting figure); no numbered lists, no bullets, no markdown. "
         "3) Do the first step WITH them in one line, then hand them the very next step; you may end with one "
-        "short question about that step. Warm and brief: no 'great question', no lecture, no apology."),
+        "short question about that step. At most three short sentences besides the arrow lines. Warm and "
+        "brief: no 'great question', no lecture, no apology."),
     "WRAP_UP_EARLY": (
         "The candidate wants to stop, maybe because they feel unprepared. No guilt, no pressure, no questions. "
         "In 2-3 short sentences: it is completely fine to stop here; they can tap Submit (top right) to get "
@@ -208,6 +242,8 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
         "say their final number back in their words; give ONE concrete sanity check - use "
         "case_context.implied_check if present (e.g. 'that's about 0.4 per person a year') and say plainly "
         "whether it looks plausible against that check (plausible / looks high / looks low - never 'correct'); "
+        "if case_context.implied_verdict is present the number does not survive that check: say so plainly "
+        "in those plain numbers and name what to recheck - never call it plausible; "
         "if case_context.earlier_results show the final does not match their own working, say that instead; "
         "name one thing they did well and one to sharpen, both specific; then tell them to tap Submit (top "
         "right) to see their score and the full worked answer. If case_context.reference_answer is present "
@@ -223,11 +259,25 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
         "left (for example: land a final number and sanity-check it) and that they can Submit whenever they "
         "like. No question."),
     "FOLLOW_UP_ANSWER": (
-        "The candidate just answered the question in your last line, briefly. React to THEIR answer, never "
-        "with a bare 'Okay' or 'Got it'. If arithmetic_check is 'verified' you may say the maths checks out; "
-        "if detected_issue is present, point to it; if the answer does not fit what you asked (a percentage "
-        "where you asked for a total, a method where you asked for a number), say so kindly and re-ask more "
-        "simply with a concrete nudge. Then give the next step in a few words. At most one question."),
+        "The candidate just answered the question in your last line, briefly. React to THEIR answer in a few "
+        "words, never with a bare 'Okay' or 'Got it'. If arithmetic_check is 'verified' you may say the maths "
+        "checks out; if detected_issue is present, point to it. If they gave a workable figure but sound "
+        "unsure (candidate_confidence 'low'), reassure them lightly that it works as a number to carry "
+        "forward - do NOT ask them to justify, break down or refine it. If the answer does not fit what you "
+        "asked (a percentage where you asked for a total, a method where you asked for a number), say so "
+        "kindly and re-ask more simply with a concrete nudge. Then name the next step in a few words. At most "
+        "one question, and only about the next step."),
+    "PRODUCT_HELP": (
+        "The candidate asked about the app itself (where the results are, how to submit or end). Answer it "
+        "plainly in one or two short sentences using only case_context.product_facts; if those do not cover "
+        "it, say the results page after Submit has everything about this attempt. Then hand back to the case "
+        "in a few words. No question, no case content."),
+    "EXPLAIN_WHY": (
+        "The candidate asked why you asked case_context.your_question_they_ask_about. In ONE plain sentence, "
+        "give the link from that topic to what this case must answer (e.g. 'The value chain shows which stage "
+        "the extra cost is sitting in, and that is what explains the loss.'). Do not answer it for them and "
+        "do not add a framework. Then hand it back in a few words as an instruction ('Walk me through the "
+        "stages.'), with no question mark."),
 }
 
 # V12 function -> the V10.2 instruction it inherits (unchanged behaviour).
@@ -248,13 +298,16 @@ _VOICE_NOTES = {
     "FINAL_REVIEW": " SPOKEN: two short sentences - the sanity check, then that they can end and submit for the score and worked answer.",
     "SESSION_STATUS": " SPOKEN: two short sentences.",
     "WRAP_UP_EARLY": " SPOKEN: two short sentences.",
+    "PRODUCT_HELP": " SPOKEN: one or two short sentences.",
+    "EXPLAIN_WHY": " SPOKEN: one sentence of why, then hand it back.",
 }
 _EXAM_NOTES = {
     "TEACH_STEP": (" TEACHING POLICY exam: name the approach and the skeleton, but do not put numbers in it "
                    "or do the first step for them."),
-    "CORRECT_AND_CONTINUE": (" TEACHING POLICY exam: point at the exact step (what they wrote) and tell them to "
-                             "recheck it; do NOT give the corrected figure."),
+    "CORRECT_AND_CONTINUE": (" TEACHING POLICY exam: point at the exact step (what they wrote) and ask them to "
+                             "recheck it; do NOT give the corrected figure, even on a second pointer."),
     "FINAL_REVIEW": " TEACHING POLICY exam: no reference answer; the sanity check and the Submit pointer only.",
+    "MICRO_HINT": " TEACHING POLICY exam: say which step to recheck; never give the corrected figure.",
 }
 
 
@@ -285,7 +338,8 @@ _PACKET_RULES = (
     "reference_facts, final_answer, earlier_results) were computed in code and are exact: use them and "
     "never contradict them; never claim their arithmetic is off when arithmetic_check is 'verified'; never "
     "invent a figure for them to sanity-check. If visual_structure_allowed is true you may lay a structure "
-    "out on separate short lines joined by arrows (→); otherwise plain sentences only. Never tell the "
+    "out on separate short lines joined by arrows (→); otherwise plain sentences only. Never use numbered "
+    "lists ('1.', '2.'). Never tell the "
     "candidate a fact is not given or not available: you own the facts."
 )
 

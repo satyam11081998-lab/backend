@@ -591,6 +591,15 @@ def _unit_switch(ch: _Chain, text: str) -> Optional[Dict[str, Any]]:
     if not a or not r or a == r:
         return None
     if a in _COUNT_NOUNS and r in _MEASURE_NOUNS and not any(n in _MEASURE_NOUNS for n in nouns[1:]):
+        # "each bottle is 500 ml so 2 crore bottles is 1 crore litres": a size per item in
+        # the result's kind of unit is stated, so the conversion happened in their head.
+        fam = _UNIT_TABLE.get(r, (r,))[0]
+        for q in parse_quantities(text):
+            if q is ch.result or q.start == ch.result.start or q.pct:
+                continue
+            u = _noun_after(tn, q)
+            if u and (u == r or (u in _UNIT_TABLE and _UNIT_TABLE[u][0] == fam)):
+                return None
         return {"kind": "units", "verified": False, "expr": f"{qs[0].raw} {a}", "stated": f"{ch.result.raw} {r}",
                 "message": (f"the {a} turned into {r} without a conversion: {qs[0].raw} {a} is a count of {a}, "
                             f"so the result is still {a} until you multiply by how many {r} each one holds")}
@@ -1016,6 +1025,321 @@ def _check_office_week(msg: str, case_content: str) -> List[Dict[str, Any]]:
                          "(about 5, maybe 6), not 7")}]
 
 
+# ----------------------------------------------------------------- unit restatements
+# Arena adversarial run (Oct 21): "so total is 5 crore ml which is like 5 crore litres"
+# went through, and the model then "corrected" it to 0.5 crore litres (also wrong:
+# 5 crore ml is 50,000 litres). Python does the conversion; the model words it.
+
+_UNIT_TABLE = {
+    "ml": ("vol", 1e-3, "ml"), "millilitre": ("vol", 1e-3, "ml"), "millilitres": ("vol", 1e-3, "ml"),
+    "milliliter": ("vol", 1e-3, "ml"), "milliliters": ("vol", 1e-3, "ml"),
+    "litre": ("vol", 1.0, "litres"), "litres": ("vol", 1.0, "litres"), "liter": ("vol", 1.0, "litres"),
+    "liters": ("vol", 1.0, "litres"), "ltr": ("vol", 1.0, "litres"), "ltrs": ("vol", 1.0, "litres"),
+    "mg": ("mass", 1e-6, "mg"), "g": ("mass", 1e-3, "g"), "gm": ("mass", 1e-3, "g"),
+    "gms": ("mass", 1e-3, "g"), "gram": ("mass", 1e-3, "g"), "grams": ("mass", 1e-3, "g"),
+    "kg": ("mass", 1.0, "kg"), "kgs": ("mass", 1.0, "kg"), "kilogram": ("mass", 1.0, "kg"),
+    "kilograms": ("mass", 1.0, "kg"), "kilo": ("mass", 1.0, "kg"), "kilos": ("mass", 1.0, "kg"),
+    "tonne": ("mass", 1e3, "tonnes"), "tonnes": ("mass", 1e3, "tonnes"), "ton": ("mass", 1e3, "tonnes"),
+    "tons": ("mass", 1e3, "tonnes"), "quintal": ("mass", 100.0, "quintals"), "quintals": ("mass", 100.0, "quintals"),
+    "sec": ("time", 1 / 3600, "seconds"), "secs": ("time", 1 / 3600, "seconds"),
+    "second": ("time", 1 / 3600, "seconds"), "seconds": ("time", 1 / 3600, "seconds"),
+    "min": ("time", 1 / 60, "minutes"), "mins": ("time", 1 / 60, "minutes"),
+    "minute": ("time", 1 / 60, "minutes"), "minutes": ("time", 1 / 60, "minutes"),
+    "hr": ("time", 1.0, "hours"), "hrs": ("time", 1.0, "hours"), "hour": ("time", 1.0, "hours"),
+    "hours": ("time", 1.0, "hours"),
+    "mm": ("len", 1e-3, "mm"), "cm": ("len", 1e-2, "cm"), "metre": ("len", 1.0, "metres"),
+    "metres": ("len", 1.0, "metres"), "meter": ("len", 1.0, "metres"), "meters": ("len", 1.0, "metres"),
+    "km": ("len", 1e3, "km"), "kms": ("len", 1e3, "km"), "kilometre": ("len", 1e3, "km"),
+    "kilometres": ("len", 1e3, "km"), "kilometer": ("len", 1e3, "km"), "kilometers": ("len", 1e3, "km"),
+}
+_UNIT_NOTE = {
+    ("ml", "litres"): "1,000 ml make a litre", ("litres", "ml"): "1,000 ml make a litre",
+    ("g", "kg"): "1,000 g make a kg", ("kg", "g"): "1,000 g make a kg",
+    ("kg", "tonnes"): "1,000 kg make a tonne", ("tonnes", "kg"): "1,000 kg make a tonne",
+    ("minutes", "hours"): "60 minutes make an hour", ("hours", "minutes"): "60 minutes make an hour",
+    ("seconds", "minutes"): "60 seconds make a minute", ("minutes", "seconds"): "60 seconds make a minute",
+    ("metres", "km"): "1,000 metres make a km", ("km", "metres"): "1,000 metres make a km",
+    ("cm", "metres"): "100 cm make a metre", ("metres", "cm"): "100 cm make a metre",
+}
+# What may sit between "5 crore ml" and "5 crore litres" in a restatement.
+# ("or" and "will be" are left out on purpose: "30 min or 1 hr" are alternatives, and
+# "a 30 minute walk will be 1 hour return" is a different quantity.)
+_RESTATE_WORDS = {"which", "is", "like", "about", "around", "roughly", "approx", "approximately", "that",
+                  "thats", "that's", "equals", "equal", "to", "means", "ie", "i.e", "so", "nearly",
+                  "basically", "comes", "come", "gives", "makes", "almost", "close", "i", "guess", "say",
+                  "it's", "its", "it", "in", "total", "~", "="}
+_RESTATE_LINK = re.compile(r"(?i)(?:\bis\b|=|\bequals?\b|\bmeans\b|\bi\.?e\b|\bcomes? to\b|\bgives\b|"
+                           r"\bmakes\b|~|\bthat'?s\b|\bthats\b|\bwhich is\b)")
+_UNIT_RATE = re.compile(r"\s*(?:per|a|an|/|every|each)\s*(day|week|month|year|annum|person|household|head|"
+                        r"capita|hour|minute|trip|visit|order)s?\b|\s*(daily|weekly|monthly|yearly|annually)\b",
+                        re.I)
+
+
+_CHAIN_OP = re.compile(r"(?i)\s*(?:[*×/+]|(?<![a-z])x(?![a-z])|\btimes\b|\binto\b|\bmultipl\w*|\bdivid\w*|\bplus\b)")
+
+
+def _unit_word_at(tn: str, pos: int) -> Tuple[Optional[str], int]:
+    m = re.match(r"\s*([a-z]+)\b", tn[pos:pos + 24].lower())
+    if not m:
+        return None, pos
+    return m.group(1), pos + m.end()
+
+
+def _rate_after(tn: str, pos: int) -> str:
+    m = _UNIT_RATE.match(tn[pos:pos + 30])
+    return (m.group(1) or m.group(2) or "").lower() if m else ""
+
+
+def _check_unit_conversions(msg: str) -> List[Dict[str, Any]]:
+    """'5 crore ml which is like 5 crore litres': a bare restatement between two units of
+    the same kind (volume, mass, time, length). Nothing but linking words may sit
+    between the two figures; a rate on either side must match the other."""
+    tn = _normalize(msg)
+    qs = [q for q in parse_quantities(msg) if not q.pct and not q.cur]
+    out: List[Dict[str, Any]] = []
+    for a, b in zip(qs, qs[1:]):
+        ua, end_a = _unit_word_at(tn, a.end)
+        ub, end_b = _unit_word_at(tn, b.end)
+        if ua not in _UNIT_TABLE or ub not in _UNIT_TABLE:
+            continue
+        fa, fb = _UNIT_TABLE[ua], _UNIT_TABLE[ub]
+        if fa[0] != fb[0] or fa[2] == fb[2]:
+            continue
+        # Inside a calculation ("2 lakh people x 30 minutes = 1 lakh hours") the left
+        # figure is an operand, not a restatement: only bare restatements are checked.
+        seg_start = max(tn.rfind(c, 0, a.start) for c in ".;\n")
+        if _CHAIN_OP.search(tn[seg_start + 1:a.start]) or _CHAIN_OP.match(tn[end_b:end_b + 6]):
+            continue
+        between = tn[end_a:b.start]
+        if len(between) > 40 or re.search(r"\d", between) or not _RESTATE_LINK.search(between):
+            continue
+        words = re.findall(r"[a-z.'~=]+", between.lower())
+        if any(w.strip(".") not in _RESTATE_WORDS for w in words):
+            continue
+        if _rate_after(tn, end_a) != _rate_after(tn, end_b):
+            continue  # "500 ml a day is 15 litres a month" changes the period too
+        expected = a.value * fa[1] / fb[1]
+        approx = bool(re.search(r"(?i)\b(like|about|around|roughly|approx\w*|nearly|almost|close)\b|~", between))
+        if expected <= 0 or _rel(expected, b.value) <= (0.25 if approx else 0.1):
+            out.append({"kind": "units", "verified": True, "expr": f"{a.raw} {ua}", "stated": f"{b.raw} {ub}",
+                        "pos": a.start})
+            continue
+        note = _UNIT_NOTE.get((fa[2], fb[2]))
+        out.append({"kind": "units", "verified": False, "expr": f"{a.raw} {ua}", "stated": f"{b.raw} {ub}",
+                    "expected": expected, "stated_value": b.value, "pos": a.start,
+                    "message": (f"{a.raw} {ua} is {fmt_in(expected, a.indian or b.indian)} {fb[2]}"
+                                + (f" ({note})" if note else "") + f", not {b.raw} {ub}")})
+    return out
+
+
+# ----------------------------------------------------------------- one-variable equations
+# "so if 0.95S - 2 = 0.80(S-2) then S comes to like 2.67 cr" (arena, Oct 21): the
+# candidate's algebra was right and the interviewer kept asking how they got it.
+
+_EQ_MAX = 120
+
+
+class _LinParser:
+    """number | V | + - * / ( ) with implicit multiplication ("0.95S", "0.80(S-2)")."""
+
+    def __init__(self, text: str, var: str):
+        self.toks: List[Any] = []
+        i = 0
+        t = text.replace(" ", "")
+        while i < len(t):
+            ch = t[i]
+            m = re.match(r"\d+(?:\.\d+)?|\.\d+", t[i:])
+            if m:
+                self.toks.append(float(m.group(0)))
+                i += m.end()
+                continue
+            if ch == var:
+                self.toks.append("V")
+            elif ch in "+-*/()":
+                self.toks.append(ch)
+            else:
+                raise ValueError("bad char")
+            i += 1
+        # implicit multiplication
+        out: List[Any] = []
+        for tok in self.toks:
+            if out and (isinstance(out[-1], float) or out[-1] in ("V", ")")) and (
+                    isinstance(tok, float) or tok in ("V", "(")):
+                out.append("*")
+            out.append(tok)
+        self.toks = out
+
+    def value(self, v: float) -> float:
+        self.i, self.v, self.depth = 0, v, 0
+        r = self._expr()
+        if self.i != len(self.toks):
+            raise ValueError("trailing")
+        return r
+
+    def _peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else None
+
+    def _expr(self):
+        r = self._term()
+        while self._peek() in ("+", "-"):
+            op = self.toks[self.i]
+            self.i += 1
+            t = self._term()
+            r = r + t if op == "+" else r - t
+        return r
+
+    def _term(self):
+        r = self._unary()
+        while self._peek() in ("*", "/"):
+            op = self.toks[self.i]
+            self.i += 1
+            u = self._unary()
+            if op == "/" and u == 0:
+                raise ZeroDivisionError
+            r = r * u if op == "*" else r / u
+        return r
+
+    def _unary(self):
+        if self._peek() == "-":
+            self.i += 1
+            return -self._unary()
+        if self._peek() == "+":
+            self.i += 1
+            return self._unary()
+        return self._atom()
+
+    def _atom(self):
+        tok = self._peek()
+        if tok is None:
+            raise ValueError("end")
+        self.i += 1
+        if isinstance(tok, float):
+            return tok
+        if tok == "V":
+            return self.v
+        if tok == "(":
+            self.depth += 1
+            if self.depth > 12:
+                raise ValueError("deep")
+            r = self._expr()
+            if self._peek() != ")":
+                raise ValueError("paren")
+            self.i += 1
+            self.depth -= 1
+            return r
+        raise ValueError("unexpected")
+
+
+# Single letters that are units or scales far more often than unknowns
+# ("1 M = 10 L", "1 h = 60 min", "1 m = 100 cm", "100 k = 1 L").
+_UNIT_LETTERS = set("mMbBlLkKhHgGtTsSdDwWyY") - set("SDY")
+_SCALED_NUM = re.compile(r"(?i)(?<![\w.])(\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?"
+                         r"(lakh crores?|lakhs?|lacs?|crores?|cr|thousand|million|mn|billion|bn|k)?\b(?!\s?%)")
+_EQ_SCALE = {"lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5, "crore": 1e7, "crores": 1e7, "cr": 1e7,
+             "thousand": 1e3, "million": 1e6, "mn": 1e6, "billion": 1e9, "bn": 1e9, "k": 1e3,
+             "lakh crore": 1e12, "lakh crores": 1e12}
+
+
+def _absolute_numbers(t: str) -> str:
+    """'1.2 crore' -> '12000000', '25,000' -> '25000' (the equation is solved in real units)."""
+    def sub(m):
+        num, unit = m.group(1), (m.group(2) or "").lower()
+        if "," in num and not _valid_commas(num):
+            return m.group(0)
+        v = float(num.replace(",", ""))
+        if unit:
+            v *= _EQ_SCALE.get(unit, 1.0)
+        return (f"{v:.10g}" if v < 1e15 else m.group(0)) + ("" if not unit else " ")
+    return _SCALED_NUM.sub(sub, t)
+
+
+_EQ_SCAN_CHARS = 600
+_EQ_TOKEN = r"[0-9.,\s+\-*/()]|(?:lakh|lakhs|lac|lacs|crores?|cr|thousand|million|mn|billion|bn|k)\b"
+
+
+def _raw_equation(raw_t: str, eq_at: int, var: str) -> Optional[Tuple[str, int, int]]:
+    """The equation as the candidate wrote it around the '=' at eq_at, and its span."""
+    tok = rf"(?:{_EQ_TOKEN}|(?<![A-Za-z]){var}(?![A-Za-z]))"
+    for m in re.finditer(rf"((?:{tok})+)=((?:{tok})+)", raw_t):
+        if m.start() <= eq_at < m.end():
+            lhs = re.split(r",\s", m.group(1))[-1].strip()
+            rhs = re.split(r",\s", m.group(2))[0].strip()
+            return re.sub(r"\s+", " ", f"{lhs} = {rhs}").strip(" ,"), m.start(), m.end()
+    return None
+
+
+def _check_equations(msg: str) -> List[Dict[str, Any]]:
+    """A linear equation in one letter and the value the candidate says it solves to.
+    Precision first: unit letters are not unknowns, scales and comma groups are read as
+    real numbers, and 'so 5 M = 50' (another equation) is never taken as the solution."""
+    if "=" not in (msg or ""):
+        return []
+    raw_t = _normalize(msg)[:_EQ_SCAN_CHARS]
+    t = _absolute_numbers(raw_t)
+    out: List[Dict[str, Any]] = []
+    cands = set(re.findall(r"(?:(?<=[\d.)])|(?<=[\d.)] ))([A-Za-z])(?![A-Za-z])", t))
+    cands |= {v for v in re.findall(r"(?<![A-Za-z'])([A-Za-z])(?=\s?[-+*/=)])", t) if v.lower() not in ("a", "i")}
+    cands -= _UNIT_LETTERS
+    for var in sorted(cands)[:3]:
+        if var.lower() == "x" and re.search(r"\d\s*x\s*\d", t):
+            continue  # "4 x 5" is multiplication
+        side = rf"(?:[0-9.\s+\-*/()]|(?<![A-Za-z]){var}(?![A-Za-z]))+"
+        for m in re.finditer(rf"({side})=({side})", t):
+            lhs, rhs = m.group(1).strip(), m.group(2).strip()
+            eq = f"{lhs} = {rhs}"
+            if len(eq) > _EQ_MAX or var not in eq or not re.search(r"\d", lhs) or not re.search(r"\d", rhs):
+                continue
+            try:
+                pl, pr = _LinParser(lhs, var), _LinParser(rhs, var)
+                f = [pl.value(v) - pr.value(v) for v in (0.0, 1.0, 2.0)]
+            except (ValueError, ZeroDivisionError, OverflowError, RecursionError):
+                continue
+            slope = f[1] - f[0]
+            if abs(slope) < 1e-12 or abs((f[2] - f[1]) - slope) > 1e-9 * max(1.0, abs(slope)):
+                continue  # not linear in the letter (or no letter in effect)
+            sol = -f[0] / slope
+            # Read the stated solution in the candidate's own text ("S comes to like 2.67 cr"):
+            # the k-th "=" is the same character in both texts.
+            k = t[:m.start() + len(m.group(1))].count("=")
+            eq_pos = [i for i, ch in enumerate(raw_t) if ch == "="]
+            if k >= len(eq_pos):
+                continue
+            found = _raw_equation(raw_t, eq_pos[k], var)
+            raw_eq, sp_start, sp_end = found if found else (f"{lhs} = {rhs}", eq_pos[k], eq_pos[k] + 1)
+            tail = raw_t[eq_pos[k] + 1:eq_pos[k] + 90]
+            sm = None
+            for cand in re.finditer(rf"(?<![A-Za-z]){var}\s*(?:=|is|comes(?:\s+out)?\s+to|works\s+out(?:\s+to)?|"
+                                    rf"equals|would\s+be|will\s+be|turns\s+out\s+to\s+be|~)\s*(?:like|about|"
+                                    rf"around|roughly|approx\.?|approximately|~)?\s*", tail):
+                if re.search(r"[\d.)]\s*$", tail[:cand.start()]):
+                    continue  # "so 5 M = 50": a coefficient in front -> another equation
+                sm = cand
+                break
+            if not sm:
+                continue
+            q = first_quantity(tail[sm.end():sm.end() + 25])
+            if q is None or q.pct or tail[sm.end():].lstrip()[:1] not in "0123456789.":
+                continue
+            base = q.value / q.scale if q.scale else q.value
+            head = q.raw.split()[0]
+            digits = len(re.sub(r"\D", "", head.split(".")[1])) if "." in head else 0
+            approx = bool(re.search(r"(?i)\b(like|about|around|roughly|approx\w*)\b|~", tail[:sm.end()]))
+            # rounding to the digits they wrote is fine, up to a point (3 for 2.67 is not)
+            tol = (0.15 * abs(sol) if approx
+                   else max(0.02 * abs(sol), min(0.5 * 10 ** (-digits), 0.06 * abs(sol))) + 1e-9)
+            ok = abs(base - sol) <= tol or abs(q.value - sol) <= tol
+            shown = f"{var} ≈ {fmt_in(sol, q.indian) if abs(sol) >= 1e5 else _sig(sol, 3)}"
+            rec = {"kind": "equation", "verified": ok, "expr": raw_eq, "stated": f"{var} = {q.raw}",
+                   "pos": eq_pos[k], "span": (sp_start, eq_pos[k] + 1 + sm.end() + len(q.raw) + 2),
+                   "text": f"{raw_eq} solves to {shown}"}
+            if not ok:
+                rec.update(expected=sol, stated_value=base,
+                           message=f"solving {raw_eq} gives {shown}, not {q.raw}")
+            out.append(rec)
+            break
+    return out
+
+
 # ----------------------------------------------------------------- dangling expression
 
 def _dangling_expression(cand_turns_newest_first: List[str]) -> Optional[Tuple[str, float]]:
@@ -1100,7 +1424,32 @@ def _final_context(transcript: List[Dict[str, str]], msg: str, case_content: str
             if re.search(rf"\b(?:{alias})\b", (case_content or "")[:400], re.I):
                 pop = Qty((lo + hi) / 2, f"~{fmt_number((lo + hi) / 2)}", 1.0, False, False, 0, 0, True)
                 break
-    if pop is not None and pop.value > 0 and final.value > 0:
+    tn = _normalize(msg)
+    noun = _noun_after(tn, final) if final.end <= len(tn) and final.start < len(tn) else None
+    after = tn[final.end:final.end + 40].lower() if final.end <= len(tn) else ""
+    daily = bool(re.search(r"\b(?:per|a|every|each)\s+day\b|\bdaily\b|/\s?day\b", after))
+    periodic = bool(re.search(r"\b(?:per|a|every|each|in a|this|last)\s+(?:year|month|week|annum)\b|\bannual(?:ly)?\b|"
+                              r"\byearly\b|\bmonthly\b|\bweekly\b|\bvisit|\btrips?\b|\bflights?\b", after))
+    if pop is None:
+        # "90000 orders per day for this small town": no figure, but the place has a size.
+        recent = " ".join([msg] + cand[-3:]).lower()
+        for pat, rng, label in _PLACE_SIZE_HINTS:
+            if re.search(pat, recent):
+                lo, hi = rng
+                if final.value > 0 and not final.cur:
+                    per_lo, per_hi = final.value / hi, final.value / lo
+                    per = " every day" if daily else ""
+                    out["implied_check"] = (f"{final.raw}{' ' + noun if noun else ''}{per} in {label} of roughly "
+                                            f"{fmt_number(lo)} to {fmt_number(hi)} people is about "
+                                            f"{_sig(per_lo, 2)} to {_sig(per_hi, 2)} per person{per}")
+                    verdict = _implied_verdict(noun, daily, per_lo, periodic)
+                    if verdict:
+                        out["implied_verdict"] = verdict
+                break
+        else:
+            out["no_base"] = True
+        return out
+    if pop.value > 0 and final.value > 0:
         per_person = final.value / pop.value
         unit = "$" if final.cur == "usd" else "Rs " if final.cur else ""
         if per_person < 0.5 and not final.cur:
@@ -1110,8 +1459,41 @@ def _final_context(transcript: List[Dict[str, str]], msg: str, case_content: str
             out["implied_check"] = (f"{final.raw} over a population of {pop.raw} is about "
                                     f"{unit}{_sig(per_person, 2)} per person"
                                     + (f" (about {unit}{_sig(per_person * 4, 2)} per household of 4)"
-                                       if per_person < 50 else ""))
+                                       if per_person < 50 else "") + (" every day" if daily else ""))
+        verdict = None if final.cur else _implied_verdict(noun, daily, per_person, periodic)
+        if verdict:
+            out["implied_verdict"] = verdict
     return out
+
+
+# A place named by size only. Ranges are deliberately wide: the verdict below fires only
+# when even the most generous size makes the number implausible.
+_PLACE_SIZE_HINTS = [
+    (r"\bsmall town\b|\blittle town\b", (5e4, 2e5), "a small town"),
+    (r"\bvillage\b", (1e3, 1e4), "a village"),
+]
+# Only shapes where no reasonable reading survives (adversarial review, Oct 21: rides,
+# tickets and UPI transactions run at 0.3+ per person a day for real; phones in use are
+# about one per person; passengers and visitors per YEAR exceed a city's population).
+_DAILY_EVENT_NOUNS = {"orders", "order", "deliveries", "delivery"}
+_DURABLE_NOUNS = {"laptops", "laptop", "cars", "car", "tvs", "tv", "televisions", "television", "fridges",
+                  "fridge", "refrigerators", "refrigerator", "acs", "washing"}
+_PEOPLE_NOUNS = {"people", "persons", "users", "customers", "households", "members", "students", "consumers",
+                 "buyers", "subscribers", "families", "homes"}
+
+
+def _implied_verdict(noun: Optional[str], daily: bool, per_person: float, periodic: bool = False) -> Optional[str]:
+    """'looks high' only where no reasonable reading survives: more people than the place
+    has (a count, not a yearly flow), most residents ordering every single day, or a
+    durable good for most people."""
+    n = (noun or "").lower()
+    if n in _PEOPLE_NOUNS and not daily and not periodic and per_person > 1.3:
+        return f"looks high: more {n} than there are people"
+    if daily and n in _DAILY_EVENT_NOUNS and per_person > 0.3:
+        return f"looks high: about {_sig(per_person, 2)} {n} per person every single day"
+    if n in _DURABLE_NOUNS and not daily and per_person > 0.6:
+        return f"looks high: about {_sig(per_person, 2)} {n} per person"
+    return None
 
 
 # ----------------------------------------------------------------- the turn check
@@ -1145,6 +1527,8 @@ def _check_turn(transcript, msg, case_content, signals) -> Dict[str, Any]:
     results += _check_households(newest_first, msg)
     results += _check_populations(msg)
     results += _check_office_week(msg, case_content)
+    results += _check_unit_conversions(msg)
+    results += _check_equations(msg)
     words = re.findall(r"[a-z0-9']+", msg.lower())
     if len(words) <= 4:
         q = first_quantity(msg)
@@ -1164,12 +1548,19 @@ def _check_turn(transcript, msg, case_content, signals) -> Dict[str, Any]:
                 results.append({"kind": "arithmetic", "verified": False, "expr": raw, "stated": q.raw,
                                 "expected": v, "stated_value": q.value,
                                 "message": f"{raw} = {fmt_number(v, indian_first=q.indian)}, not {q.raw}"})
+    # A linear equation Python solved owns its span: the chain reader's partial readings
+    # inside it ("(1-0.2) = 0.8, not 80", "0.8C + 20 = 20.8") are not issues; the
+    # equation's own verdict stands.
+    solved = [r["span"] for r in results if r.get("kind") == "equation" and r.get("span")]
+    if solved:
+        results = [r for r in results if r.get("verified") or r.get("kind") == "equation"
+                   or not any(a <= (r.get("pos") or 0) <= b for a, b in solved)]
     issues = sorted((r for r in results if not r.get("verified")), key=lambda r: r.get("pos") or 0)
     verified = [r for r in results if r.get("verified")]
     out: Dict[str, Any] = {
         "math_issue": issues[0] if issues else None,
         "math_issues": issues[:3],
-        "math_verified": [f"{r['expr']} = {r['stated']}".strip(" =") for r in verified][:3],
+        "math_verified": [r.get("text") or f"{r['expr']} = {r['stated']}".strip(" =") for r in verified][:3],
         "reference_facts": reference_facts(case_content),
     }
     return out

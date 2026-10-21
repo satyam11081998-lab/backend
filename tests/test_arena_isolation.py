@@ -227,7 +227,13 @@ def test_violations_are_reported_for_an_offending_reply(arena, monkeypatch):
     # and then drops the refusing sentence, so it never ships either.
     assert "Great job" not in out["reply"], "the sanitiser should have removed the gush"
     assert "isn't specified" not in out["reply"], "a refusal must not ship"
-    assert "too_long" in out["violations"], "violations are still reported for what ships"
+    # V12.1 (arena adversarial run): production now caps a reply at five sentences
+    # (enforce_mode -> cap_sentences), so what ships is no longer too long; the raw
+    # model text still is, and the violations are computed on what ships.
+    from services.interviewer_decision import detect_violations
+    assert "too_long" not in out["violations"], "the shipped reply is capped at five sentences"
+    assert "too_long" in detect_violations(out["raw_reply"])
+    assert out["violations"] == detect_violations(out["reply"]), "violations are reported for what ships"
     # The gush, the refusal and the double question survive in the raw model text,
     # which is why the arena shows both.
     assert "Great job" in out["raw_reply"]

@@ -21,10 +21,22 @@ _TAG_RE = re.compile(r"^\s*<<(.*?)>>\s*", re.DOTALL)
 _DEC = "\u0001"  
 
 
+_ABBR_DOT = re.compile(r"(?i)\b(?:rs|approx|etc|vs|avg|mr|mrs|ms|dr|st|est|incl|yr|yrs|sq|ft|nos?|fig|govt|dept|"
+                       r"min|max)\.(?=\s+\S)|\b(?:e\.g|i\.e)\.|(?<=[a-z0-9])\.(?=[a-z]{2,}\b)|\.{2,}")
+_LIST_DOT = re.compile(r"(?m)^(\s*\d{1,2})\.(?=\s)")
+
+
+def _protect(t: str) -> str:
+    t = _LIST_DOT.sub(lambda m: m.group(1) + _DEC, t)
+    return _ABBR_DOT.sub(lambda m: m.group(0).replace(".", _DEC), t)
+
+
 def _sentences(text: str, keep_punct: bool = True):
     t = re.sub(r"(\d)\.(\d)", r"\1" + _DEC + r"\2", text or "")
     if keep_punct:
-        parts = re.findall(r"[^.!?]*[.!?]|[^.!?]+$", t)
+        # V12.1: "Rs. 300", "e.g.", "app.mece.in", "..." and a "1." list marker do not end a sentence
+        t = _protect(t)
+        parts = re.findall(r"[^.!?]*[.!?]+(?=\s|$)|[^.!?]*[.!?]+(?=[^.!?\s])|[^.!?]+$", t)
     else:
         parts = re.split(r"[.!?]+", t)
     return [p.replace(_DEC, ".").strip() for p in parts if p.strip()]
@@ -150,10 +162,20 @@ def _wants_teaching(signals: Dict[str, Any]) -> bool:
     than drop one more hint: explicit "teach me / walk me through", a blank "i dont
     know", repeated stuckness, high frustration, a weak learner, or a help request
     before any work is on the table."""
-    if signals.get("wants_teaching") or signals.get("stuck_blank"):
+    if signals.get("wants_teaching"):
         return True
     if re.search(r"\bhints?\b", signals.get("new_message_norm") or ""):
         return False  # they asked for a hint: the hint ladder escalates it
+    if signals.get("latest_work"):
+        # Arena adversarial run (Oct 21): "help na i'm not getting this at all" right after
+        # "0.95S - 2 = 0.80(S-2) then S comes to 2.67 cr" got a generic profit tree. With
+        # their own working on the table, help is a hint ON that working; teaching from
+        # scratch only once a hint on it has already failed.
+        helped = any(f in ("MICRO_HINT", "TEACH_STEP", "REPAIR_AND_RESET")
+                     for f in (signals.get("recent_functions") or [])[-2:])
+        return bool(helped and signals.get("help_streak", 0) >= 2)
+    if signals.get("stuck_blank"):
+        return True
     return bool(signals.get("help_streak", 0) >= 2
                 or signals.get("frustration_explicit")
                 or signals.get("learner_level") == "weak"
@@ -177,11 +199,30 @@ def _evaluate_v121_requests(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
         return True, "RESTATE_CASE", "case_restate"
     if signals.get("asks_how_it_works") and signals.get("early_in_case"):
         return True, "EXPLAIN_FORMAT", "how_it_works"
+    # Arena adversarial run (Oct 21): these three were caught by help / repair first.
+    if signals.get("asks_product_help"):
+        return True, "PRODUCT_HELP", "product_question"
+    if signals.get("asks_why_asked"):
+        return True, "EXPLAIN_WHY", "why_this_question"
+    if signals.get("asks_for_space"):
+        return True, "HOLD_SPACE", "candidate_wants_space"
     if signals.get("complains_unanswered"):
         return True, "ANSWER_DIRECT", "unanswered_questions"
     if signals.get("math_issue"):
         return True, "CORRECT_MATERIAL", "math_check"
+    li = signals.get("logic_issue") or {}
+    if li:
+        if li.get("kind") == "extreme_assumption":
+            return True, "RETHINK_CUE", "extreme_assumption"
+        return True, "CORRECT_MATERIAL", "logic_check"
+    if (signals.get("answers_interviewer_number") and signals.get("hedged_self_estimate")
+            and not signals.get("final_declared")):
+        # "maybe 20 lakh? not very sure" answers your question; the "?" is doubt, not a question
+        return True, "FOLLOW_UP", "hedged_answer"
     if signals.get("final_declared"):
+        if signals.get("final_needs_check"):
+            # an implausible or unchecked final gets ONE sanity check before the close
+            return True, "RETHINK_CUE", "final_sanity_check"
         return True, "FINAL_REVIEW", "final_answer"
     if signals.get("concept_asked"):
         return True, "EXPLAIN_CONCEPT", "concept_question"
@@ -243,6 +284,9 @@ def _evaluate_substantive_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]
     return False, "", ""
 
 def _evaluate_presence_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
+    # "give me a minute" / "ek minute soch raha hu": the floor stays with them (V12.1 review)
+    if signals.get("candidate_mid_thought") and not signals.get("is_substantive_reasoning"):
+        return True, "HAND_BACK", "candidate_mid_thought"
     if signals.get("last_action_was_presence"):
         return False, "", "recently_acknowledged"
         
@@ -317,6 +361,7 @@ RESPONSE_FUNCTIONS = (
     # V12.1
     "RESTATE_CASE", "EXPLAIN_FORMAT", "EXPLAIN_CONCEPT", "TEACH_STEP", "WRAP_UP_EARLY",
     "FINAL_REVIEW", "SESSION_STATUS", "FOLLOW_UP_ANSWER",
+    "PRODUCT_HELP", "EXPLAIN_WHY",
 )
 FAST_FUNCTIONS = frozenset({"SHORT_ACK", "HAND_BACK"})
 CONTEXTUAL_PRESENCE = frozenset({
@@ -348,6 +393,9 @@ _SUBSTANTIVE_FUNCTION = {
     "FINAL_REVIEW": "FINAL_REVIEW",
     "SESSION_STATUS": "SESSION_STATUS",
     "FOLLOW_UP": "FOLLOW_UP_ANSWER",
+    "PRODUCT_HELP": "PRODUCT_HELP",
+    "EXPLAIN_WHY": "EXPLAIN_WHY",
+    "HOLD_SPACE": "HAND_BACK",   # fixed line: "Fair enough, it's all yours." (no model, no question)
 }
 
 _CONTEXTUAL_BY_TURN = {
@@ -405,11 +453,12 @@ def _fast_ok_in_text(sig: Dict[str, Any]) -> bool:
     norm = sig.get("new_message_norm") or ""
     if sig.get("is_affirmation_only") or sig.get("courtesy_only"):
         return True
-    if sig.get("candidate_mid_thought") or sig.get("wants_space"):
+    if sig.get("candidate_mid_thought") or sig.get("wants_space") or sig.get("asks_for_space"):
         return True
     if sig.get("intent") == "greeting":
         return True
-    return _announces_own_work(norm) and not re.search(r"\d", norm)
+    # "i'll go with the demand approach" -> "Go ahead."; a longer plan gets its content picked up
+    return _announces_own_work(norm) and not re.search(r"\d", norm) and len(norm.split()) <= 10
 
 
 def _never_canned(d: Dict[str, Any], sig: Dict[str, Any]) -> Dict[str, Any]:
@@ -420,7 +469,8 @@ def _never_canned(d: Dict[str, Any], sig: Dict[str, Any]) -> Dict[str, Any]:
     fn = d["function"]
     if d["render"] == "silent":
         return d
-    asks = sig.get("asks_interviewer") and not sig.get("tag_question_only")
+    # "can you stop asking questions and let me think" is a request for space, not a question
+    asks = sig.get("asks_interviewer") and not sig.get("tag_question_only") and not sig.get("asks_for_space")
     if fn in FAST_FUNCTIONS or fn in CONTEXTUAL_PRESENCE:
         if asks and not (fn in CONTEXTUAL_PRESENCE and d["reason"] == "floor_yield_after_work"):
             return _decision("SUBSTANTIVE", "ANSWER_DIRECT", "ANSWER_DIRECT", d["reason"] + "|question_answered")
@@ -532,15 +582,19 @@ _OBJECTIVE = {
     "FINAL_REVIEW": "close on their final answer: sanity-check it, one strength, one improvement, point to Submit",
     "SESSION_STATUS": "tell them honestly where they stand and what is left; point to Submit for the score",
     "FOLLOW_UP_ANSWER": "react to the short answer they just gave to your question, then the next step",
+    "PRODUCT_HELP": "answer the question about the app plainly, then hand back to the case",
+    "EXPLAIN_WHY": "say in one line why your question matters for this case, then hand it back",
 }
 _STRONG = {"MICRO_HINT", "CORRECT_AND_CONTINUE", "REPAIR_AND_RESET", "DELIVER_SOLUTION",
            "TEACH_STEP", "EXPLAIN_CONCEPT"}
 _MODERATE = {"TARGETED_QUESTION", "SANITY_CHECK", "ANSWER_DIRECT", "DATA_REVEAL",
              "TRANSITION", "OPEN", "CLOSE", "DEFLECT_META", "NOISE", "RESTATE_CASE",
-             "EXPLAIN_FORMAT", "WRAP_UP_EARLY", "FINAL_REVIEW", "SESSION_STATUS", "FOLLOW_UP_ANSWER"}
+             "EXPLAIN_FORMAT", "WRAP_UP_EARLY", "FINAL_REVIEW", "SESSION_STATUS", "FOLLOW_UP_ANSWER",
+             "PRODUCT_HELP", "EXPLAIN_WHY"}
 _NEW_FACTS_OK = {"ANSWER_DIRECT", "DATA_REVEAL", "OPEN", "DELIVER_SOLUTION", "MICRO_HINT",
                  "REPAIR_AND_RESET", "CORRECT_AND_CONTINUE", "TEACH_STEP", "EXPLAIN_CONCEPT",
                  "EXPLAIN_FORMAT", "FOLLOW_UP_ANSWER", "SESSION_STATUS"}
+_USES_LATEST_WORK = frozenset({"MICRO_HINT", "REPAIR_AND_RESET", "TEACH_STEP", "ANSWER_DIRECT"})
 # Functions that may lay a structure out on separate short lines (text channel only).
 VISUAL_FUNCTIONS = frozenset({"TEACH_STEP", "EXPLAIN_FORMAT", "EXPLAIN_CONCEPT", "DELIVER_SOLUTION",
                               "RESTATE_CASE"})
@@ -597,11 +651,16 @@ def _gist(text: str, limit: int = 180) -> str:
     return first
 
 
-_SENTENCES_TEXT = {"TEACH_STEP": 6, "EXPLAIN_FORMAT": 5, "EXPLAIN_CONCEPT": 4, "RESTATE_CASE": 5,
-                   "FINAL_REVIEW": 4, "SESSION_STATUS": 4, "WRAP_UP_EARLY": 3, "DELIVER_SOLUTION": 5,
-                   "ANSWER_DIRECT": 3, "FOLLOW_UP_ANSWER": 3}
+# Sentences of prose; a structure laid out on arrow lines does not count. Never above 4:
+# a reply over 5 sentences is flagged too long (detect_violations) and is a wall of text
+# on a phone (arena adversarial run, Oct 21: three teaching replies failed on length alone).
+_SENTENCES_TEXT = {"TEACH_STEP": 4, "EXPLAIN_FORMAT": 4, "EXPLAIN_CONCEPT": 4, "RESTATE_CASE": 4,
+                   "FINAL_REVIEW": 4, "SESSION_STATUS": 4, "WRAP_UP_EARLY": 3, "DELIVER_SOLUTION": 4,
+                   "ANSWER_DIRECT": 3, "FOLLOW_UP_ANSWER": 2, "PRODUCT_HELP": 2, "EXPLAIN_WHY": 2,
+                   "SANITY_CHECK": 2, "CORRECT_AND_CONTINUE": 2, "MICRO_HINT": 2}
 _SENTENCES_VOICE = {"TEACH_STEP": 3, "EXPLAIN_FORMAT": 3, "EXPLAIN_CONCEPT": 2, "RESTATE_CASE": 3,
-                    "FINAL_REVIEW": 2, "SESSION_STATUS": 2, "WRAP_UP_EARLY": 2, "DELIVER_SOLUTION": 2}
+                    "FINAL_REVIEW": 2, "SESSION_STATUS": 2, "WRAP_UP_EARLY": 2, "DELIVER_SOLUTION": 2,
+                    "PRODUCT_HELP": 2, "EXPLAIN_WHY": 2}
 
 
 def _sentence_target(fn: str, voice: bool, contextual: bool) -> int:
@@ -617,10 +676,12 @@ def _case_context(sig: Dict[str, Any], fn: str) -> Dict[str, Any]:
     if facts:
         ctx["reference_facts"] = facts
     fc = sig.get("final_context") or {}
-    if fn in ("FINAL_REVIEW", "SESSION_STATUS", "EXPLAIN_CONCEPT"):
-        for k in ("final_answer", "earlier_results", "implied_check"):
+    if fn in ("FINAL_REVIEW", "SESSION_STATUS", "EXPLAIN_CONCEPT", "SANITY_CHECK"):
+        for k in ("final_answer", "earlier_results", "implied_check", "implied_verdict"):
             if fc.get(k):
                 ctx[k] = fc[k]
+        if fn == "SANITY_CHECK" and fc.get("no_base"):
+            ctx["no_base_for_check"] = True
     if fn in ("FINAL_REVIEW", "SESSION_STATUS") and sig.get("reference_answer"):
         ctx["reference_answer"] = sig["reference_answer"]
     if fn == "ANSWER_DIRECT" and sig.get("complains_unanswered") and sig.get("unanswered_questions"):
@@ -631,6 +692,13 @@ def _case_context(sig: Dict[str, Any], fn: str) -> Dict[str, Any]:
         ctx["teach_focus"] = sig.get("teach_focus") or "next_step"
         if sig.get("candidate_ideas"):
             ctx["candidate_ideas"] = list(sig["candidate_ideas"])
+        if sig.get("already_tried"):
+            # the pointer they already got and are still stuck after: switch method
+            ctx["already_tried"] = sig["already_tried"]
+    if fn == "PRODUCT_HELP":
+        ctx["product_facts"] = list(PRODUCT_FACTS)
+    if fn == "EXPLAIN_WHY" and sig.get("why_target"):
+        ctx["your_question_they_ask_about"] = sig["why_target"]
     if fn == "WRAP_UP_EARLY" or fn == "SESSION_STATUS" or fn == "FINAL_REVIEW" or fn == "CLOSE":
         ctx["how_to_finish"] = ("tap Submit (top right of the chat) to end and see the score, feedback and "
                                 "the full worked answer")
@@ -638,6 +706,28 @@ def _case_context(sig: Dict[str, Any], fn: str) -> Dict[str, Any]:
         ctx["where_the_case_is"] = ("the brief is on screen; on a phone it sits behind the menu icon "
                                     "at the top left of the chat")
     return ctx
+
+
+def exam_safe_issue(issue: Dict[str, Any]) -> Optional[str]:
+    """The slip without the corrected figure (exam policy: they must find it themselves)."""
+    if not issue:
+        return None
+    if "expected" not in issue:
+        return issue.get("message")
+    expr, stated = issue.get("expr") or "that step", issue.get("stated") or "that figure"
+    if issue.get("kind") == "equation":
+        return f"{stated} does not solve {expr} - that step needs rechecking"
+    return f"{expr} does not come to {stated} - that step needs rechecking"
+
+
+# What the interviewer may say about the app (PRODUCT_HELP). Only what the product
+# really does; anything else is "after you tap Submit, the results page has it".
+PRODUCT_FACTS = (
+    "Submit is at the top right of the chat; tapping it ends the case",
+    "after Submit, the results page shows the score, feedback on the attempt and the full worked answer",
+    "on a phone, the case brief is behind the menu icon at the top left of the chat",
+    "the candidate can stop whenever they like and Submit what they have so far",
+)
 
 
 def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
@@ -660,6 +750,20 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
         alerts.append("you have repeated yourself: do not reuse a previous line")
     if sig.get("turns_without_progress", 0) >= 2:
         alerts.append(f"no progress for {sig['turns_without_progress']} turns")
+    if sig.get("questions_suppressed"):
+        alerts.append("the candidate asked you to stop asking questions: do not ask one this turn, keep it short")
+    li = sig.get("logic_issue") or {}
+    exam = (sig.get("teaching_policy") or "coached") == "exam"
+    mi = sig.get("math_issue") or {}
+    # exam policy: the packet names the step that is off, never the corrected figure
+    issue_text = (exam_safe_issue(mi) if exam else mi.get("message")) if mi else li.get("message")
+    material = fn == "CORRECT_AND_CONTINUE"
+    work_check = dict(sig.get("latest_work_check") or {})
+    if exam and work_check.get("issue"):
+        work_check["issue"] = work_check.get("exam") or "a step in it is off and needs rechecking"
+    may_confirm = bool((sig.get("math_verified") and not sig.get("math_issue"))
+                       or (work_check.get("verified") and fn in ("MICRO_HINT", "ANSWER_DIRECT",
+                                                                 "REPAIR_AND_RESET", "TEACH_STEP")))
     return {"interviewer_control": {
         "response_function": fn,
         "conversational_objective": _OBJECTIVE.get(fn, "move the case forward"),
@@ -669,7 +773,7 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
             "numbers_stated": list(sig.get("numbers_stated") or []),
             "reasoning_stage": _reasoning_stage(sig),
             "progress_state": _progress_state(sig),
-            "reasoning_quality": ("material_issue" if fn == "CORRECT_AND_CONTINUE"
+            "reasoning_quality": ("material_issue" if material
                                   else "tentative" if sig.get("candidate_confidence") == "low"
                                   else "not_verified"),
             "candidate_confidence": sig.get("candidate_confidence", "moderate"),
@@ -677,13 +781,19 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
             "candidate_needs_space": bool(sig.get("wants_space") or sig.get("candidate_mid_thought")),
             "explicit_help_request": bool(sig.get("help_requested")),
             "explicit_solution_request": bool(sig.get("solution_requested")),
-            "material_error": fn == "CORRECT_AND_CONTINUE",
+            "material_error": material,
             "frustration_state": sig.get("frustration", "none"),
             # V12.1: computed by services/numbers_check (Python did the arithmetic)
             "arithmetic_check": ("issue" if sig.get("math_issue")
                                  else "verified" if sig.get("math_verified") else "not_checked"),
-            "detected_issue": (sig.get("math_issue") or {}).get("message"),
+            "detected_issue": issue_text,
+            "issue_kind": (sig.get("math_issue") or {}).get("kind") or li.get("kind"),
             "verified_steps": list(sig.get("math_verified") or [])[:3],
+            # their own latest working, checked in code, for a hint ON it (help after work)
+            "latest_work": sig.get("latest_work") if fn in _USES_LATEST_WORK else None,
+            "latest_work_check": ((work_check.get("verified") and "verified: " + work_check["verified"])
+                                  or (work_check.get("issue") and "issue: " + work_check["issue"])
+                                  or None) if fn in _USES_LATEST_WORK else None,
         },
         "interviewer_decision": {
             "lane": decision.get("lane", ""),
@@ -696,7 +806,7 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
             "silence_allowed": fn == "NO_OUTPUT",
             # True only when Python verified the arithmetic in this turn: the model may
             # then say the MATHS checks out (never that an assumption is right).
-            "may_confirm_correctness": bool(sig.get("math_verified") and not sig.get("math_issue")),
+            "may_confirm_correctness": may_confirm,
             "new_case_facts_allowed": fn in _NEW_FACTS_OK,
             "visual_structure_allowed": fn in VISUAL_FUNCTIONS and not voice,
         },
@@ -864,11 +974,28 @@ _FAST_PHRASES = {
         {"code": "HB_04", "text": "Alright, continue."},
         {"code": "HB_05", "text": "Makes sense. Go ahead."}
     ],
+    # V12.1 (arena adversarial run): "let me think for a second" got "Alright, continue."
+    "THINK": [
+        {"code": "TH_01", "text": "Take your time."},
+        {"code": "TH_02", "text": "Sure, take your time."},
+        {"code": "TH_03", "text": "No rush. Take a moment."},
+    ],
+    # "you're asking too many questions, just let me solve" -> back off, no question.
+    "SPACE": [
+        {"code": "SP_01", "text": "Fair enough. Over to you."},
+        {"code": "SP_02", "text": "Fair point. It's all yours."},
+        {"code": "SP_03", "text": "Got it. Go ahead and solve it your way."},
+    ],
 }
 _FAST_ALIASES = {"ACKNOWLEDGE": "SHORT_ACK", "VALIDATE": "HAND_BACK"}
 
 def get_fast_lane_event(mode: str, signals: Dict[str, Any]) -> Dict[str, Any]:
     key = _FAST_ALIASES.get(mode, mode)
+    if key in ("HAND_BACK", "SHORT_ACK"):
+        if signals.get("asks_for_space"):
+            key = "SPACE"
+        elif signals.get("candidate_mid_thought") and not signals.get("is_substantive_reasoning"):
+            key = "THINK"
     options = _FAST_PHRASES.get(key, _FAST_PHRASES["SHORT_ACK"])
     
     msg = signals.get("new_message_norm", "default")
@@ -1205,16 +1332,337 @@ class StreamReplyGuard:
             t, self.buf = _undangle(self.buf.lstrip()), ""
             out += list(self._emit(t))
         if self.held.strip():
-            keep = []
-            for x in _sentences(self.held, keep_punct=True):
-                if x.rstrip().endswith("?"):
+            # what followed the first question, up to the next one, with its own line breaks
+            # ("Which segment first?\n- Students\n- Professionals" keeps the options)
+            lines_out, stop = [], False
+            for line in self.held.split("\n"):
+                if stop:
                     break
-                keep.append(x)
-            if keep:
-                tail = " " + " ".join(keep)
+                keep = []
+                for x in _sentences(line, keep_punct=True):
+                    if x.rstrip().endswith("?"):
+                        stop = True
+                        break
+                    keep.append(x)
+                lines_out.append(" ".join(keep))
+            tail = "\n".join(lines_out).rstrip()
+            if tail.strip():
+                tail = tail if tail[:1] in (" ", "\n") else " " + tail
                 self.emitted += tail
                 out.append(tail)
         return "".join(out)
+
+# --- V12.1 (arena adversarial run): reply shape -------------------------------
+# Three teaching replies failed on length alone: numbered lists ("1. Total market size")
+# count every item as a sentence, and the model ran to 6-7 sentences. A list becomes
+# short lines (numbered -> arrow steps, bullets -> dots) and prose is capped; the final
+# question, if any, is always kept.
+_LIST_LINE = re.compile(r"^\s*(?:(?P<num>\d{1,2})[.)]|(?P<bul>[-*\u2022]))\s+(?P<item>\S.*?)\s*$")
+_SKELETON_LINE = re.compile(r"^\s*(?:\u2192|->|=|\u00b7|\u2022)")
+
+
+def _split_inline_lists(line: str) -> str:
+    """'First, look at: 1. Total market 2. Segments 3. Needs' -> one item per line. Only a
+    real run 1., 2., 3. counts ('costs rose by 5. Then volume fell 10. So...' is prose)."""
+    marks = [m for m in re.finditer(r"(?:^|(?<=\s))(\d{1,2})\.\s+(?=[A-Za-z(])", line)]
+    run = []
+    for m in marks:
+        if int(m.group(1)) == len(run) + 1:
+            run.append(m)
+    if len(run) < 2:
+        return line
+    out, last = [], 0
+    for m in run:
+        out.append(line[last:m.start()].rstrip())
+        last = m.start()
+    out.append(line[last:])
+    return "\n".join(x for x in out if x.strip())
+
+
+def shape_lists(text: str) -> str:
+    """Numbered items -> '→ step' lines (the first stays plain), bullets -> '· item'.
+    Short items lose their full stop, so a list is never counted as prose sentences."""
+    if not text or not re.search(r"(?m)^\s*(?:\d{1,2}[.)]|[-*\u2022])\s+|\s\d{1,2}\.\s+[A-Za-z(]", text):
+        return text
+    if re.search(r"(?m)^\s*2\.\s+\S", text):
+        # a list whose "1." was written at the end of a sentence line
+        text = re.sub(r"(?<=[.!?:])[ \t]+(?=1\.\s+[A-Za-z(])", "\n", text)
+    lines = "\n".join(_split_inline_lists(l) for l in text.split("\n")).split("\n")
+    out: List[str] = []
+    prev_num = False
+    for line in lines:
+        m = _LIST_LINE.match(line)
+        if not m:
+            out.append(line.rstrip())
+            prev_num = False
+            continue
+        item = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group("item")).strip()
+        if len(item.split()) <= 14:
+            item = item.rstrip(" .;")
+        if m.group("num"):
+            out.append(("\u2192 " + item) if prev_num else item)
+            prev_num = True
+        else:
+            out.append("\u00b7 " + item)
+            prev_num = False
+    return "\n".join(out).strip()
+
+
+def _prose_units(text: str) -> List[Tuple[int, int, str, bool]]:
+    """(line_no, idx, sentence, is_prose) for every sentence. An arrow/dot line's first
+    piece and a line with no sentence punctuation are structure; prose written after an
+    arrow item on the same line ("-> Population. Use Rs 300 per ticket.") is prose."""
+    units = []
+    for ln, line in enumerate((text or "").split("\n")):
+        if not line.strip():
+            units.append((ln, 0, "", False))  # a blank line keeps the layout
+            continue
+        if not re.search(r"[.!?](?:\s|$)", line):
+            units.append((ln, 0, line, False))
+            continue
+        parts = _sentences(line, keep_punct=True)
+        skel = bool(_SKELETON_LINE.match(line))
+        for i, x in enumerate(parts):
+            if skel and i == 0:
+                units.append((ln, i, re.sub(r"\.\s*$", "", x) if len(parts) > 1 else x, False))
+            else:
+                units.append((ln, i, x, True))
+    return units
+
+
+def cap_sentences(text: str, limit: int = 5) -> str:
+    """At most `limit` sentences as detect_violations counts them. Drops prose from the
+    middle: the first sentence (the point), the question (there is at most one) and the
+    last sentence (the hand-back) stay, and so does any structure on its own lines."""
+    t = (text or "").strip()
+    if not t or len(_sentences(t, keep_punct=False)) <= limit:
+        return t
+    units = _prose_units(t)
+    prose = [k for k, u in enumerate(units) if u[3]]
+    keep_always = {prose[0], prose[-1]} if prose else set()
+    keep_always |= {k for k in prose if units[k][2].rstrip().endswith("?")}
+    droppable = [k for k in prose if k not in keep_always]
+    drop: set = set()
+
+    def build():
+        lines: Dict[int, List[str]] = {}
+        for k, (ln, _i, x, _p) in enumerate(units):
+            if k not in drop:
+                lines.setdefault(ln, []).append(x)
+        return _join_lines(lines)
+    cand = build()
+    # drop from the end of the middle backwards: the latest filler goes first
+    for k in reversed(droppable):
+        drop.add(k)
+        cand = build()
+        if len(_sentences(cand, keep_punct=False)) <= limit:
+            return cand
+    return cand
+
+
+def _join_lines(lines: Dict[int, List[str]]) -> str:
+    out = "\n".join(" ".join(v).strip() for _ln, v in sorted(lines.items()))
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+def tidy_abbreviations(text: str) -> str:
+    """'Rs. 300' -> 'Rs 300', 'approx. 20' -> 'approx 20': the same words, and a sentence
+    counter no longer sees a sentence end inside a figure."""
+    t = re.sub(r"\b([Rr]s|RS)\.\s?(?=\d)", r"\1 ", text or "")
+    return re.sub(r"(?i)\b(approx)\.(?=\s)", r"\1", t)
+
+
+def tidy_skeleton(text: str) -> str:
+    """'= total consumption.' -> '= total consumption': an arrow line is not a sentence."""
+    return re.sub(r"(?m)^(\s*(?:\u2192|->|=)[^\n]*?)\.[ \t]*$", r"\1", text or "")
+
+
+class StreamShapeGuard:
+    """The streamed lane's version of shape_lists + cap_sentences. Text goes out a sentence
+    (or a line) at a time. A list line is held until it is complete and goes out as an
+    arrow / dot line. Prose stops at `budget` sentences (counted the way detect_violations
+    counts them); at the end, the last held question, if no question went out yet, is
+    still sent, so a reply is never more than budget + 1 sentences. A sentence is sent or
+    held as a whole, never cut."""
+
+    _BOUNDARY = re.compile(r"\n|[.!?]+(?=\s)")
+    _ABBR_END = re.compile(r"(?i)(?:\b(?:rs|approx|etc|vs|avg|mr|mrs|ms|dr|st|est|incl|yr|yrs|sq|ft|nos?|fig|govt|"
+                           r"dept|min|max)|\be\.g|\bi\.e|\.\.)\.$")
+    _MAYBE_MARK = re.compile(r"^[ \t]*(?:\d{1,2}[.)]?|[-*\u2022])?$")
+    _MARK = re.compile(r"^[ \t]*(?:\d{1,2}[.)]|[-*\u2022])[ \t]")
+    _LONG = 240
+
+    def __init__(self, budget: int = 4):
+        self.budget = budget
+        self.buf = ""
+        self.count = 0
+        self.held: List[str] = []
+        self.q_out = False
+        self.line_start = True
+        self.prev_num = False
+        self.cur: Optional[str] = None  # a sentence in progress: "out" or "held"
+        self.pending_item = False
+        self.emitted = ""
+
+    def _list_line(self, line: str) -> str:
+        m = _LIST_LINE.match(line.rstrip("\n"))
+        nl = "\n" if line.endswith("\n") else ""
+        if not m:
+            return line
+        item = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group("item")).strip()
+        if len(item.split()) <= 14:
+            item = item.rstrip(" .;")
+        if m.group("num"):
+            out = (("\u2192 " + item) if self.prev_num else item) + nl
+            self.prev_num = True
+        else:
+            out = "\u00b7 " + item + nl
+            self.prev_num = False
+        return out
+
+    def _out(self, chunk: str):
+        self.emitted += chunk
+        if "?" in chunk:
+            self.q_out = True
+        yield chunk
+
+    @staticmethod
+    def _n(body: str) -> int:
+        return max(1, len(_sentences(body, keep_punct=False)))
+
+    def _take(self, chunk: str, is_list: bool = False, partial: bool = False):
+        if not chunk:
+            return
+        chunk = tidy_abbreviations(chunk)
+        if self.cur is not None:
+            # the rest of a sentence already sent (or already held)
+            if self.cur == "out":
+                yield from self._out(chunk)
+            else:
+                self.held[-1] += chunk
+            self.line_start = chunk.endswith("\n")
+            if not partial:
+                self.cur = None
+            return
+        at_start = self.line_start
+        self.line_start = chunk.endswith("\n")
+        body = chunk.strip()
+        if not at_start and not is_list and re.fullmatch(r"\d{1,2}\.", body):
+            # "...the share. 1. Price per unit.\n2. ..." -> the item goes on its own line
+            self.pending_item, self.prev_num = True, False
+            self.line_start = True
+            yield from self._out("\n")
+            return
+        if self.pending_item and body and not is_list:
+            self.pending_item = False
+            if len(body.split()) <= 14 and "?" not in body:
+                self.prev_num = True
+                yield from self._out(body.rstrip(" .;") + ("\n" if chunk.endswith("\n") else ""))
+                return
+        if is_list:
+            chunk = self._list_line(chunk)
+            body = chunk.strip()
+            parts = _sentences(chunk.rstrip("\n"), keep_punct=True)
+            if len(parts) > 1 or "?" in body:
+                # prose glued onto a list item ("2. Total market. What share would you take?"):
+                # the item is structure, the rest is counted like any prose
+                nl = "\n" if chunk.endswith("\n") else ""
+                head, rest = parts[0], parts[1:]
+                if "?" in head:
+                    rest, head = [head] + rest, ""
+                if head:
+                    yield from self._out(head.rstrip(" .;") + " ")
+                self.line_start = False
+                for x in rest:
+                    yield from self._take(x + " ")
+                if nl:
+                    yield from self._take("\n")
+                return
+        elif at_start and body:
+            self.prev_num = False
+        skeleton = at_start and bool(_SKELETON_LINE.match(chunk))
+        if skeleton and chunk.rstrip().endswith("."):
+            chunk = re.sub(r"\.(\s*)$", r"\1", chunk)  # "= total consumption." is not a sentence
+        structure = (is_list or skeleton or not body
+                     or (at_start and chunk.endswith("\n") and not re.search(r"[.!?]\s*$", body)))
+        if self.held and body:
+            self.held.append(chunk)  # once prose is held, everything after it waits
+            if partial:
+                self.cur = "held"
+            return
+        if structure and not partial:
+            yield from self._out(chunk)
+            return
+        n = self._n(body)
+        if self.count + n > self.budget:
+            self.held.append(chunk)
+            if partial:
+                self.cur = "held"
+            return
+        self.count += n
+        if partial:
+            self.cur = "out"
+        yield from self._out(chunk)
+
+    def _boundary(self):
+        for m in self._BOUNDARY.finditer(self.buf):
+            if m.group(0) != "\n" and self._ABBR_END.search(self.buf[:m.end()]):
+                continue  # "Rs. 300", "e.g. the", "approx. 20"
+            return m
+        return None
+
+    def feed(self, piece: str):
+        if not piece:
+            return
+        self.buf += piece
+        while self.buf:
+            if self.line_start and self.cur is None:
+                if self._MAYBE_MARK.match(self.buf):
+                    return  # "1" / "1." / "-" so far: wait to see whether a list line starts
+                if self._MARK.match(self.buf):
+                    nl = self.buf.find("\n")
+                    if nl == -1:
+                        if len(self.buf) > 4 * self._LONG:
+                            chunk, self.buf = self.buf, ""
+                            yield from self._take(chunk, is_list=True)
+                        return  # hold the list line until it ends
+                    line, self.buf = self.buf[:nl + 1], self.buf[nl + 1:]
+                    yield from self._take(line, is_list=True)
+                    continue
+            m = self._boundary()
+            if not m:
+                if len(self.buf) > self._LONG:
+                    cut = self.buf.rfind(" ", 0, self._LONG)
+                    cut = cut + 1 if cut > 0 else self._LONG
+                    chunk, self.buf = self.buf[:cut], self.buf[cut:]
+                    yield from self._take(chunk, partial=True)
+                    continue
+                return
+            end = m.end()
+            while end < len(self.buf) and self.buf[end] in " \t":
+                end += 1
+            if end >= len(self.buf) and self.buf[m.end() - 1:m.end()] != "\n":
+                return  # wait: the next token may continue the spacing or the line
+            chunk, self.buf = self.buf[:end], self.buf[end:]
+            yield from self._take(chunk)
+
+    def flush(self) -> str:
+        out = []
+        if self.buf:
+            chunk, self.buf = self.buf, ""
+            out += list(self._take(chunk, is_list=bool(self.line_start and self.cur is None
+                                                      and self._MARK.match(chunk))))
+        self.cur = None
+        if self.held and not self.q_out:
+            qs = [x for h in self.held for x in _sentences(h, keep_punct=True) if x.rstrip().endswith("?")]
+            if qs:
+                tail = qs[-1].strip()
+                sep = "" if (not self.emitted or self.emitted.endswith((" ", "\n"))) else " "
+                self.emitted += sep + tail
+                out.append(sep + tail)
+        self.held = []
+        return "".join(out)
+
 
 _SOLICIT_RE = re.compile(
     r"(?i)\b(please\s+)?(share|tell me|give me|walk me|provide|explain|describe|outline|"
@@ -1237,6 +1685,9 @@ _MODE_FALLBACK = {
     "TEACH": "Let's take it one piece at a time: put a number on the first driver and build from there.",
     "FOLLOW_UP": "Take that into your next step.",
     "EXPLAIN_FORMAT": "You lead and I play the interviewer: ask a clarifying question or two, lay out your structure, work the numbers step by step, then give a final answer. Tap Submit at the end for your score and the worked answer.",
+    "PRODUCT_HELP": "Tap Submit at the top right when you're ready: the results page shows your score, feedback and the full worked answer. Carry on whenever you like.",
+    "EXPLAIN_WHY": "It's the link between that piece and what the case is asking you to explain. Go ahead with it.",
+    "HOLD_SPACE": "Fair enough. Over to you.",
 }
 
 def strip_all_questions(text: str) -> str:
@@ -1246,9 +1697,9 @@ def strip_solicitations(text: str) -> str:
     return _filter_lines(text, lambda x: not _SOLICIT_RE.search(x))
 
 def enforce_mode(text: str, mode: str, allow_questions: bool = True, policy: str = "coached") -> str:
-    t = sanitize_reply(text, policy)
+    t = sanitize_reply(tidy_skeleton(shape_lists(tidy_abbreviations((text or "")[:3000]))), policy)
     if not allow_questions:
         t = strip_solicitations(strip_all_questions(t)).strip()
         if not t:
             t = _MODE_FALLBACK.get(mode, "Okay, continue.")
-    return t.strip()
+    return cap_sentences(t.strip(), 5)

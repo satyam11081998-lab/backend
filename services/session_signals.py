@@ -20,6 +20,7 @@ _HELP = (
     "where do i start", "where to start", "what should i do", "what do i do", 
     "confused", "i am lost", "i'm lost", "no idea", "not sure how", "guide me",
     "give me direction", "point me", "don't understand", "dont understand",
+    "help karo", "help kar do", "help kardo", "madad karo", "madad kar do", "guide karo", "samajh nahi",
 )
 _SOLUTION = (
     "give me the answer", "what is the answer", "what's the answer",
@@ -32,6 +33,10 @@ _SOLUTION = (
     "give me the final", "tell me the final", "just the final answer",
     "the final answer now", "what's the final answer", "whats the final answer",
     "give me the answer", "just give me the", "how would you solve",
+    "share the approach", "share your approach", "tell me the approach", "what's the approach", "whats the approach",
+    "what is the approach", "explain the approach",
+    "approach bata do", "approach batao", "approach bta do", "solution bata do", "solution batao",
+    "answer bata do", "answer batao", "bata do approach",
 )
 _EXACT_SOLUTION = {"answer", "solution", "solve it", "tell me"}
 
@@ -73,6 +78,9 @@ _MID_THOUGHT = (
     "let me think", "let me redo", "let me recompute", "let me recalculate",
     "no wait", "wait no", "hold on", "give me a sec", "give me a second",
     "one sec", "let me re-do", "scratch that", "let me redo the",
+    # adversarial review (Oct 21)
+    "give me a minute", "give me a min", "one minute", "1 minute", "ek minute", "ek min", "ek second",
+    "soch raha", "soch rahi", "sochne do", "sochta hu", "sochti hu",
 )
 _WANTS_SPACE = (
     "let me solve", "let me work", "let me try", "just let me", "let me do it",
@@ -330,6 +338,7 @@ _EXIT_RE = re.compile(
 # lakh"), or a short "this is my final answer" when the figure came in earlier turns.
 _FINAL_RE = re.compile(
     r"\bfinal (?:answer|estimate|number|figure|value|output|result|count|total)\b(?! of (?:households|people|population|users|the population))"
+    r"|^\s*(?:so\s+|ok\s+|okay\s+)?final\s*[-:=]\s*(?=(?:about |around |~|approx\w* )?(?:\d|rs|₹|\$))"
     r"|\bmy (?:answer|estimate) (?:is|would be|comes(?: to)?)(?: therefore| then| now)? (?:about |around |roughly |approx\w* |~|nearly )?(?=\d|rs|₹|\$)"
     r"|\bi (?:would )?estimate (?:it|this|that) (?:to be|to|at|as|is|around|about|roughly|approx\w*)\b"
     r"|\bi (?:would )?estimate the (?:total|answer|number|market|count)\b"
@@ -375,7 +384,66 @@ _STUCK_BLANK_RE = re.compile(
     r"(?:do ?n[o']?t|don'?t|dont) (?:know|get it|understand)(?: (?:actually|anything|at all|sir|yet|really|"
     r"what to do|how))?[\s.!]*$"
     r"|^(?:no idea|idk|clueless(?: here)?|nothing(?: i (?:do ?n[o']?t|don'?t|dont) know)?|no clue|"
-    r"i'?m (?:blank|lost|stuck)|i am (?:blank|lost|stuck)|blank|not sure|nope|i have no idea)[\s.!]*$")
+    r"i'?m (?:blank|lost|stuck)|i am (?:blank|lost|stuck)|blank|not sure|nope|i have no idea|"
+    r"(?:mujhe |muje )?(?:pata nahi|nahi pata|pta nahi|nhi pata|kuch nahi pata|kuch samajh nahi(?: aa raha)?|"
+    r"samajh nahi aa raha))(?: (?:bhai|yaar|sir|honestly))?[\s.!]*$")
+# Arena adversarial run (Oct 21) + review: only a complaint about being questioned, or an
+# explicit "just let me solve". A plain "ok let me solve it" announces work (an ordinary
+# hand-back), and "too many questions in the survey" is case talk.
+_SPACE_ASK_RE = re.compile(
+    r"\b(?:you(?:'re| are)?|u r|ur|youre)\s+(?:asking\s+)?(?:too|so) many questions\b|"
+    r"\btoo many questions\s*(?:man|bro|yaar|na|please|pls|sir|now|yr)?\s*(?:[,.!]|$|\bjust\b|\blet\b|\bstop\b)|"
+    r"\bstop asking(?: me)?(?: (?:so many )?questions)?(?=\s*(?:[,.!?]|$|\b(?:and|let|please|pls|man|bro|yaar|na|so|just|i)\b))|"
+    r"\b(?:stop|quit) (?:interrupting|probing|quizzing)(?: me)?(?=\s*(?:[,.!?]|$|\b(?:and|let|please|pls|man|bro|yaar|na|so|just|i)\b))|"
+    r"\bdon'?t interrupt(?: me)?(?=\s*(?:[,.!?]|$|\b(?:and|let|please|pls|man|bro|yaar|na|so|just|i)\b))|"
+    r"\bjust let me (?:solve|do it|do this|work|finish)\b|\blet me do it myself\b|"
+    r"\bi'?ll figure (?:it|this) out(?: (?:myself|on my own))?\s*[.!]*$")
+# About the app, never the case: "MY results", the results page, Submit, ending the
+# session. Not "the results of the survey", "the solution, top down or bottom up",
+# "the feedback report from customers", "finish this calculation".
+_PRODUCT_RE = re.compile(
+    r"\b(?:where|how) (?:do|can|will|would|should) i (?:see|find|get|check|view|access) my "
+    r"(?:results?|score|scores|feedback|report|marks|performance)\b|\bresults? page\b|"
+    r"\bsee my (?:score|results?|feedback|report|marks|performance)\b|\bhow (?:do|can|should) i submit\b|"
+    r"\bwhere(?:'s| is) the submit\b|\bsubmit button\b|"
+    r"\bhow (?:do|can|should) i (?:end|finish|exit|close|stop) (?:this |the )?(?:case|session|interview|attempt|chat)\b|"
+    r"\bwill i (?:get|see|receive) (?:a |my |any )?(?:score|feedback|results?|report|marks)\b(?! (?:from|of|on) (?!me\b))|"
+    r"\bcan i see the (?:solution|model answer|worked answer|full answer) (?:later|after|at the end)\b")
+# About the interviewer's own question. The strict forms stand alone; the topic forms
+# ("why is the value chain relevant here?", "why value chain?") must name a topic from
+# the interviewer's last line, so "why is it important for the client to grow in north
+# india" stays a case question.
+_WHY_ASKED_RE = re.compile(
+    r"\b(?:why|y) (?:are|r) (?:you|u) (?:asking|asks)\b|\bwhy (?:do|did|would) (?:you|u) ask\b|\bwhy (?:this|that) question\b|"
+    r"\bwhy (?:do|would) (?:you|u) (?:want|need) to know\b|"
+    r"\bwhat'?s the (?:point|use) of (?:the |this |that |your )?(?:[a-z-]+ ){0,4}question\b|"
+    r"\bwhat'?s the point of asking\b|\bhow is (?:that|this) relevant\s*(?:here)?\s*\??\s*$|"
+    r"\bwhy (?:does|would) (?:that|this) matter\s*(?:here)?\s*\??\s*$|"
+    r"\bwhy (?:is|would) (?:that|this) (?:relevant|important|needed)\s*(?:here)?\s*\??\s*$")
+_WHY_TOPIC_RE = re.compile(
+    r"^\s*(?:but |and |so |ok |okay )?(?:why (?:is |are |does |do |would )?|how (?:is|are) )(?:the |a |an |this |that )?"
+    r"(?P<topic>[a-z][a-z\s-]{1,40}?)(?: (?:relevant|important|needed|matter|matters))?"
+    r"(?: here| for this case| now| to (?:the )?[a-z]+(?: [a-z]+)?)?\s*\??\s*$")
+_WHY_STOP = {"is", "are", "the", "a", "an", "this", "that", "here", "now", "for", "case", "relevant", "important",
+             "needed", "matter", "matters", "do", "does", "would", "we", "you", "it", "of", "to", "and", "so"}
+
+
+def _asks_why_asked(norm: str, last_asst: str) -> bool:
+    """'why are you asking about X' (or 'why X?' naming the topic of your last line)."""
+    if re.search(r"\bbecause\b|\bcoz\b|\bsince\b", norm):
+        return False  # "why does this matter? because cost is the driver..." answers itself
+    la = _norm(last_asst)
+    if len(re.findall(r"[a-z]+", la)) < 3:
+        return False  # after "Go on." there is no question of yours to explain
+    if _WHY_ASKED_RE.search(norm):
+        return True
+    m = _WHY_TOPIC_RE.search(norm)
+    if not m:
+        return False
+    topic = {w for w in re.findall(r"[a-z]+", m.group("topic")) if w not in _WHY_STOP and len(w) >= 4}
+    return bool(topic) and topic <= set(re.findall(r"[a-z]+", la))
+
+
 _COURTESY_WORDS = {"thank", "thanks", "thankyou", "you", "so", "much", "ty", "ok", "okay", "great", "cool",
                    "sure", "alright", "bye", "sir", "maam", "nice", "very", "a", "lot", "again", "for", "help"}
 _CLOSING_LINE_RE = re.compile(
@@ -649,6 +717,8 @@ def _error_materiality(t: str) -> str:
 def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
                     teaching_policy: str = "coached", prior_state=None, channel: str = "text", is_voice_partial: bool = False) -> Dict[str, Any]:
     transcript = list(transcript or [])
+    # a pasted essay is read on its first few thousand characters (a 20k-char paste took 4s)
+    new_user_message = (new_user_message or "")[:4000]
     cand = _candidate_turns(transcript)
     asst = _assistant_turns(transcript)
     new_norm = _norm(new_user_message)
@@ -716,7 +786,9 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
                   or candidate_repeating or interviewer_repeating)) or frustration == "high"
 
     ends_ellipsis = new_norm.endswith("...") or "..." in new_norm
-    candidate_mid_thought = _has_any(new_norm, _MID_THOUGHT) or ends_ellipsis
+    candidate_mid_thought = (_has_any(new_norm, _MID_THOUGHT) or ends_ellipsis
+                             or (len(new_norm.split()) <= 4 and bool(re.search(
+                                 r"\bthinking\b|^\s*(?:\d+|one|two|a)\s*mins?\b|\bone min\b", new_norm))))
     wants_space = _has_any(new_norm, _WANTS_SPACE)
     wants_to_advance = _has_any(new_norm, _WANTS_ADVANCE)
     candidate_working = (_has_any(new_norm, _PLANNING)
@@ -753,7 +825,9 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
 
     has_number = bool(re.search(r"\d", new_norm))
     defended = (" because" in (" " + new_norm)) or (" since " in new_norm) or ("reason" in new_norm)
-    confident_unsupported_claim = _has_any(new_norm, _CONFIDENT) and has_number and not defended
+    hedged_100 = bool(re.search(r"\bnot (?:100|hundred) ?(?:%|percent|per cent) (?:sure|certain|confident)\b", new_norm))
+    confident_unsupported_claim = (_has_any(new_norm, _CONFIDENT) and has_number and not defended
+                                   and not hedged_100)
     
     # Must explicitly state finality to trigger sanity check
     states_final_estimate = _has_any(new_norm, _FINAL_ESTIMATE) and has_number
@@ -811,6 +885,9 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
             help_streak += 1
         else:
             break
+    asks_for_space = bool(_SPACE_ASK_RE.search(new_norm)) and not has_number and wc_now <= 18
+    space_requested_recently = any(_SPACE_ASK_RE.search(_norm(c)) and not re.search(r"\d", c)
+                                   for c in cand[-2:])
     unanswered = [re.sub(r"\s+", " ", (t.get("content") or "")).strip()[:160]
                   for t in transcript[-8:]
                   if (t.get("role") or "user") == "user" and asks_interviewer(t.get("content") or "")["asks"]][-2:]
@@ -849,6 +926,11 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "candidate_working": candidate_working,
         "product_ux_question": product_ux_question,
         "why_this_question": why_this_question,
+        # V12.1 (arena adversarial run): strict versions that route ahead of help / repair
+        "asks_for_space": asks_for_space,
+        "space_requested_recently": space_requested_recently,
+        "asks_product_help": bool(_PRODUCT_RE.search(new_norm)) and not intent["solution_requested"],
+        "asks_why_asked": _asks_why_asked(new_norm, last_asst),
         "asks_owned_fact": asks_owned_fact,
         "confident_unsupported_claim": confident_unsupported_claim,
         "states_final_estimate": final_declared,  # V12.1: one definition of a final answer
