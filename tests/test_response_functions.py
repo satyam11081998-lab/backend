@@ -36,6 +36,9 @@ for _k, _v in {
 }.items():
     os.environ.setdefault(_k, _v)
 os.environ["ADAPTIVE_INTERVIEWER"] = "true"
+# V12.1: the numbers audit is a separate model call with its own suite
+# (tests/test_v121_real_sessions.py); this suite counts the interviewer's own calls.
+os.environ["INTERVIEWER_NUMBERS_AUDIT"] = "off"
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -133,11 +136,18 @@ check("plan + 'Shall I proceed?' -> acknowledged and floor returned (not a clari
 sig, d = decide("Shall I proceed?")
 check("bare 'Shall I proceed?' keeps its V10.2 route (ANSWER_DIRECT)", d["function"] == "ANSWER_DIRECT", d)
 
-for text, fn in [("Okay.", "HAND_BACK"), ("Yeah", "HAND_BACK"), ("100.", "SHORT_ACK"),
+for text, fn in [("Okay.", "HAND_BACK"), ("Yeah", "HAND_BACK"),
                  ("I'll split households into urban and rural first.", "HAND_BACK")]:
     sig, d = decide(text, history=PROFIT_CASE + [{"role": "user", "content": "Let me start."},
                                                  {"role": "assistant", "content": "Go on."}])
     check(f"minimal turn {text!r} -> {fn} on the fast lane (no model call)", d["function"] == fn and d["render"] == "fast", d)
+# V12.1 (15-day review: "Rs 15 crore" -> "Alright.", "50 cr" -> "Alright."): in chat a
+# number is content and gets a model-worded line; voice keeps the 0-token beat.
+_h = PROFIT_CASE + [{"role": "user", "content": "Let me start."}, {"role": "assistant", "content": "Go on."}]
+sig, d = decide("100.", history=_h)
+check("[text] bare number '100.' -> model-worded line, not a fixed word", d["render"] == "model", d)
+sig, d = decide("100.", history=_h, channel="voice")
+check("[voice] bare number '100.' -> SHORT_ACK on the fast lane", d["function"] == "SHORT_ACK" and d["render"] == "fast", d)
 
 sig, d = decide("Delhi population = 20 million. Assume 5 people per family...")
 check("[text] mid-calculation ('...') -> HAND_BACK", d["function"] == "HAND_BACK", d)
@@ -147,7 +157,9 @@ sig, d = decide("okay", history=PROFIT_CASE + [{"role": "user", "content": "I'll
                                               {"role": "assistant", "content": "Go ahead."}])
 check("'okay' mid-case no longer re-opens the case", d["function"] != "OPEN", d)
 
-for text, fn in [("Can you help me here?", "MICRO_HINT"), ("Show me the correct approach.", "DELIVER_SOLUTION"),
+# V12.1: help with nothing on the table is TAUGHT (approach + skeleton + first step);
+# help after real work still gets the next hint.
+for text, fn in [("Can you help me here?", "TEACH_STEP"), ("Show me the correct approach.", "DELIVER_SOLUTION"),
                  ("Tell me the answer", "DELIVER_SOLUTION"),
                  ("So 1 litre = 100 ml, then I multiply by households", "CORRECT_AND_CONTINUE"),
                  ("This is irritating, you keep asking the same question", "REPAIR_AND_RESET"),
@@ -157,6 +169,13 @@ for text, fn in [("Can you help me here?", "MICRO_HINT"), ("Show me the correct 
     check(f"business rule kept: {text[:36]!r} -> {fn}", d["function"] == fn and d["lane"] == "SUBSTANTIVE", d)
 sig, d = decide("Can you help me here?", channel="voice", history=LIVE)
 check("[voice] help still honoured -> MICRO_HINT", d["function"] == "MICRO_HINT", d)
+_worked = PROFIT_CASE + [{"role": "user", "content": REAL_PLAN},
+                         {"role": "assistant", "content": "Baseline first - go ahead."}]
+sig, d = decide("Can you help me here?", history=_worked)
+check("help after real work -> MICRO_HINT (the next rung, not a lesson)", d["function"] == "MICRO_HINT", d)
+sig, d = decide("i dont know", history=_worked + [{"role": "user", "content": "help, how do I start the cuts?"},
+                                                  {"role": "assistant", "content": "Start with raw materials."}])
+check("blank 'i dont know' -> TEACH_STEP", d["function"] == "TEACH_STEP", d)
 sig = compute_signals(LIVE, "Can you help", "coached", channel="voice", is_voice_partial=True)
 check("[voice] partial transcript -> NO_OUTPUT", decide_response(sig)["function"] == "NO_OUTPUT")
 
@@ -196,7 +215,7 @@ for text in ("Yes.", "Do ahead.", "Go ahead", "Yes, go ahead.", "Sure, carry on"
 sig, d = decide("Do ahead.", history=PROPOSED)
 check("'Do ahead.' is never a question or a data request", not sig["is_scope_question"] and d["function"] != "DATA_REVEAL", d)
 for text, fn in [("Do you know the population?", "ANSWER_DIRECT"), ("Is it okay", "ANSWER_DIRECT"),
-                 ("Yes but what is the population?", "ANSWER_DIRECT"), ("Can you help me here?", "MICRO_HINT")]:
+                 ("Yes but what is the population?", "ANSWER_DIRECT"), ("Can you help me here?", "TEACH_STEP")]:
     sig, d = decide(text, history=PROPOSED)
     check(f"real questions keep their route: {text!r} -> {fn}", d["function"] == fn, d)
 sig, d = decide("Yes.", history=[{"role": "user", "content": "Hi."}, {"role": "assistant", "content": "Let's begin."}])
@@ -364,9 +383,14 @@ check("provider failure on a presence beat -> hand-back line, not an error", out
 out, ctl, calls = run("Okay.", history=PROFIT_CASE + [{"role": "user", "content": "Let me start."},
                                                      {"role": "assistant", "content": "Go on."}])
 check("minimal turn: fast lane, zero model calls", calls == [] and out in FAST_TEXTS, (out, len(calls)))
-out, ctl, calls = run("Can you help me here?", replies=["<<intervention=micro_hint; hint=2>>\n\nStart from the cost lines that change."])
+out, ctl, calls = run("Can you help me here?", history=PROFIT_CASE + [
+    {"role": "user", "content": REAL_PLAN}, {"role": "assistant", "content": "Baseline first - go ahead."}],
+    replies=["<<intervention=micro_hint; hint=2>>\n\nStart from the cost lines that change."])
 check("help turn: substantive deep lane, function MICRO_HINT, V10.2 HINT instruction kept",
       ctl.get("function") == "MICRO_HINT" and ctl.get("mode") == "HINT" and "YOUR MOVE THIS TURN: HINT" in system_text(calls[0]), ctl)
+out, ctl, calls = run("Can you help me here?", replies=["Let's do it line by line:\nraw materials 50 -> 45\nlabour 20 -> 19\nWhat does overhead become?"])
+check("help with nothing on the table: TEACH_STEP, visual skeleton allowed, line breaks kept",
+      ctl.get("function") == "TEACH_STEP" and "\n" in out and '"visual_structure_allowed": true' in system_text(calls[0]), (ctl, out))
 
 # ----- routes
 class _Res:

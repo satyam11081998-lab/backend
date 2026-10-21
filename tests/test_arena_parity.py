@@ -21,7 +21,8 @@ os.environ["ADAPTIVE_INTERVIEWER"] = "true"
 
 CASE = "Spice Express sales fell 12% YoY.\n- 240 outlets\n- AOV Rs 420"
 NOTE = {"role": "system", "kind": "system_note",
-        "content": "Case ready: Spice Express. Ask any clarifying questions before structuring."}
+        "content": ("Case ready: Spice Express. On a phone, tap the menu at the top left to read the full "
+                    "brief. Ask any clarifying questions before structuring.")}
 
 # A reply that production's post-processing treats differently by lane: a praise
 # opener, then two questions.
@@ -150,16 +151,21 @@ def test_arena_text_is_byte_identical_to_production_on_every_lane(wired, name, t
     assert out["control"]["render"] == ctl.get("render")
 
 
-def test_a_stacked_question_production_sends_is_visible_in_the_arena(wired):
-    """The exact v1 failure: the arena hid the second question users receive."""
+def test_a_stacked_question_is_trimmed_in_production_and_the_arena_shows_the_same(wired):
+    """v1 failure: the arena hid the second question users received. V12.1 fixes the
+    product instead: the streamed lane now drops the praise opener and cuts a stacked
+    second question (ONE question per reply), and the arena still shows exactly what
+    production sends -- the raw model text keeps both questions for the record."""
     transcript, message = LANES[0][1], LANES[0][2]
     prod_text, _ = _production(wired["eng"], transcript, message)
     out = _arena(wired["arena"], transcript, message)
-    assert prod_text.count("?") == 2, "fixture no longer exercises the stacked question"
-    assert out["reply"].count("?") == 2
-    assert "multiple_questions" in out["violations"]
-    # ...and the old engine entry point really does hide it, which is why the arena
-    # must not use it. If this ever stops being true the two paths have converged.
+    assert out["raw_reply"].count("?") == 2, "fixture no longer exercises the stacked question"
+    assert prod_text.count("?") == 1
+    assert "Great point" not in prod_text
+    assert out["reply"] == prod_text
+    assert "multiple_questions" not in out["violations"]
+    assert out["enforced"] is True, "the rewrite is attributed to the guard, not the prompt"
+    # The non-streamed entry point agrees with the streamed one.
     old = wired["eng"].complete_interviewer_reply(
         case_content=CASE, case_type="profitability", transcript=transcript,
         new_user_message=message, prior_state={}, control_out={})
@@ -215,8 +221,8 @@ def test_raw_text_is_reported_and_a_rewrite_is_attributed(wired):
     assert out["raw_reply"] and "<<" not in out["raw_reply"]
     if out["raw_reply"] != out["reply"]:
         assert out["enforced"] is True
-    out_q = _arena(wired["arena"], LANES[0][1], LANES[0][2])  # streamed as-is
-    assert out_q["enforced"] is False, "production does not rewrite a streamed reply"
+    out_q = _arena(wired["arena"], LANES[0][1], LANES[0][2])  # streamed through the reply guard
+    assert out_q["enforced"] is True, "V12.1: the stream guard trims praise and a stacked question"
 
 
 # --------------------------------------------------------------- copied constants
@@ -239,7 +245,8 @@ def test_quota_ladder_matches_the_route_that_enforces_it():
 
 def test_opening_note_matches_the_row_production_seeds():
     from routes import arena as ar
-    expr = 'f"Case ready: {case.get(\'title\')}. Ask any clarifying questions before structuring."'
+    expr = ('f"Case ready: {case.get(\'title\')}. On a phone, tap the menu at the top left to read the full '
+            'brief. Ask any clarifying questions before structuring."')
     src = _attempts_source()
     assert expr in src, "the system_note production seeds has changed: update routes/arena.py"
     assert '"kind": "system_note"' in src

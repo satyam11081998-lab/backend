@@ -223,9 +223,17 @@ check("default session is model-led: the model answers by itself, barge-in kept"
       out.get("interviewer") == "model_led" and td["create_response"] is True and td["interrupt_response"] is True, td)
 check("model-led: replies come fast (semantic_vad eagerness high by default)", td.get("eagerness") == "high", td)
 check("model-led: NO tools by default (a tool call is a round trip = lag)", "tools" not in sess, sess.get("tools"))
+_tr = dict(sess["audio"]["input"]["transcription"])
 check("model-led: streaming transcription model, in English (no Devanagari for Indian English)",
-      sess["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe", "language": "en"},
-      sess["audio"]["input"]["transcription"])
+      {k: _tr[k] for k in ("model", "language")} == {"model": "gpt-4o-mini-transcribe", "language": "en"}, _tr)
+# V12.1: the transcriber gets the case vocabulary, the mic gets noise reduction, and
+# the voice is the realtime-native one.
+check("model-led: transcription carries a case-vocabulary prompt (lakh, crore, population)",
+      all(w in (_tr.get("prompt") or "") for w in ("lakh", "crore", "population")), _tr)
+check("model-led: near-field noise reduction on the mic",
+      sess["audio"]["input"].get("noise_reduction") == {"type": "near_field"}, sess["audio"]["input"])
+check("model-led: natural realtime voice by default (marin)", sess["audio"]["output"]["voice"] == "marin",
+      sess["audio"]["output"])
 check("model-led: the interviewer opens the call; per-turn coach off",
       out.get("open_first") is True and out.get("coach") is False, out)
 check("prompt: the case sits on top", ins.startswith("=== THE CASE") and CASE_CONTENT in ins.split("===")[2])

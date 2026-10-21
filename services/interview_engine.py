@@ -11,6 +11,7 @@ worded from their own content, validated, and fall back to a plain hand-back
 """
 
 import os
+import re
 import json
 import time
 from typing import Iterable, Dict, List, Generator, Any, Optional
@@ -33,7 +34,10 @@ from services.interviewer_decision import (
     assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event,
     decide_response, build_interviewer_control_packet, validate_contextual_line,
     CONTEXTUAL_PRESENCE, scrub_control_leak, StreamLeakGuard,
+    StreamReplyGuard, looks_like_refusal, is_praise_only, strip_all_questions, strip_solicitations,
+    _filter_lines,
 )
+from services import numbers_check
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 from prompts.voice_renderer import strip_say_label
 
@@ -128,9 +132,89 @@ def _recent_lines(transcript) -> List[str]:
             if t.get("role") == "assistant" and (t.get("content") or "").strip()][-3:]
 
 
+# V12.1: deterministic routes that already know what the turn needs. The context
+# assessor (an extra model call) is skipped for them, and can never overwrite them.
+_DECIDED_KEYS = ("wants_to_exit", "asks_session_status", "wants_case_restate", "complains_unanswered",
+                 "math_issue", "final_declared", "concept_asked", "wants_next_step", "stuck_blank",
+                 "wants_teaching")
+_ASSESSOR_WEAK_INTENTS = ("answering", "working", "unknown", "hypothesis")
+
+
+def _merge_assessment(signals: Dict[str, Any], assessed: Dict[str, Any]) -> None:
+    """The assessor refines progress / materiality / phase. It may not turn a real
+    question to the interviewer into 'answering' (that is how "Budget was fixed
+    ... or what was the budget trends" got "Alright.")."""
+    a = dict(assessed or {})
+    if signals.get("asks_interviewer") and a.get("intent") in _ASSESSOR_WEAK_INTENTS:
+        a.pop("intent", None)
+    signals.update(a)
+
+
+def _reference_figure(solution: Optional[str]) -> Optional[str]:
+    """Only the model solution's headline figure ("about 3 lakh vendors"), never the
+    worked steps: shared once the candidate has committed to a final answer, so they
+    can see roughly how close they landed."""
+    sol = re.sub(r"\s+", " ", (solution or "")).strip()
+    if not sol:
+        return None
+    for m in reversed(list(re.finditer(r"(?i)final (?:answer|estimate)|\banswer\b\s*[:=]?|\bestimate\b\s*[:=]?|≈|~", sol))):
+        tail = sol[m.end():m.end() + 80]
+        q = numbers_check.first_quantity(tail)
+        if q is not None:
+            rest = tail[q.end:]
+            noun = re.match(r"\s*((?:[A-Za-z][\w-]*\s?){0,3})", rest)
+            words = (noun.group(1).strip() if noun else "")
+            words = re.split(r"\b(?:per|in|a|an|the|for|of|which|so|and)\b", words)[0].strip()
+            return f"about {q.raw} {words}".strip()
+    return None
+
+
+def _annotate_turn(signals, tlist, msg, case_content, case_type, prior_state, overrides,
+                   audit_ctx, case_solution) -> None:
+    """V12.1: the numbers Python checked, the facts the turn may lean on, and the
+    structure/teaching reads that need the case type."""
+    signals.update(numbers_check.check_turn(tlist, msg, case_content, signals))
+    if numbers_check.should_audit(signals, tlist, msg, signals.get("channel") or "text"):
+        auditor = overrides.get("numbers_auditor")
+        if auditor is None:
+            ctx = audit_ctx or {}
+            cli = (ctx.get("llm") or (None,))[0] or openai_client()
+            usage_out, user_id = ctx.get("usage_out"), ctx.get("user_id")
+
+            def _record(resp, latency_ms, model):
+                _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages/audit",
+                               model=model, response=resp, latency_ms=latency_ms, provider="openai")
+
+            def auditor(t, m, c):
+                return numbers_check.audit_turn(t, m, c, client=cli, record=_record)
+        numbers_check.merge_audit(signals, auditor(tlist, msg, case_content))
+    if signals.get("math_issue"):
+        signals["error_materiality"] = "material"
+    if signals.get("final_declared") or signals.get("asks_session_status") or signals.get("concept_asked"):
+        signals["final_context"] = numbers_check.final_context(tlist, msg, case_content)
+    # The reference figure is shared only AFTER a real final answer (a number in THIS
+    # message, or a final already given), and never in exam policy.
+    final_now = signals.get("final_declared") and re.search(r"\d", msg or "")
+    if (case_solution and (signals.get("teaching_policy") or "coached") != "exam"
+            and (final_now or (signals.get("asks_session_status") and signals.get("final_given_earlier")))):
+        ref = _reference_figure(case_solution)
+        if ref:
+            signals["reference_answer"] = ref
+    recent = list(signals.get("recent_functions") or [])
+    guess = (case_type or "").lower() == "guesstimate"
+    if (not guess and signals.get("idea_streak", 0) >= 3 and not signals.get("structured_ever")
+            and "TEACH_STEP" not in recent and not signals.get("asks_interviewer")):
+        signals["needs_structure"] = True
+        signals["teach_focus"] = "structure"
+        ideas = [re.sub(r"\s+", " ", (t.get("content") or "")).strip()[:140]
+                 for t in tlist if (t.get("role") or "user") == "user"][-4:]
+        signals["candidate_ideas"] = ideas + [re.sub(r"\s+", " ", msg).strip()[:140]]
+
+
 def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarifications_exhausted,
                         teaching_policy, prior_state, channel, is_voice_partial,
-                        messages_builder=None, prompt_overrides=None) -> Dict[str, Any]:
+                        messages_builder=None, prompt_overrides=None, audit_ctx=None,
+                        case_solution=None) -> Dict[str, Any]:
     """Signals -> gates -> response function -> (for model turns) control packet + messages.
 
     messages_builder / prompt_overrides are the admin arena's seam (services/arena.py):
@@ -140,9 +224,12 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
     policy = _teaching_policy(teaching_policy)
     signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state,
                               channel=channel, is_voice_partial=is_voice_partial)
-    if needs_contextual_assessment(signals):
+    if not is_voice_partial:
+        _annotate_turn(signals, tlist, new_user_message, case_content, case_type, prior_state,
+                       overrides, audit_ctx, case_solution)
+    if needs_contextual_assessment(signals) and not any(signals.get(k) for k in _DECIDED_KEYS):
         assessor = overrides.get("assessor") or assess_context_with_llm
-        signals.update(assessor(tlist, new_user_message, case_content))
+        _merge_assessment(signals, assessor(tlist, new_user_message, case_content))
     decision = decide_response(signals)
     plan = {"policy": policy, "signals": signals, "decision": decision,
             "mode": decision["mode"], "function": decision["function"], "reason": decision["reason"]}
@@ -214,7 +301,9 @@ def _contextual_line(plan, new_user_message, channel, user_id,
         if usage_out is not None:
             usage_out.update(raw_text=raw, model=model, provider=provider)
         tag, clean = parse_control_tag(raw)
-        line, problems = validate_contextual_line(clean, new_user_message, channel, max_sent)
+        may_confirm = bool(plan["packet"]["interviewer_control"]["interviewer_decision"].get("may_confirm_correctness"))
+        line, problems = validate_contextual_line(clean, new_user_message, channel, max_sent,
+                                                  may_confirm=may_confirm)
         if line and not problems:
             return {"text": line, "tag": tag or {}, "fallback": False, "problems": []}
         if line and "leak" not in problems and not best and len(line.split()) > 3:
@@ -233,6 +322,60 @@ def _contextual_line(plan, new_user_message, channel, user_id,
     print(f"[interviewer] contextual_fallback function={plan['function']} problems={problems}")
     return {"text": ev["data"]["text"], "tag": {"mode": "HAND_BACK", "intervention": "fast_lane"},
             "fallback": True, "problems": problems}
+
+
+_RETRY_NOTES = {
+    "refusal": ("You just told the candidate the information is not available. In this interview you OWN "
+                "the facts: give a specific, realistic figure (or a direct answer) as fact, consistent with the "
+                "case and anything already said, then hand back. Write the reply again."),
+    "questions_only": ("Your reply was only a question, but this turn must not ask anything. Do what the turn "
+                       "requires as plain statements. Write the reply again."),
+    "praise_only": ("Your reply was only praise; it gave the candidate nothing to use. Do what the turn "
+                    "requires, specifically, without praise. Write the reply again."),
+}
+
+
+def _no_question_problem(clean: str, mode: str, allow_questions: bool, policy: str) -> Optional[str]:
+    """Why a no-question reply cannot ship as written (None = it can)."""
+    if looks_like_refusal(clean):
+        return "refusal"
+    if is_praise_only(clean):
+        return "praise_only"
+    body = sanitize_reply(scrub_control_leak(clean), policy)
+    if not allow_questions and not strip_solicitations(strip_all_questions(body)).strip():
+        return "questions_only"
+    return None
+
+
+def _finish_no_question(cli, model, messages, raw_text, mode, allow_questions, policy, record):
+    """V12.1: one regeneration when the reply refuses data, is only praise, or is
+    only questions (which used to ship as the stock 'Let's move on to the next
+    phase.'). Returns (tag, final_text, raw_text)."""
+    tag, clean = parse_control_tag(raw_text)
+    problem = _no_question_problem(clean, mode, allow_questions, policy)
+    if problem:
+        try:
+            t0 = time.time()
+            resp2 = cli.chat.completions.create(
+                model=model,
+                messages=list(messages) + [{"role": "assistant", "content": raw_text[:500]},
+                                           {"role": "system", "content": _RETRY_NOTES[problem]}],
+                temperature=INTERVIEWER_TEMPERATURE, frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
+                presence_penalty=INTERVIEWER_PRESENCE_PENALTY, max_tokens=220)
+            record(resp2, int((time.time() - t0) * 1000))
+            raw2 = (resp2.choices[0].message.content or "").strip()
+            tag2, clean2 = parse_control_tag(raw2)
+            if clean2 and _no_question_problem(clean2, mode, allow_questions, policy) is None:
+                tag, clean, raw_text = (tag2 or tag), clean2, raw2
+            print(f"[interviewer] regenerated reason={problem} ok={clean2 == clean}")
+        except Exception as e:  # noqa: BLE001 - the first reply is still usable after filtering
+            print(f"[interviewer] regeneration_failed reason={problem} error={type(e).__name__}")
+    if looks_like_refusal(clean):
+        clean = _filter_lines(clean, lambda x: not looks_like_refusal(x))
+    final_text = enforce_mode(scrub_control_leak(clean), mode, allow_questions, policy)
+    if is_praise_only(final_text):
+        final_text = enforce_mode("", mode, False, policy)  # never ship "Great job!" as the turn
+    return tag, final_text, raw_text
 
 
 # -----------------------------------------------------------------------------
@@ -255,6 +398,7 @@ def stream_interviewer_reply(
     llm_override=None,
     usage_out: Optional[dict] = None,
     prompt_overrides: Optional[dict] = None,
+    case_solution: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """The production turn: /attempts/{id}/messages (text, SSE) and the voice route.
 
@@ -273,7 +417,9 @@ def stream_interviewer_reply(
         plan = _plan_adaptive_turn(case_content, case_type, tlist, new_user_message,
                                    clarifications_exhausted, teaching_policy, prior_state,
                                    channel, is_voice_partial, messages_builder=messages_builder,
-                                   prompt_overrides=prompt_overrides)
+                                   prompt_overrides=prompt_overrides,
+                                   audit_ctx={"llm": llm_override, "usage_out": usage_out, "user_id": user_id},
+                                   case_solution=case_solution)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]
@@ -326,6 +472,10 @@ def stream_interviewer_reply(
         )
         cli, model, provider = llm_override or resolve_llm("interviewer")
 
+    # V12.1: teaching turns lay a structure out on a few short lines.
+    max_tokens = 260 if (adaptive and function in ("TEACH_STEP", "EXPLAIN_FORMAT", "DELIVER_SOLUTION",
+                                                    "RESTATE_CASE", "FINAL_REVIEW", "SESSION_STATUS")) else 180
+
     def _complete(c, m):
         return c.chat.completions.create(
             model=m,
@@ -333,7 +483,7 @@ def stream_interviewer_reply(
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
             presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
-            max_tokens=180,
+            max_tokens=max_tokens,
         )
 
     def _open_stream(c, m):
@@ -343,7 +493,7 @@ def stream_interviewer_reply(
             temperature=INTERVIEWER_TEMPERATURE,
             frequency_penalty=INTERVIEWER_FREQUENCY_PENALTY,
             presence_penalty=INTERVIEWER_PRESENCE_PENALTY,
-            max_tokens=180,
+            max_tokens=max_tokens,
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -363,19 +513,24 @@ def stream_interviewer_reply(
                 raise InterviewEngineError(f"OpenAI call failed: {e}")
         
         raw_text = (resp.choices[0].message.content or "").strip()
-        tag, clean_text = parse_control_tag(raw_text)
-        final_text = enforce_mode(scrub_control_leak(clean_text), mode, allow_questions, policy)
-        
+        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages", model=model,
+                       response=resp, latency_ms=int((time.time() - t0) * 1000),
+                       provider="openai" if fell_back else provider)
+
+        def _record_retry(r, ms, _m=model, _p=("openai" if fell_back else provider)):
+            _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages", model=_m,
+                           response=r, latency_ms=ms, provider=_p)
+
+        tag, final_text, raw_text = _finish_no_question(cli, model, messages, raw_text, mode,
+                                                        allow_questions, policy, _record_retry)
+
         if control_out is not None:
             _set_control(control_out, plan, tag or {}, "model")
         if usage_out is not None:
             usage_out.update(raw_text=raw_text, model=model,
                              provider="openai" if fell_back else provider)
-            
+
         yield final_text
-        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages", model=model,
-                       response=resp, latency_ms=int((time.time() - t0) * 1000),
-                       provider="openai" if fell_back else provider)
         return
 
     # STANDARD STREAMING
@@ -399,6 +554,11 @@ def stream_interviewer_reply(
     final = _U()
     stripper = StreamTagStripper() if adaptive else None
     guard = StreamLeakGuard() if adaptive else None
+    reply_guard = StreamReplyGuard() if adaptive else None
+
+    def _guarded(piece):
+        for _o in guard.feed(piece):
+            yield from reply_guard.feed(_o)
     raw_parts: Optional[List[str]] = [] if usage_out is not None else None
     try:
         for chunk in stream:
@@ -415,15 +575,21 @@ def stream_interviewer_reply(
                     raw_parts.append(token)
                 if stripper is not None:
                     for _out in stripper.feed(token):
-                        yield from guard.feed(_out)
+                        yield from _guarded(_out)
                 else:
                     yield token
         if stripper is not None:
             for _out in stripper.flush():
-                yield from guard.feed(_out)
+                yield from _guarded(_out)
             held = guard.flush(fallback=enforce_mode("", mode, False, policy))
             if held:
-                yield held
+                yield from reply_guard.feed(held)
+            tail = reply_guard.flush()
+            if tail:
+                yield tail
+            if not reply_guard.emitted.strip():
+                # Only praise came back: never an empty bubble.
+                yield enforce_mode("", mode, False, policy)
             if control_out is not None:
                 _set_control(control_out, plan, getattr(stripper, "tag", {}) or {}, "model")
     except Exception as e:
@@ -452,6 +618,7 @@ def complete_interviewer_reply(
     llm_override=None,
     usage_out: Optional[dict] = None,
     prompt_overrides: Optional[dict] = None,
+    case_solution: Optional[str] = None,
 ) -> str:
     """messages_builder / llm_override are used ONLY by the admin arena
     (services/arena.py) to pin the prompt layer and the model per arm. Both default
@@ -463,7 +630,9 @@ def complete_interviewer_reply(
         plan = _plan_adaptive_turn(case_content, case_type, transcript, new_user_message,
                                    clarifications_exhausted, teaching_policy, prior_state,
                                    channel, is_voice_partial, messages_builder=messages_builder,
-                                   prompt_overrides=prompt_overrides)
+                                   prompt_overrides=prompt_overrides,
+                                   audit_ctx={"llm": llm_override, "usage_out": usage_out},
+                                   case_solution=case_solution)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]
@@ -527,8 +696,8 @@ def complete_interviewer_reply(
 
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
-        tag, text = parse_control_tag(text)
-        text = enforce_mode(scrub_control_leak(text), mode, allow_questions, policy)
+        tag, text, _raw = _finish_no_question(cli, used_model, messages, text, mode, allow_questions,
+                                              policy, lambda r, ms: None)
         if control_out is not None:
             _set_control(control_out, plan, tag or {}, "model")
     return text

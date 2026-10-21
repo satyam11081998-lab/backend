@@ -27,7 +27,27 @@ CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 # The realtime family moves fast — keep this in one env-overridable place so a
 # model bump is a config change, not a redeploy.
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime-2.1")
-REALTIME_VOICE = os.getenv("REALTIME_VOICE", "alloy")
+# V12.1: "marin" (and "cedar") are the realtime-native voices -- the natural,
+# conversational ones ChatGPT-style voice mode is known for. "alloy" is the older,
+# flatter TTS voice and was the default until now. REALTIME_VOICE still overrides.
+REALTIME_VOICE = os.getenv("REALTIME_VOICE", "marin")
+
+# V12.1: background noise (a fan, traffic, a TV, the phone's own speaker) was cutting
+# the interviewer off mid-sentence and showing up as junk in transcripts. near_field
+# suits a phone or laptop mic close to the mouth; "far_field" for a room mic; "off".
+REALTIME_NOISE_REDUCTION = (os.getenv("REALTIME_NOISE_REDUCTION", "near_field") or "").strip().lower()
+# A vocabulary hint for the transcription model: Indian English case-interview words
+# and number scales. Without it, "population" came back as "Papulo-pustular rosacea".
+REALTIME_TRANSCRIBE_PROMPT = os.getenv(
+    "REALTIME_TRANSCRIBE_PROMPT",
+    "A consulting case interview in Indian English. Expect numbers and words like lakh, crore, "
+    "million, billion, percent, population, households, penetration, guesstimate, market size, "
+    "revenue, profit, margin, cost, MECE, segment, top-down, bottom-up, sanity check, Rs.")
+REALTIME_TRANSCRIBE_PROMPT_US = os.getenv(
+    "REALTIME_TRANSCRIBE_PROMPT_US",
+    "A consulting case interview in American English. Expect numbers and words like thousand, "
+    "million, billion, percent, dollars, population, households, penetration, market size, revenue, "
+    "profit, margin, cost, MECE, segment, top-down, bottom-up, sanity check.")
 
 # Kill switch, mirroring AI_TTS_MIN_PRO for the pipeline. Set to "0" to disable
 # realtime voice for everyone WITHOUT a redeploy.
@@ -112,6 +132,33 @@ def build_turn_detection(create_response: bool = False, eagerness: Optional[str]
         "create_response": create_response,
         "interrupt_response": True,
     }
+
+
+def _transcribe_prompt(market: str = "IN") -> str:
+    return REALTIME_TRANSCRIBE_PROMPT_US if (market or "").upper() == "US" else REALTIME_TRANSCRIBE_PROMPT
+
+
+def _add_input_extras(audio_in: dict, market: str = "IN") -> None:
+    """V12.1: noise reduction + a transcription vocabulary hint (both env-tunable)."""
+    if REALTIME_NOISE_REDUCTION in ("near_field", "far_field"):
+        audio_in["noise_reduction"] = {"type": REALTIME_NOISE_REDUCTION}
+    prompt = _transcribe_prompt(market)
+    if prompt and isinstance(audio_in.get("transcription"), dict):
+        audio_in["transcription"]["prompt"] = prompt
+
+
+def _strip_input_extras(audio_in: dict) -> bool:
+    """Remove the V12.1 extras; True if anything was removed."""
+    changed = audio_in.pop("noise_reduction", None) is not None
+    tr = audio_in.get("transcription")
+    if isinstance(tr, dict) and tr.pop("prompt", None) is not None:
+        changed = True
+    return changed
+
+
+def _rejects_extras(res) -> bool:
+    txt = (getattr(res, "text", "") or "").lower()
+    return "noise_reduction" in txt or "prompt" in txt
 
 
 class RealtimeSessionRequest(BaseModel):
@@ -279,6 +326,12 @@ async def create_realtime_session(
             },
         }
     }
+    try:
+        from services.markets import case_market as _case_market
+        _market = _case_market(case.data[0])
+    except Exception:  # noqa: BLE001 -- the market only picks the transcription vocabulary
+        _market = "IN"
+    _add_input_extras(payload["session"]["audio"]["input"], _market)
 
     try:
         t0 = time.time()
@@ -291,16 +344,34 @@ async def create_realtime_session(
                 },
                 json=payload,
             )
-            if res.status_code in (400, 422) and transcribe_model != "whisper-1":
-                # A transcription model the account or API does not accept must
-                # never take voice down: retry once with the known-good one.
-                print(f"[realtime] transcription model {transcribe_model!r} rejected; retrying with whisper-1")
-                payload["session"]["audio"]["input"]["transcription"] = {"model": "whisper-1"}
+            audio_in = payload["session"]["audio"]["input"]
+            if res.status_code in (400, 422) and _rejects_extras(res) and _strip_input_extras(audio_in):
+                # The V12.1 extras (noise reduction, vocabulary prompt) are niceties:
+                # an API that refuses them must never take voice down.
+                print("[realtime] input extras rejected; retrying without them")
                 res = await client.post(
                     CLIENT_SECRETS_URL,
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                     json=payload,
                 )
+            if res.status_code in (400, 422) and transcribe_model != "whisper-1":
+                # A transcription model the account or API does not accept must
+                # never take voice down: retry once with the known-good one.
+                print(f"[realtime] transcription model {transcribe_model!r} rejected; retrying with whisper-1")
+                audio_in["transcription"] = {"model": "whisper-1"}
+                if _transcribe_prompt(_market) and "noise_reduction" in audio_in:
+                    audio_in["transcription"]["prompt"] = _transcribe_prompt(_market)
+                res = await client.post(
+                    CLIENT_SECRETS_URL,
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+                if res.status_code in (400, 422) and _strip_input_extras(audio_in):
+                    res = await client.post(
+                        CLIENT_SECRETS_URL,
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                        json=payload,
+                    )
         latency_ms = int((time.time() - t0) * 1000)
 
         if res.status_code >= 400:

@@ -92,6 +92,12 @@ _WHY_THIS = (
     "why that question", "what's the point of", "whats the point of",
     "why do you want to know", "why are we", "why does that matter",
 )
+_OWNED_FACT_WIDE = (
+    "population", "growth", "competitor", "how many", "how much", "market size", "market share",
+    "per capita", "price", "cost", "revenue", "salary", "wage", "margin", "share of", "number of",
+    "average", "data", "exhibit", "split", "breakdown", "budget", "trend", "spend", "volume", "rate",
+    "households", "income", "profit", "sales", "customers", "members", "stores", "outlets", "fleet",
+)
 _OWNED_FACT = (
     "population", "growth rate", "market growth", "competitors", "how many players",
     "market size", "gdp", "per capita", "how big is the market", "what's the price",
@@ -117,6 +123,11 @@ _RECOMMEND = (
     "i recommend", "overall i'd", "overall i would", "so overall i", "in summary",
     "to summarize", "to sum up", "my final recommendation", "overall my",
 )
+_END_RE = re.compile(
+    r"^(?:ok(?:ay)?[\s,]+|so[\s,]+|yeah[\s,]+)*(?:i'?m|i am|im) (?:done|finished)(?:\s+(?:now|here|for today|sir))?(?=\s*(?:[.!,;]|$|let'?s|lets|my|and i))"
+    r"|\blet'?s wrap(?: (?:it )?up)?\b|\blets wrap\b|\bwe can wrap\b|\bi (?:don'?t|do not|dont) want to continue\b"
+    r"|\bi give up(?: (?:now|here|on this(?: case)?|for (?:today|now)))?(?=\s*(?:[.!?,]|$))|\bi quit\b"
+    r"|^leave it(?=\s*(?:[.!?,]|$|na|yaar))")
 _POST_CLOSE = (
     "how did i do", "how'd i do", "any tips", "any feedback", "how was i",
     "what's my score", "whats my score", "how did that go", "any advice",
@@ -159,7 +170,10 @@ _PRESENCE_TEXT_MATCHES = [
 
 _AFFIRMATION_WORDS = {
     "ok", "okay", "got", "right", "understood", "yes", "yeah", "yep",
-    "sure", "makes", "agreed", "correct", "exactly", "proceed", "continue"
+    "sure", "makes", "agreed", "correct", "exactly", "proceed", "continue",
+    # V12.1: Hinglish yes and plain thanks are affirmations too ("hn", "haan ji", "thanks")
+    "hn", "haan", "han", "ha", "ji", "acha", "accha", "achha", "theek", "thik", "thanks", "thank",
+    "thankyou", "ty",
 }
 
 # --- V12: what kind of turn is this? ------------------------------------------
@@ -193,6 +207,16 @@ _CALC_WORDS = (
     "multiply", "multiplied", "divide", "divided", "times", " x ", "*", "/", " per ",
     "%", "percent", "plus", "minus", "subtract", "add ",
 )
+# Wanting to skip a step or stop - said about the session, not the client ("the client
+# wants to QUIT the market", "customers GIVE UP on the brand", "LEAVE the market").
+_SKIP_STOP_RE = re.compile(
+    r"^(?:(?:ok|okay|so|arre|yaar|please)[\s,]+)*(?:leave it|skip(?: it| this)?|forget it|move on|next question)\b"
+    r"|\b(?:let'?s|lets|can we|could we|shall we|we can)(?: just| please)? (?:move on|skip)\b|\bnext question\b"
+    r"|\bskip (?:this|it|to the)\b|^(?:(?:eh|ok|okay|so)[\s,]+)*(?:just )?move on\b"
+    r"|\bi (?:don'?t|dont|do not) want to (?:continue|do (?:this|it)|answer|go on|proceed|carry on)\b"
+    r"|\bi (?:don'?t|dont|do not) want to[\s.!]*$|\bi (?:don'?t|dont|do not) want (?:this|to do this)\b"
+    r"|\bnot interested\b|\b(?:i'?m|i am|im) done\b(?! with)|\bi give up\b(?! on (?:the|this) (?!case))|\bi quit\b"
+    r"|\bleave it\b(?=\s*(?:[.!?,]|$|na|yaar|i))")
 _PROCEED_ASKS = (
     "shall i proceed", "should i proceed", "can i proceed", "may i proceed",
     "shall i continue", "should i continue", "can i continue", "shall i go ahead",
@@ -203,6 +227,218 @@ _PROCEED_ASKS = (
     "okay to proceed", "ok to proceed", "good to go",
 )
 _CONFIDENCE_HIGH = ("definitely", "clearly", "obviously", "certainly", "for sure", "surely")
+
+# --- V12.1: what the candidate is ASKING FOR -----------------------------------
+# From the 15-day review (Oct 2026): questions and requests that got "Okay." /
+# "Sure, continue." / "Let's move on to the next phase." -- "Show me the case study",
+# "Are we done?", "i want to exist the interview i am not prepared", "How it work",
+# "how i adjust my assumtion", "could you answer the questions?", "i estimate it to
+# around 20k". Each of these now has a named signal and a real response function.
+
+# A question that only tags work ("... three parts. Upper, middle and lower class. Right?")
+_TAG_Q_RE = re.compile(
+    r"(?:^|[\s,.;-])(right|ok|okay|correct|yes|na|naa|no|isn'?t it|is it|innit|yeah|fine|agreed|"
+    r"sound good|sounds good|makes sense|good)\s*\?+\s*$")
+_REQUEST_RE = re.compile(
+    r"\b(show me|tell me|give me|can you|could you|would you|will you|can u|could u|u tell|you tell|"
+    r"please (?:tell|give|share|explain|show|provide|help)|explain (?:to )?me\b|"
+    r"share (?:the |your |some |my )?(?:feedback|data|numbers|answer|case)|let me know|"
+    r"i need (?:the|some|to know)|brief me)\b")
+# A question asked mid-sentence without a question mark ("Budget was fixed all over
+# the past 5 years or what was the budget trends").
+_EMBEDDED_Q_RE = re.compile(
+    r"\bor what\b|\b(?:do|did) (?:we|you) (?:have|know)\b|\b(?:is|are) there (?:any|a)\b|"
+    r"\bwhat (?:was|were|is|are) the (?:\w+ )?(?:trend|trends|number|numbers|data|split|share|budget|price|cost|"
+    r"revenue|size|growth|rate|figure|figures|breakdown|target|timeline|objective)\b|"
+    r"\bcan (?:i|we) (?:get|have|know)\b|\bi(?:'d| would| will|'ll)? (?:like to )?ask\b|\bclarifying question\b|"
+    r"\b(?:i(?:'d| would)|would) (?:like|love) to (?:know|understand|check)\b|\bi (?:want|need|wanted) to know\b|"
+    r"\b(?:was |am )?wondering (?:if|whether|about)\b|"
+    r"\b(?:kitna|kitne|kitni|kya|kaise|kyun|kyu|kaun|kab|kahan|kidhar)\b")
+_DATA_NOUN_RE = re.compile(
+    r"\b(?:price|prices|pricing|cost|costs|breakdown|margins?|share|revenue|data|split|size|number of|trend|trends|"
+    r"growth|budget|sales|volume|competitors?|population|salary|salaries|rate|average|avg|ebitda|profit|"
+    r"capacity|utili[sz]ation|churn|footfall|aov|skus?|stores|outlets|exhibit)\b")
+_DATA_ASK_LEAD_RE = re.compile(r"^(?:and|ok|okay|so|also|what about|how about|any|need|the|plus|then|now)\b")
+# "What I would do is first check...", "How I see it is..." open a statement.
+_STATEMENT_START_RE = re.compile(r"^(?:what|how|why|where) i(?:'d| would| will|'ll| did| do| see| think| mean| am| was)\b"
+                                 r"[^?]*\b(?:is|was|are)\b")
+_NOT_A_REQUEST_RE = re.compile(r"\bgive me (?:a |one )?(?:sec|second|moment|minute|min)\b|\bgive me time\b")
+_Q_STARTERS = {"what", "whats", "what's", "why", "how", "hows", "how's", "when", "where", "who", "which",
+               "is", "are", "do", "does", "did", "can", "could", "should", "would", "shall", "am", "any"}
+_Q_FILLERS = re.compile(r"^(?:(?:so|and|but|then|well|now|actually|basically|okay|ok|hmm+|umm+|sir|ma'?am|bro|"
+                        r"yes|yeah|no|also|right|alright|hello|hi)[\s,.!]+)+")
+
+# Asking for the case again. Directed at the interviewer: "can you show me the case",
+# "brief me the case", "show me the case study ...", a whole message "what is the
+# question?", or "I can't see it on my screen". NOT "To summarize the case: ..." or
+# "So the problem statement is ..." or "What is the problem with the cost side".
+_CASE_NOUN = r"(?:case(?:\s+study)?|question|problem(?:\s+statement)?|brief|prompt|scenario)"
+_RESTATE_VERB = r"(?:show|give|send|share|repeat|read|tell|brief|recap|summari[sz]e|remind|explain)"
+_RESTATE_RE = re.compile(
+    rf"\b(?:can|could|would|will) (?:you|u) (?:please |pls |plz |kindly )?(?:again )?{_RESTATE_VERB}"
+    rf"(?: me| us)?(?: again)? (?:the |this |that |our )?(?:full |whole |complete )?{_CASE_NOUN}\b"
+    rf"|^(?:(?:please|pls|plz|kindly|ok|okay|so|sir|hi|hello|first)[\s,]+)*{_RESTATE_VERB} (?:me|us)\b[^.?!]{{0,25}}?{_CASE_NOUN}\b"
+    rf"|^(?:(?:please|pls|plz|kindly|ok|okay|so|sir)[\s,]+)*(?:show|repeat|read|recap|summari[sz]e|explain) "
+    rf"(?:the|this|that) {_CASE_NOUN}(?: again| once more| please)?[\s?.!]*$"
+    r"|\b(?:can'?t|cannot|can not|unable to|not able to|don'?t|dont|could not|couldn'?t)\s+(?:see|find|view|read|open)\s+"
+    r"(?:the\s+|this\s+)?(?:case|question|brief|prompt|problem|it on my (?:screen|phone|mobile)|anything on (?:my )?(?:screen|phone))\b"
+    rf"|^(?:(?:so|ok|okay|sorry|sir|hi|hello|wait)[\s,]+)*what(?:'s| is| was) (?:the|this|our) {_CASE_NOUN}"
+    r"(?: again| here| exactly| about| we are solving)?[\s?.!]*$"
+    r"|\bwhere(?:'s| is)\s+the\s+(?:case|question|brief|prompt)\b|^brief me\b|\b(?:the )?case again\b")
+
+_HOW_IT_WORKS_RE = re.compile(
+    r"\bhow (?:does |do )?(?:it|this|the (?:interview|case|session|platform|app)|this (?:interview|case|session|platform|app)) works?\b"
+    r"|\bhow (?:do|does|should|can) (?:i|we) (?:use|start|begin|do|play) (?:this|it)\b"
+    r"|\bwhat am i supposed to\b|\bhow to (?:use|start|begin) (?:this|it)\b"
+    r"|\b(?:first time|new to (?:this|cases?|case interviews?|guesstimates?|consulting))\b"
+    r"|\bwhat (?:type|kind|sort|types|kinds) of (?:\w+ )?(?:questions?|clarifications?) (?:should |can |do |shall )?(?:i|we)\b"
+    r"|\b(?:which|what) (?:\w+ )?questions? (?:(?:should|can|do|shall|to) (?:i )?|i (?:should |can )?)ask\b"
+    r"|\bwhat (?:do|should) i (?:do|ask) (?:here|now|first)\b")
+
+_CONCEPT_T = (r"(sanity[- ]?check(?:ing)?|reasonableness|mece|top[- ]?down|bottom[- ]?up|issue[- ]tree|"
+              r"profit[- ]tree|driver[- ]tree|hypothes[ie]s|break[- ]?even|cagr|ebitda|"
+              r"(?:profit |contribution |gross |net |operating )?margin|market share|penetration|"
+              r"synthesis|value chain|unit economics|payback(?: period)?|npv|irr|elasticity|tam|sam|som|"
+              r"market sizing|demand[- ]side|supply[- ]side|run[- ]rate|weighted average|framework)")
+# "what is market share of client?" asks for DATA, not a definition.
+_CONCEPT_RE = re.compile(
+    rf"\bwhat (?:does|do) (?:a |an |the |this |you mean by )?(?:\w+ ){{0,2}}?{_CONCEPT_T} means?\b"
+    rf"|\bwhat (?:is|are|'s) (?:a |an )?{_CONCEPT_T}\b(?!\s+(?:of|for|in|at|with|here|now)\b)(?!\s+\w+\s+(?:is|are|was)\b)"
+    rf"|\b(?:meaning of|what do you mean by|define|definition of) (?:a |an |the )?{_CONCEPT_T}"
+    rf"|\bhow (?:to|do i|do you|should i|can i|would i|do we|does one) (?:do |make |build |run |perform |"
+    rf"calculate |use |apply |draw |write |create |check )?(?:a |an |the |my |this )?{_CONCEPT_T}"
+    rf"|\bexplain (?:me )?(?:a |an |the |what )?{_CONCEPT_T}")
+
+_UNANSWERED_RE = re.compile(
+    r"\b(?:you )?(?:didn'?t|did not|haven'?t|have not|never|not) answer(?:ed)?\b"
+    r"|\banswer (?:my|the|these|those|all) (?:questions?|query|queries)\b"
+    r"|\b(?:could|can|will|would) (?:you|u) (?:please )?answer\b|\byou (?:ignored|skipped|missed) my\b"
+    r"|\bmy question was\b")
+
+# Wanting to leave the SESSION - anchored to the speaker or the session. Not "the rural
+# market is not ready", "consumers are not prepared to pay", "customers give up on the
+# brand", "stop the practice of 60-day credit", "Bye-laws aside".
+_EXIT_RE = re.compile(
+    r"\b(?:exit|exist|end|stop|quit|leave|close) (?:the |this |my )?(?:interview|session|chat|practice session)\b"
+    r"|\bi (?:want|wanna|would like|need|have) to (?:exit|exist|quit)\b"
+    r"|\bi (?:want|wanna|would like|need|have) to (?:stop|leave)(?: now| here| this| for (?:today|now)| the (?:interview|session|case))?(?=\s*(?:[.!?,]|$|i am|i'm))"
+    r"|\bi(?:'m| am)(?: really| just)? not (?:prepared|ready)\b|\bi give up(?: (?:now|here|on this(?: case)?))?(?=\s*(?:[.!?,]|$))"
+    r"|\bi quit\b|\bi(?:'m| am) done for (?:today|now)\b"
+    r"|^(?:ok(?:ay)?[\s,]+)?bye(?:[\s.!]|$)|^(?:ok(?:ay)?[\s,]+)?good ?bye\b")
+
+# A final answer: the phrase AND a figure right after it ("my final estimate is about 9
+# lakh"), or a short "this is my final answer" when the figure came in earlier turns.
+_FINAL_RE = re.compile(
+    r"\bfinal (?:answer|estimate|number|figure|value|output|result|count|total)\b(?! of (?:households|people|population|users|the population))"
+    r"|\bmy (?:answer|estimate) (?:is|would be|comes(?: to)?)(?: therefore| then| now)? (?:about |around |roughly |approx\w* |~|nearly )?(?=\d|rs|₹|\$)"
+    r"|\bi (?:would )?estimate (?:it|this|that) (?:to be|to|at|as|is|around|about|roughly|approx\w*)\b"
+    r"|\bi (?:would )?estimate the (?:total|answer|number|market|count)\b"
+    r"|\bthat'?s my (?:answer|number|estimate|final)\b|\bthis is my (?:answer|final)\b"
+    r"|\bi(?:'ve| have)? arrived at\b"
+    r"|\b(?:so )?the (?:answer|estimate) (?:is|would be|comes to) (?:about |around |roughly |approx\w* |~|nearly )?(?=\d|rs|₹|\$)")
+_FINAL_SHORT_RE = re.compile(
+    r"\b(?:this|that)(?:'s| is) my (?:final(?: answer| estimate)?|answer)\b|^final answer\b|\bthat'?s my final\b|"
+    r"\bi'?m done with (?:my )?(?:estimate|answer)\b")
+_FINAL_ASK_RE = re.compile(r"\bfinal (?:answer|estimate|number|figure|value)\b|\bconfirm your final\b|\block (?:it|that) in\b")
+
+# About the SESSION, not the case: "are we done?", "did I pass?", "how close am I?",
+# "share the feedback". Not "any feedback from customers?", "the actual number of
+# outlets", "is it over 50% of the market?", "we are done with households".
+_STATUS_RE = re.compile(
+    r"\b(?:are we|am i|is it|is this|is the (?:case|interview|session)|are we all)(?: all)? "
+    r"(?:done|finished|over|complete|completed)(?: here| now| yet| for today| with (?:the|this) (?:case|interview|session))?(?=\s*(?:[?.!,]|$|did|right|na))"
+    r"|\bdid i (?:pass|solve(?: (?:it|the (?:case|problem)))?|crack(?: it| the case)?|do (?:it|well|good|ok|okay))(?=\s*(?:[?.!,]|$))"
+    r"|\bhow (?:did i do|close (?:am i|i am|was i|is (?:my|it))|was (?:i|my (?:answer|estimate|performance)))\b"
+    r"|\bhow (?:accurate|good) (?:am i|is (?:my answer|my estimate|this answer))\b"
+    r"|\b(?:share|give|any|your|some) (?:the |some |me |overall |my )?feedback(?: (?:please|pls|for me|on (?:my|this)))?(?=\s*(?:[?.!,]|$|and|for (?:overall|my|the overall)))"
+    r"|\bfeedback (?:for|on) (?:overall|my|the overall)\b"
+    r"|\bactual (?:value|answer)\b|\bwhat(?:'s| is) the (?:actual|real|right|correct) (?:answer|value)\b"
+    r"|\bwhat(?:'s| is) my score\b|\bhow (?:much|many) (?:marks|points) (?:do|did|will) i\b")
+_CORRECT_Q_RE = re.compile(
+    r"\bam i (?:right|correct|close)\b|\bis (?:that|this|it|my (?:answer|calculation|math)) (?:right|correct)\b"
+    r"|\bhope (?:that|it|this) is (?:right|correct)\b|\bdid i get (?:it|that) right\b")
+
+# Asking to be TAUGHT - the candidate, about how to proceed. Not "we don't know what
+# competitors charge, so I'll assume Rs 40k".
+_TEACH_RE = re.compile(
+    r"\bteach me\b|\bwalk me through\b|\bshow me how\b|\bexplain (?:to me )?how\b|\bhelp me understand\b"
+    r"|\bhow (?:do|should|can|would) i (?:approach|structure|solve|start|begin|tackle|break|frame)\b"
+    r"|\bhow to (?:approach|structure|solve|start|begin|tackle|break|frame)\b(?! (?:the|this) (?:market|customer|client))"
+    r"|\bi (?:really |still |honestly |just )?(?:do ?n[o']?t|don'?t|dont) (?:know|understand) "
+    r"(?:how|what (?:to|i|and|should)|where (?:to|i)|what is going on)\b|\bno idea how\b"
+    r"|\bi'?m new\b|\bi am new\b|\bnever done (?:this|a case|one)\b"
+    r"|\bi (?:still )?(?:do ?n[o']?t|don'?t|dont) get (?:it|this)\b|\bstill (?:confused|lost)\b"
+    r"|\b(?:u|you) tell me (?:the questions?|how|what (?:to do|should i|do i|i should))\b"
+    r"|\bactually (?:u|you) tell me\b")
+_STUCK_BLANK_RE = re.compile(
+    r"^(?:(?:so|but|and|hmm+|umm+|um|uh|sir|bro|actually)[\s,]+)*(?:i\s+)?(?:really\s+|honestly\s+)?"
+    r"(?:do ?n[o']?t|don'?t|dont) (?:know|get it|understand)(?: (?:actually|anything|at all|sir|yet|really|"
+    r"what to do|how))?[\s.!]*$"
+    r"|^(?:no idea|idk|clueless(?: here)?|nothing(?: i (?:do ?n[o']?t|don'?t|dont) know)?|no clue|"
+    r"i'?m (?:blank|lost|stuck)|i am (?:blank|lost|stuck)|blank|not sure|nope|i have no idea)[\s.!]*$")
+_COURTESY_WORDS = {"thank", "thanks", "thankyou", "you", "so", "much", "ty", "ok", "okay", "great", "cool",
+                   "sure", "alright", "bye", "sir", "maam", "nice", "very", "a", "lot", "again", "for", "help"}
+_CLOSING_LINE_RE = re.compile(
+    r"\bthank you for (?:sharing|walking|working|your|the)\b|\bthat'?s the end of the case\b|\bresults page\b|"
+    r"\btap submit\b|\ball the best\b|\bgood luck\b|\btake care\b|\bwe'?re done\b|\bend of the case\b")
+_NEXT_STEP_RE = re.compile(
+    r"^(?:ok(?:ay)?[\s,.]+)?(?:so[\s,.]+)?(?:next|what next|what'?s next|whats next|next step|next what|then what|"
+    r"now what|what now|what do (?:i|we) do next|what (?:should|do) i do next|"
+    r"what do you want(?: me to do)? next|next what do you want)[\s?.!]*$")
+
+
+def _strip_q_fillers(norm: str) -> str:
+    return _Q_FILLERS.sub("", norm or "")
+
+
+def asks_interviewer(text: str) -> Dict[str, bool]:
+    """Is this turn a question or request aimed at the interviewer?
+
+    tag_question: the only '?' tags the candidate's own work ("... Right?").
+    A question to the interviewer must never get a canned "Okay." (V12.1)."""
+    norm = _norm(text)
+    wc = len(norm.split())
+    if not norm or is_go_ahead(text):
+        return {"asks": False, "tag": False}
+    q = norm.count("?")
+    if q:
+        if q == 1 and wc >= 6 and _TAG_Q_RE.search(norm):
+            return {"asks": False, "tag": True}
+        if q == 1 and wc >= 8 and _has_any(norm, _PROCEED_ASKS) and not _REQUEST_RE.search(norm):
+            return {"asks": False, "tag": False}
+        return {"asks": True, "tag": False}
+    stripped = _strip_q_fillers(norm)
+    fw = stripped.split(" ", 1)[0] if stripped else ""
+    if fw in _Q_STARTERS and wc <= 25 and not _STATEMENT_START_RE.match(stripped) and ":" not in stripped[:45]:
+        return {"asks": True, "tag": False}
+    if _REQUEST_RE.search(norm) and not _NOT_A_REQUEST_RE.search(norm):
+        return {"asks": True, "tag": False}
+    if wc <= 30 and _EMBEDDED_Q_RE.search(norm):
+        return {"asks": True, "tag": False}
+    if wc <= 6 and not re.search(r"\d", norm) and _DATA_NOUN_RE.search(norm) and (
+            _DATA_ASK_LEAD_RE.match(norm) or re.search(r"\b(?:please|pls|plz)[.!]*$", norm) or wc <= 3):
+        return {"asks": True, "tag": False}  # "And the margins", "number of SKUs", "cost breakdown please"
+    return {"asks": False, "tag": False}
+
+
+def _is_idea_turn(norm: str) -> bool:
+    """A free-standing idea, not a structure, a calculation or a question."""
+    if not norm or "?" in norm or re.search(r"\d", norm):
+        return False
+    if len(norm.split()) < 10:
+        return False
+    if _has_any(norm, _STRUCTURE_WORDS) or sum(1 for w in _SEQUENCE_WORDS if w in norm) >= 2:
+        return False
+    if re.search(r"\b(ask|question|clarif\w*|english|hindi|language|repeat)\b", norm):
+        return False
+    fw = _strip_q_fillers(norm).split(" ", 1)[0]
+    return fw not in _Q_STARTERS
+
+
+def _structured(norm: str) -> bool:
+    return (_has_any(norm, _STRUCTURE_WORDS) or sum(1 for w in _SEQUENCE_WORDS if w in norm) >= 2
+            or bool(re.search(r"(?:^|\n)\s*(?:1[.)]|-|•)", norm)) or "=" in norm)
+
 
 _NUM_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:%|percent|crore|lakh|million|billion|k\b)?", re.I)
 
@@ -322,6 +558,24 @@ def is_go_ahead(text: str) -> bool:
     return bool(t) and "?" not in t and len(t.split()) <= 6 and bool(_GO_AHEAD_RE.match(t))
 
 
+# "help" only as a REQUEST: "Can you help me here?", "help na ...", "need some help".
+# Not "it would be really helpful" or "both metrics will help me make a decision".
+_HELP_WORD_RE = re.compile(
+    r"^(?:pls |please |plz |sir |bro )?help\b|\b(?:can|could|would|will) (?:you|u) (?:please |pls )?help\b"
+    r"|\b(?:pls|please|plz) help\b"
+    r"|\bneed (?:some |a little |a bit of |your |more )?help\b|\b(?:some|any|little) help\b|\bhelp (?:na|pls|please|plz)\b"
+    r"|\bhelp me(?: out| here| with this| please)?[\s.!?]*$|\bhelp me (?:with|out|here|please|pls|start|understand|structure|solve)\b")
+
+
+def _help_hit(t: str) -> bool:
+    """_HELP phrases, with 'help' itself counted only as a request (V12.1)."""
+    if _HELP_WORD_RE.search(t):
+        return True
+    if len(t.split()) <= 4 and re.search(r"\bhelp\b", t):
+        return True
+    return any(n in t for n in _HELP if n != "help")
+
+
 def detect_intent(text: str) -> Dict[str, Any]:
     t = _norm(text)
     
@@ -333,9 +587,9 @@ def detect_intent(text: str) -> Dict[str, Any]:
     is_sol = _has_any(t, _SOLUTION) or t in _EXACT_SOLUTION
     
     flags = {
-        "help_requested": _has_any(t, _HELP),
+        "help_requested": _help_hit(t),
         "solution_requested": is_sol,
-        "skip_or_stop": _has_any(t, _SKIP_STOP),
+        "skip_or_stop": bool(_SKIP_STOP_RE.search(t)),
         "frustration": _has_any(t, _FRUSTRATION),
         "is_meta": _has_any(t, _META),
         "looks_garbage": _looks_garbage(text),
@@ -473,16 +727,27 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     
     asks_owned_fact = (intent["intent"] == "clarification") and _has_any(new_norm, _OWNED_FACT) and not intent["help_requested"]
 
+    # V12.1: a first message that is already work ("total population: 1.2 crore ...
+    # total: 7 lakh building") is answered as work, not with a case kick-off.
+    _figs = re.findall(r"\d[\d,.]*\s*(?:%|percent|lakh|lac|crore|cr\b|million|billion|mn\b|bn\b|k\b|m\b|b\b)", new_norm)
+    first_turn_is_work = len(cand) == 0 and (
+        bool(_figs) or len(re.findall(r"\d+", new_norm)) >= 3 or "=" in new_norm
+        or shape["is_substantive_reasoning"])
     is_session_open = (
         # V12: a bare "okay"/"so" mid-case is not a greeting that re-opens the case.
         (intent["intent"] == "greeting" and len(cand) == 0)
-        or (len(asst) == 0 and len(cand) == 0)
+        or (len(asst) == 0 and len(cand) == 0 and not first_turn_is_work)
         or (len(cand) == 0 and len(new_norm) <= 24 and _has_any(new_norm, _KICKOFF)
             and not intent["solution_requested"]
             and not intent["help_requested"]))
     is_final_recommendation = _has_any(new_norm, _RECOMMEND)
-    is_post_close = _has_any(new_norm, _POST_CLOSE)
-    wants_to_end = _has_any(new_norm, _END_SESSION) and not wants_to_advance
+    # V12.1: "Do we have any feedback from customers?", "the client wants to quit the
+    # market", "customers give up on the brand", "i am done with structuring" are case
+    # talk, not the candidate ending the session.
+    is_post_close = (_has_any(new_norm, _POST_CLOSE)
+                     and (len(new_norm.split()) <= 8 or bool(_STATUS_RE.search(new_norm)))
+                     and not re.search(r"\bfeedback (?:from|of|by) (?!you\b)", new_norm))
+    wants_to_end = bool(_END_RE.search(new_norm)) and not wants_to_advance
     is_session_close = ((is_final_recommendation or is_post_close or wants_to_end)
                         and not is_session_open)
 
@@ -496,6 +761,59 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     hedged_self_estimate = has_number and _has_any(new_norm, _HEDGE)
     just_recovered = _has_any(new_norm, _RECOVERY) and len(asst) >= 1
     error_materiality = _error_materiality(new_norm)
+
+    # --- V12.1: what the candidate is asking for (see the detectors above) ---
+    ask = asks_interviewer(new_user_message)
+    wc_now = len(new_norm.split())
+    prior_user_text = [t for t in cand]
+    work_so_far = any(re.search(r"\d", c) or _structured(c) for c in prior_user_text)
+    stuck_blank = bool(_STUCK_BLANK_RE.search(new_norm)) and wc_now <= 10
+    wants_teaching = bool(_TEACH_RE.search(new_norm))
+    if stuck_blank:
+        intent["help_requested"] = True
+    last_asst = asst[-1] if asst else ""
+    _fm = _FINAL_RE.search(new_norm)
+    _asks_for_it = bool(intent["solution_requested"]
+                        or re.search(r"\b(?:tell|give|show|share) me\b|\bwhat(?:'s| is) the final\b", new_norm))
+    final_declared = bool(
+        not _asks_for_it and (
+            (_fm and re.search(r"\d", new_norm[_fm.end():_fm.end() + 60]))
+            or (_fm and has_number and len(new_norm.rstrip(" .!")) - _fm.end() <= 2)  # "... 552 cr, final answer"
+            or (_FINAL_SHORT_RE.search(new_norm) and wc_now <= 14 and any(re.search(r"\d", c) for c in cand[-3:]))))
+    if (not final_declared and _FINAL_ASK_RE.search(last_asst) and wc_now <= 6
+            and (has_number or re.match(r"^(yes|yeah|yep|yup|haan|han|ji|correct|confirm|confirmed|sure|right|"
+                                        r"ok|okay)\b", new_norm))):
+        final_declared = any(re.search(r"\d", c) for c in cand[-3:]) or has_number
+    rf = [f for f in recent_functions if f]
+    final_given_earlier = (any(_FINAL_RE.search(c) and re.search(r"\d", c) for c in cand)
+                           or bool(_CLOSING_LINE_RE.search(last_asst))
+                           or any(f in ("FINAL_REVIEW", "CLOSE", "SESSION_STATUS") for f in rf)
+                           or any(_has_any(c, _RECOMMEND) for c in cand))
+    words_now = re.findall(r"[a-z']+", new_norm)
+    courtesy_only = bool(words_now) and all(w in _COURTESY_WORDS for w in words_now) and any(
+        w in ("thank", "thanks", "thankyou", "ty", "bye") for w in words_now)
+    asks_owned_fact_any = ask["asks"] and _has_any(new_norm, _OWNED_FACT_WIDE)
+    # free ideas with no structure yet (passive "interesting perspective" sessions)
+    streak = 0
+    for c in reversed(cand + [new_norm]):
+        if _is_idea_turn(c):
+            streak += 1
+        elif "?" in c or len(c.split()) < 6:
+            continue
+        else:
+            break
+    # consecutive help / stuck turns, each read on ITS OWN text (turns_without_progress
+    # reads every earlier turn with the current turn's intent, so it is not usable here)
+    help_streak = 0
+    for c in reversed(cand + [new_norm]):
+        ci = detect_intent(c)
+        if ci["help_requested"] or ci["solution_requested"] or (_STUCK_BLANK_RE.search(c) and len(c.split()) <= 10):
+            help_streak += 1
+        else:
+            break
+    unanswered = [re.sub(r"\s+", " ", (t.get("content") or "")).strip()[:160]
+                  for t in transcript[-8:]
+                  if (t.get("role") or "user") == "user" and asks_interviewer(t.get("content") or "")["asks"]][-2:]
 
     return {
         "intent": intent["intent"],
@@ -533,11 +851,37 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "why_this_question": why_this_question,
         "asks_owned_fact": asks_owned_fact,
         "confident_unsupported_claim": confident_unsupported_claim,
-        "states_final_estimate": states_final_estimate,
+        "states_final_estimate": final_declared,  # V12.1: one definition of a final answer
         "hedged_self_estimate": hedged_self_estimate,
         "just_recovered": just_recovered,
         "error_materiality": error_materiality,
         "new_message_norm": new_norm,
+        # V12.1: requests that must get a real answer, never a canned beat
+        "asks_interviewer": ask["asks"],
+        "tag_question_only": ask["tag"],
+        "wants_case_restate": bool(_RESTATE_RE.search(new_norm)),
+        "asks_how_it_works": bool(_HOW_IT_WORKS_RE.search(new_norm)),
+        "early_in_case": len(cand) <= 2 or not work_so_far,
+        "concept_asked": (_CONCEPT_RE.search(new_norm).group(0) if _CONCEPT_RE.search(new_norm) else None),
+        "complains_unanswered": bool(_UNANSWERED_RE.search(new_norm)),
+        "unanswered_questions": unanswered,
+        "wants_to_exit": bool(_EXIT_RE.search(new_norm)),
+        "final_declared": final_declared,
+        "final_given_earlier": final_given_earlier,
+        "case_finished": final_given_earlier,
+        "answers_interviewer_number": bool(last_assistant_asked and has_number and wc_now <= 6),
+        "asks_session_status": bool(_STATUS_RE.search(new_norm)),
+        "asks_if_correct": bool(_CORRECT_Q_RE.search(new_norm)),
+        "wants_teaching": wants_teaching,
+        "stuck_blank": stuck_blank,
+        "courtesy_only": courtesy_only,
+        "wants_next_step": bool(_NEXT_STEP_RE.search(new_norm)),
+        "asks_owned_fact_any": bool(asks_owned_fact_any and not intent["solution_requested"]),
+        "is_final_recommendation": is_final_recommendation,
+        "idea_streak": streak,
+        "help_streak": help_streak,
+        "structured_ever": any(_structured(c) for c in cand + [new_norm]),
+        "work_so_far": work_so_far,
         # V12 turn shape + conversation memory (read by interviewer_decision)
         "turn_type": shape["turn_type"],
         "word_count": shape["word_count"],

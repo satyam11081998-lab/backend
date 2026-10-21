@@ -76,7 +76,9 @@ CASE = "Spice Express sales fell 12% YoY.\n- 240 outlets\n- AOV Rs 420"
 # V11 routes most turns to a DETERMINISTIC lane that builds no prompt at all. Only a
 # turn whose render is "model" exercises the variant, so the suite uses one.
 MODEL_TURN = "help na i'm not getting this at all"
-FAST_LANE_TURN = "so the annual number is 50 lakh"
+# V12.1: in chat a turn with a number in it is answered in its own terms (model-worded),
+# so the fast lane is exercised with a mid-thought turn instead.
+FAST_LANE_TURN = "hold on, let me think..."
 
 
 @pytest.fixture()
@@ -213,20 +215,23 @@ def test_the_two_arms_receive_different_system_prompts(arena):
 
 def test_violations_are_reported_for_an_offending_reply(arena, monkeypatch):
     from services import interview_engine as eng
-    bad = "Great job, perfect! That isn't specified in the prompt. What's the population? And how many per household?"
+    bad = ("Great job, perfect! That isn't specified in the prompt. Start with volume. Then price. Then mix. "
+           "Then outlets. Then AOV. Then margin. What's the population? And how many per household?")
     client = _FakeClient(bad, [])
     monkeypatch.setattr(eng, "_resolve_adaptive_llm", lambda: (client, "gpt-4o-mini", "openai"))
     monkeypatch.setattr(arena, "openai_client", lambda: client)
     out = _run(arena)
     # MODEL_TURN routes to a no-question function, where production ALSO runs the
     # sanitiser (enforce_mode) -- so here the gush is legitimately gone from the
-    # shipped text. On question-allowed turns production does not sanitise; that
-    # case is pinned in tests/test_arena_parity.py.
-    assert "banned_isnt_specified" in out["violations"]
+    # shipped text. V12.1: production also regenerates a "not specified" refusal once
+    # and then drops the refusing sentence, so it never ships either.
     assert "Great job" not in out["reply"], "the sanitiser should have removed the gush"
-    # The gush and the double question survive in the raw model text, which is why
-    # the arena shows both.
+    assert "isn't specified" not in out["reply"], "a refusal must not ship"
+    assert "too_long" in out["violations"], "violations are still reported for what ships"
+    # The gush, the refusal and the double question survive in the raw model text,
+    # which is why the arena shows both.
     assert "Great job" in out["raw_reply"]
+    assert "isn't specified" in out["raw_reply"]
     assert out["raw_reply"].count("?") >= 2
 
 

@@ -145,16 +145,74 @@ def assess_context_with_llm(transcript: list, new_message: str, case_content: st
 
 # --- INTERVENTION GATE (V10 TWO-GATE SYSTEM) --------------------------------
 
+def _wants_teaching(signals: Dict[str, Any]) -> bool:
+    """Teach the step (name the approach, show the skeleton, do step one) rather
+    than drop one more hint: explicit "teach me / walk me through", a blank "i dont
+    know", repeated stuckness, high frustration, a weak learner, or a help request
+    before any work is on the table."""
+    if signals.get("wants_teaching") or signals.get("stuck_blank"):
+        return True
+    if re.search(r"\bhints?\b", signals.get("new_message_norm") or ""):
+        return False  # they asked for a hint: the hint ladder escalates it
+    return bool(signals.get("help_streak", 0) >= 2
+                or signals.get("frustration_explicit")
+                or signals.get("learner_level") == "weak"
+                or (signals.get("help_requested") and not signals.get("work_so_far")))
+
+
+def _evaluate_v121_requests(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """V12.1 (15-day review): every one of these got a canned "Okay." / "Sure,
+    continue." / "Let's move on to the next phase." in real sessions. Each now has
+    its own function, ahead of the generic routes."""
+    finished = signals.get("case_finished")
+    if signals.get("wants_to_exit"):
+        if finished or signals.get("is_final_recommendation"):
+            return True, "CLOSE", "session_end"
+        return True, "WRAP_UP_EARLY", "wants_to_exit"
+    if signals.get("courtesy_only") and finished:
+        return True, "CLOSE", "courtesy_after_close"
+    if signals.get("asks_session_status"):
+        return True, "SESSION_STATUS", "session_status"
+    if signals.get("wants_case_restate"):
+        return True, "RESTATE_CASE", "case_restate"
+    if signals.get("asks_how_it_works") and signals.get("early_in_case"):
+        return True, "EXPLAIN_FORMAT", "how_it_works"
+    if signals.get("complains_unanswered"):
+        return True, "ANSWER_DIRECT", "unanswered_questions"
+    if signals.get("math_issue"):
+        return True, "CORRECT_MATERIAL", "math_check"
+    if signals.get("final_declared"):
+        return True, "FINAL_REVIEW", "final_answer"
+    if signals.get("concept_asked"):
+        return True, "EXPLAIN_CONCEPT", "concept_question"
+    if signals.get("wants_next_step"):
+        return True, "TRANSITION", "next_step"
+    return False, "", ""
+
+
 def _evaluate_substantive_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]:
-    if signals.get("is_session_open"): return True, "OPEN", "session_start"
+    if signals.get("is_session_open"):
+        if signals.get("asks_how_it_works"):
+            return True, "EXPLAIN_FORMAT", "how_it_works"  # "How it work" as the very first message
+        if signals.get("wants_teaching") or signals.get("stuck_blank"):
+            return True, "TEACH", "teach_from_the_start"   # "teach me" / "i dont know" before anything
+        return True, "OPEN", "session_start"
+    hit, mode, reason = _evaluate_v121_requests(signals)
+    if hit:
+        return True, mode, reason
     if signals.get("is_session_close"): return True, "CLOSE", "session_end"
     if signals.get("wants_to_advance") or signals.get("intent") == "wants_to_stop":
         return True, "TRANSITION", "candidate_transition"
         
     if signals.get("solution_requested") or signals.get("intent") == "asking_for_solution":
         return True, "DELIVER_SOLUTION", "solution_requested"
-    if signals.get("help_requested") or signals.get("intent") == "asking_for_help":
+    if (signals.get("help_requested") or signals.get("intent") == "asking_for_help"
+            or signals.get("wants_teaching") or signals.get("asks_how_it_works")):
+        if _wants_teaching(signals) or signals.get("asks_how_it_works"):
+            return True, "TEACH", "teach_step"
         return True, "HINT", "help_requested"
+    if signals.get("needs_structure"):
+        return True, "TEACH", "structure_coaching"
     if signals.get("looks_garbage"): return True, "NOISE", "noise"
     if signals.get("is_meta") or signals.get("intent") == "meta": return True, "DEFLECT_META", "meta"
 
@@ -165,9 +223,17 @@ def _evaluate_substantive_gate(signals: Dict[str, Any]) -> Tuple[bool, str, str]
     if signals.get("frustration_explicit") or signals.get("progress") in ["stuck", "repeatedly_stuck"]:
         return True, "REPAIR", "frustration_or_stuck"
 
-    if signals.get("why_this_question") or signals.get("product_ux_question") or signals.get("intent") == "clarification":
+    # V12.1: "clarification" from a stray directive word ("...how they are able to PROVIDE
+    # such costs...") is not a question; only a turn that asks the interviewer something is.
+    clarifies = ((signals.get("intent") == "clarification"
+                  and (signals.get("asks_interviewer", True) or signals.get("asks_to_proceed")))
+                 # a question the intent read missed ("competitors ka market share kitna hai",
+                 # "I would like to know the number of stores", "And the margins")
+                 or (signals.get("asks_interviewer") and not signals.get("tag_question_only")
+                     and signals.get("intent") in ("answering", "hypothesis", "greeting")))
+    if signals.get("why_this_question") or signals.get("product_ux_question") or clarifies:
         return True, "ANSWER_DIRECT", "clarification"
-    if signals.get("asks_owned_fact") or signals.get("is_scope_question"):
+    if (signals.get("asks_owned_fact") or signals.get("is_scope_question")) and signals.get("asks_interviewer", True):
         return True, "DATA_REVEAL", "fact_requested"
 
     if signals.get("intent") == "hypothesis":
@@ -248,6 +314,9 @@ RESPONSE_FUNCTIONS = (
     "TARGETED_QUESTION", "SANITY_CHECK", "MICRO_HINT", "CORRECT_AND_CONTINUE",
     "REPAIR_AND_RESET", "ANSWER_DIRECT", "DATA_REVEAL", "DELIVER_SOLUTION",
     "TRANSITION", "OPEN", "CLOSE", "DEFLECT_META", "NOISE", "CONTINUE_AS_AGREED",
+    # V12.1
+    "RESTATE_CASE", "EXPLAIN_FORMAT", "EXPLAIN_CONCEPT", "TEACH_STEP", "WRAP_UP_EARLY",
+    "FINAL_REVIEW", "SESSION_STATUS", "FOLLOW_UP_ANSWER",
 )
 FAST_FUNCTIONS = frozenset({"SHORT_ACK", "HAND_BACK"})
 CONTEXTUAL_PRESENCE = frozenset({
@@ -270,6 +339,15 @@ _SUBSTANTIVE_FUNCTION = {
     "ANSWER_DIRECT": "ANSWER_DIRECT",
     "DATA_REVEAL": "DATA_REVEAL",
     "PROBE": "TARGETED_QUESTION",
+    # V12.1
+    "RESTATE_CASE": "RESTATE_CASE",
+    "EXPLAIN_FORMAT": "EXPLAIN_FORMAT",
+    "EXPLAIN_CONCEPT": "EXPLAIN_CONCEPT",
+    "TEACH": "TEACH_STEP",
+    "WRAP_UP_EARLY": "WRAP_UP_EARLY",
+    "FINAL_REVIEW": "FINAL_REVIEW",
+    "SESSION_STATUS": "SESSION_STATUS",
+    "FOLLOW_UP": "FOLLOW_UP_ANSWER",
 }
 
 _CONTEXTUAL_BY_TURN = {
@@ -321,8 +399,44 @@ def contextual_presence_enabled() -> bool:
     return os.getenv("INTERVIEWER_CONTEXTUAL_PRESENCE", "on").strip().lower() not in ("off", "0", "false", "no")
 
 
+def _fast_ok_in_text(sig: Dict[str, Any]) -> bool:
+    """In chat, a fixed word ("Okay.", "Go ahead.") is right only when the turn
+    itself carried nothing to answer."""
+    norm = sig.get("new_message_norm") or ""
+    if sig.get("is_affirmation_only") or sig.get("courtesy_only"):
+        return True
+    if sig.get("candidate_mid_thought") or sig.get("wants_space"):
+        return True
+    if sig.get("intent") == "greeting":
+        return True
+    return _announces_own_work(norm) and not re.search(r"\d", norm)
+
+
+def _never_canned(d: Dict[str, Any], sig: Dict[str, Any]) -> Dict[str, Any]:
+    """V12.1 invariant (15-day review): a question or request to the interviewer is
+    always answered by the model, never by the fixed-phrase lane or a presence beat
+    that strips every question; and in chat, a short answer to the interviewer's own
+    question, or any turn with content, is responded to in its own terms."""
+    fn = d["function"]
+    if d["render"] == "silent":
+        return d
+    asks = sig.get("asks_interviewer") and not sig.get("tag_question_only")
+    if fn in FAST_FUNCTIONS or fn in CONTEXTUAL_PRESENCE:
+        if asks and not (fn in CONTEXTUAL_PRESENCE and d["reason"] == "floor_yield_after_work"):
+            return _decision("SUBSTANTIVE", "ANSWER_DIRECT", "ANSWER_DIRECT", d["reason"] + "|question_answered")
+    if sig.get("channel", "text") == "text" and contextual_presence_enabled():
+        if fn in FAST_FUNCTIONS and not _fast_ok_in_text(sig):
+            if sig.get("last_assistant_asked"):
+                return _decision("SUBSTANTIVE", "FOLLOW_UP", "FOLLOW_UP_ANSWER", d["reason"] + "|answer_to_question")
+            return _decision("PRESENCE", d["mode"], "ACKNOWLEDGE_AND_CONTINUE", d["reason"] + "|not_canned")
+        if (fn in CONTEXTUAL_PRESENCE and sig.get("last_assistant_asked")
+                and (sig.get("word_count") or 0) < 12 and not sig.get("is_affirmation_only")):
+            return _decision("SUBSTANTIVE", "FOLLOW_UP", "FOLLOW_UP_ANSWER", d["reason"] + "|answer_to_question")
+    return d
+
+
 def decide_response(signals: Dict[str, Any]) -> Dict[str, Any]:
-    d = _decide_response(signals)
+    d = _never_canned(_decide_response(signals), signals or {})
     if d["function"] in CONTEXTUAL_PRESENCE and not contextual_presence_enabled():
         fn = "HAND_BACK" if d["function"] == "VALIDATE_AND_HAND_BACK" else "SHORT_ACK"
         return _decision(d["lane"], d["mode"], fn, d["reason"] + "|contextual_off")
@@ -410,12 +524,26 @@ _OBJECTIVE = {
     "DEFLECT_META": "stay in role and return to the case",
     "NOISE": "ask the candidate to restate a garbled turn",
     "CONTINUE_AS_AGREED": "the candidate agreed to what you just proposed or asked: carry on with exactly that",
+    "RESTATE_CASE": "give the case back to a candidate who cannot see it, then say where to start",
+    "EXPLAIN_FORMAT": "explain how this interview works and what to do first",
+    "EXPLAIN_CONCEPT": "explain the concept they asked about and show it on their own case",
+    "TEACH_STEP": "teach the next step: name the approach, show the skeleton, do the first step with them",
+    "WRAP_UP_EARLY": "let a candidate who wants to stop leave without pressure, and show the way back in",
+    "FINAL_REVIEW": "close on their final answer: sanity-check it, one strength, one improvement, point to Submit",
+    "SESSION_STATUS": "tell them honestly where they stand and what is left; point to Submit for the score",
+    "FOLLOW_UP_ANSWER": "react to the short answer they just gave to your question, then the next step",
 }
-_STRONG = {"MICRO_HINT", "CORRECT_AND_CONTINUE", "REPAIR_AND_RESET", "DELIVER_SOLUTION"}
+_STRONG = {"MICRO_HINT", "CORRECT_AND_CONTINUE", "REPAIR_AND_RESET", "DELIVER_SOLUTION",
+           "TEACH_STEP", "EXPLAIN_CONCEPT"}
 _MODERATE = {"TARGETED_QUESTION", "SANITY_CHECK", "ANSWER_DIRECT", "DATA_REVEAL",
-             "TRANSITION", "OPEN", "CLOSE", "DEFLECT_META", "NOISE"}
+             "TRANSITION", "OPEN", "CLOSE", "DEFLECT_META", "NOISE", "RESTATE_CASE",
+             "EXPLAIN_FORMAT", "WRAP_UP_EARLY", "FINAL_REVIEW", "SESSION_STATUS", "FOLLOW_UP_ANSWER"}
 _NEW_FACTS_OK = {"ANSWER_DIRECT", "DATA_REVEAL", "OPEN", "DELIVER_SOLUTION", "MICRO_HINT",
-                 "REPAIR_AND_RESET", "CORRECT_AND_CONTINUE"}
+                 "REPAIR_AND_RESET", "CORRECT_AND_CONTINUE", "TEACH_STEP", "EXPLAIN_CONCEPT",
+                 "EXPLAIN_FORMAT", "FOLLOW_UP_ANSWER", "SESSION_STATUS"}
+# Functions that may lay a structure out on separate short lines (text channel only).
+VISUAL_FUNCTIONS = frozenset({"TEACH_STEP", "EXPLAIN_FORMAT", "EXPLAIN_CONCEPT", "DELIVER_SOLUTION",
+                              "RESTATE_CASE"})
 
 
 def _intervention_level(fn: str) -> str:
@@ -469,6 +597,49 @@ def _gist(text: str, limit: int = 180) -> str:
     return first
 
 
+_SENTENCES_TEXT = {"TEACH_STEP": 6, "EXPLAIN_FORMAT": 5, "EXPLAIN_CONCEPT": 4, "RESTATE_CASE": 5,
+                   "FINAL_REVIEW": 4, "SESSION_STATUS": 4, "WRAP_UP_EARLY": 3, "DELIVER_SOLUTION": 5,
+                   "ANSWER_DIRECT": 3, "FOLLOW_UP_ANSWER": 3}
+_SENTENCES_VOICE = {"TEACH_STEP": 3, "EXPLAIN_FORMAT": 3, "EXPLAIN_CONCEPT": 2, "RESTATE_CASE": 3,
+                    "FINAL_REVIEW": 2, "SESSION_STATUS": 2, "WRAP_UP_EARLY": 2, "DELIVER_SOLUTION": 2}
+
+
+def _sentence_target(fn: str, voice: bool, contextual: bool) -> int:
+    if voice:
+        return _SENTENCES_VOICE.get(fn, 1)
+    return _SENTENCES_TEXT.get(fn, 2 if contextual else 3)
+
+
+def _case_context(sig: Dict[str, Any], fn: str) -> Dict[str, Any]:
+    """Facts the turn may lean on, computed in code: never a line to copy."""
+    ctx: Dict[str, Any] = {}
+    facts = list(sig.get("reference_facts") or [])
+    if facts:
+        ctx["reference_facts"] = facts
+    fc = sig.get("final_context") or {}
+    if fn in ("FINAL_REVIEW", "SESSION_STATUS", "EXPLAIN_CONCEPT"):
+        for k in ("final_answer", "earlier_results", "implied_check"):
+            if fc.get(k):
+                ctx[k] = fc[k]
+    if fn in ("FINAL_REVIEW", "SESSION_STATUS") and sig.get("reference_answer"):
+        ctx["reference_answer"] = sig["reference_answer"]
+    if fn == "ANSWER_DIRECT" and sig.get("complains_unanswered") and sig.get("unanswered_questions"):
+        ctx["unanswered_questions"] = list(sig["unanswered_questions"])
+    if sig.get("concept_asked") and fn in ("EXPLAIN_CONCEPT", "TEACH_STEP"):
+        ctx["concept_asked"] = sig["concept_asked"]
+    if fn == "TEACH_STEP":
+        ctx["teach_focus"] = sig.get("teach_focus") or "next_step"
+        if sig.get("candidate_ideas"):
+            ctx["candidate_ideas"] = list(sig["candidate_ideas"])
+    if fn == "WRAP_UP_EARLY" or fn == "SESSION_STATUS" or fn == "FINAL_REVIEW" or fn == "CLOSE":
+        ctx["how_to_finish"] = ("tap Submit (top right of the chat) to end and see the score, feedback and "
+                                "the full worked answer")
+    if fn in ("RESTATE_CASE", "OPEN", "EXPLAIN_FORMAT"):
+        ctx["where_the_case_is"] = ("the brief is on screen; on a phone it sits behind the menu icon "
+                                    "at the top left of the chat")
+    return ctx
+
+
 def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
                                      candidate_text: str = "",
                                      recent_lines: Optional[List[str]] = None,
@@ -508,29 +679,42 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
             "explicit_solution_request": bool(sig.get("solution_requested")),
             "material_error": fn == "CORRECT_AND_CONTINUE",
             "frustration_state": sig.get("frustration", "none"),
+            # V12.1: computed by services/numbers_check (Python did the arithmetic)
+            "arithmetic_check": ("issue" if sig.get("math_issue")
+                                 else "verified" if sig.get("math_verified") else "not_checked"),
+            "detected_issue": (sig.get("math_issue") or {}).get("message"),
+            "verified_steps": list(sig.get("math_verified") or [])[:3],
         },
         "interviewer_decision": {
             "lane": decision.get("lane", ""),
             "intervention_level": _intervention_level(fn),
             "question_allowed": q_ok,
-            "hint_allowed": fn in ("MICRO_HINT", "REPAIR_AND_RESET", "DELIVER_SOLUTION"),
+            "hint_allowed": fn in ("MICRO_HINT", "REPAIR_AND_RESET", "DELIVER_SOLUTION", "TEACH_STEP",
+                                   "EXPLAIN_CONCEPT", "EXPLAIN_FORMAT"),
             "correction_allowed": fn == "CORRECT_AND_CONTINUE",
             "solution_allowed": fn == "DELIVER_SOLUTION",
             "silence_allowed": fn == "NO_OUTPUT",
-            "may_confirm_correctness": False,
+            # True only when Python verified the arithmetic in this turn: the model may
+            # then say the MATHS checks out (never that an assumption is right).
+            "may_confirm_correctness": bool(sig.get("math_verified") and not sig.get("math_issue")),
             "new_case_facts_allowed": fn in _NEW_FACTS_OK,
+            "visual_structure_allowed": fn in VISUAL_FUNCTIONS and not voice,
         },
         "response_generation": {
             "medium": "spoken" if voice else "chat",
             "tone": "calm_human_interviewer",
-            "target_length": "brief" if (contextual or voice) else "short",
-            "target_sentence_count": 1 if voice else (2 if contextual else 3),
+            "target_length": ("brief" if (contextual or voice) else
+                              "a few short lines" if fn in VISUAL_FUNCTIONS else "short"),
+            "target_sentence_count": _sentence_target(fn, voice, contextual),
             "content_specificity": "required" if contextual else "normal",
             "must_reference_candidate_content": contextual,
             "generic_acknowledgement_only": False,
             "do_not_overpraise": True,
-            "do_not_take_over_candidate_reasoning": True,
+            # Teaching turns do ONE step with the candidate; everything else leaves the
+            # reasoning with them.
+            "do_not_take_over_candidate_reasoning": fn not in ("TEACH_STEP", "EXPLAIN_CONCEPT", "DELIVER_SOLUTION"),
         },
+        "case_context": _case_context(sig, fn),
         "conversation_memory": {
             "recent_response_functions": list(sig.get("recent_functions") or []),
             "recent_interviewer_lines": [l for l in (recent_lines or [])][-3:],
@@ -583,7 +767,7 @@ def references_candidate(line: str, candidate_text: str) -> bool:
 
 
 def validate_contextual_line(text: str, candidate_text: str, channel: str = "text",
-                             max_sentences: int = 2) -> Tuple[str, List[str]]:
+                             max_sentences: int = 2, may_confirm: bool = False) -> Tuple[str, List[str]]:
     """Clean a model-worded presence line. Returns (line, problems).
 
     Problems: "leak" (control metadata in the text), "empty", "unreferenced"
@@ -596,7 +780,7 @@ def validate_contextual_line(text: str, candidate_text: str, channel: str = "tex
         return "", ["leak"]
     t = sanitize_reply(t)
     t = strip_solicitations(strip_all_questions(t)).strip()
-    kept = [s for s in _sentences(t, keep_punct=True) if not _CLAIM_RE.search(s)]
+    kept = [s for s in _sentences(t, keep_punct=True) if may_confirm or not _CLAIM_RE.search(s)]
     n = 1 if channel == "voice" else max(1, max_sentences)
     t = " ".join(kept[:n]).strip()
     if not t:
@@ -724,7 +908,25 @@ _BANNED_PHRASES = (
     "not in the prompt", "isn't provided", "not provided", "isn't given", "not given",
     "i can't give you that", "i cannot give you that", "i won't provide", "i wont provide",
     "i cannot provide", "that detail isn't", "information isn't provided",
+    # V12.1 (15-day review): the same refusal in other words
+    "isn't explicitly stated", "not explicitly stated", "isn't stated", "not stated in",
+    "aren't detailed", "not detailed in", "isn't detailed", "don't have specific data",
+    "do not have specific data", "don't have an exhibit", "don't have data", "do not have data",
+    "no exhibit", "i can't provide", "can't provide an exact", "cannot provide an exact",
+    "not available in the case", "the case doesn't specify",
+    "the case does not specify", "isn't mentioned", "not mentioned in the", "you'll need to assume",
+    "you can make reasonable assumptions", "make reasonable assumptions about",
 )
+
+
+def looks_like_refusal(text: str) -> bool:
+    """The interviewer told the candidate the data isn't available (a hard failure:
+    the interviewer owns the facts). A sentence that also GIVES a figure ("The
+    population isn't stated in the brief, so take 2 crore") is answering, not refusing."""
+    for sent in _sentences((text or "").lower().replace("\u2019", "'"), keep_punct=True):
+        if any(p in sent for p in _BANNED_PHRASES) and not re.search(r"\d", sent):
+            return True
+    return False
 _RUBBER_STAMP = (
     "solid structure", "great job", "well done", "impressive", "well-structured",
     "well structured", "comprehensive", "excellent job",
@@ -814,26 +1016,205 @@ _GUSH = (
     "flawless", "masterful", "genius", "incredible", "love it", "really impressive",
     "solid structure", "well structured", "well-structured", "comprehensive",
     "you're on the right track", "youre on the right track", "phenomenal", "stellar",
-    "you nailed", "beautifully done", "top notch", "top-notch",
+    "you nailed", "beautifully done", "top notch", "top-notch", "love that", "love this",
 )
+
+# V12.1: praise-only sentences seen in real sessions ("That's a solid estimate for the
+# annual number of laptops sold in Mumbai." for a 3x-wrong number; "Great start with
+# the population figure."). Removed only when the sentence is short and carries no
+# number, so a sentence with substance is never dropped for its opening word.
+_PRAISE_RE = re.compile(
+    r"\b(great|good|solid|excellent|nice|strong|fantastic|wonderful|impressive|brilliant|thoughtful|"
+    r"clear|smart|perfect|thorough|well[- ]grounded|robust|insightful)\s+(start|starting point|breakdown|"
+    r"approach|estimate|calculation|analysis|job|work|thinking|structure|segmentation|plan|catch|"
+    r"observation|insight|summary|recap|progress|framework|choice|way|attempt|reasoning|logic|set of numbers|"
+    r"first step|step|point|question|idea|thought|perspective|consideration)\b|\byou'?ve done a (?:thorough|great|solid|good|excellent)\b|"
+    r"\bthat'?s (?:a )?(?:great|excellent|fantastic|brilliant) (?:question|point)\b", re.I)
+_DANGLING_RE = re.compile(r"^(?:but|and|however|though|although|yet)[,\s]+", re.I)
+
 
 def _is_gush(sentence: str) -> bool:
     s = sentence.lower().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
-    return any(g in s for g in _GUSH)
+    if any(g in s for g in _GUSH):
+        return True
+    return bool(_PRAISE_RE.search(s)) and len(s.split()) <= 16 and not re.search(r"\d", s)
+
+
+def is_praise_only(text: str) -> bool:
+    """Every sentence is praise (nothing a candidate can use)."""
+    sents = [x for x in _sentences(text or "", keep_punct=True) if x.strip()]
+    return bool(sents) and all(_is_gush(x) and not _PIVOT_RE.search(x) for x in sents)
+
+
+def _capitalize(t: str) -> str:
+    for i, ch in enumerate(t or ""):
+        if ch.isalpha():
+            return t[:i] + ch.upper() + t[i + 1:]
+        if not ch.isspace() and ch not in "\"'(":
+            break
+    return t
+
+
+def _undangle(t: str) -> str:
+    """'but there's a material issue...' after a removed opener -> 'There's a material issue...'.
+    Only ever called on text that FOLLOWS something that was removed."""
+    t2 = _DANGLING_RE.sub("", (t or "").lstrip())
+    return _capitalize(t2) if t2 else t
+
+
+def _filter_lines(text: str, keep) -> str:
+    """Apply a per-sentence filter line by line, so a structure laid out on separate
+    lines keeps its line breaks."""
+    out_lines = []
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            if out_lines and out_lines[-1] != "":
+                out_lines.append("")
+            continue
+        kept = [x for x in _sentences(line, keep_punct=True) if keep(x)]
+        if kept:
+            out_lines.append(" ".join(kept).strip())
+    while out_lines and out_lines[-1] == "":
+        out_lines.pop()
+    return "\n".join(out_lines).strip()
+
+
+_PIVOT_RE = re.compile(r"\b(but|however|though|although|yet|except)\b", re.I)
+
+
+def trim_praise_opener(sentence: str) -> str:
+    """'Great start, but there's a material issue...' -> 'There's a material issue...';
+    a praise-only sentence -> ''; anything else unchanged."""
+    m = re.match(r"^\s*([^,;:\u2014]{0,60}?)(?:[,;:\u2014]|\s-\s)\s*(\S.*)$", sentence or "", re.DOTALL)
+    if m and _is_gush(m.group(1) + "."):
+        rest = _undangle(m.group(2))
+        if _is_gush(rest) or (len(rest.split()) <= 4 and rest.rstrip().endswith("!")):
+            return ""
+        return _capitalize(rest)
+    if _is_gush(sentence or "") and not _PIVOT_RE.search(sentence or ""):
+        return ""
+    return sentence
+
 
 def sanitize_reply(text: str, policy: str = "coached") -> str:
     t = (text or "").strip()
     if not t:
         return t
-    m = re.match(r"^\s*([^.!?\n]{0,90}?[.!?,])\s+(\S.*)$", t, re.DOTALL)
-    if m and _is_gush(m.group(1)):
-        t = m.group(2).strip()
-    kept = [s for s in _sentences(t, keep_punct=True) if not _is_gush(s)]
-    if kept:
-        t = " ".join(kept).strip()
+    first = True
+    trimmed_head = False
+    out_lines: List[str] = []
+    for line in t.split("\n"):
+        if not line.strip():
+            if out_lines and out_lines[-1] != "":
+                out_lines.append("")
+            continue
+        kept = []
+        for x in _sentences(line, keep_punct=True):
+            if first:
+                first = False
+                y = trim_praise_opener(x)
+                trimmed_head = y != x
+                if not y:
+                    continue
+                x = y
+            elif _is_gush(x) and not _PIVOT_RE.search(x):
+                continue
+            kept.append(x)
+        if kept:
+            out_lines.append(" ".join(kept).strip())
+    while out_lines and out_lines[-1] == "":
+        out_lines.pop()
+    cleaned = "\n".join(out_lines).strip()
+    if cleaned:
+        # Repair the start only if the opening was cut: "So far, you have..." stays.
+        t = _undangle(cleaned) if trimmed_head else cleaned
     if t.count("?") >= 2:
         t = t[: t.find("?") + 1].strip()
     return t
+
+
+class StreamReplyGuard:
+    """V12.1: a question-allowed reply still streams, with the two repairs only the
+    non-streamed lane used to get: a praise opener is dropped ("Great point, love
+    that!" / "Great start, but ..."), and a stacked second question is cut (ONE
+    question per reply). The first sentence is held until it ends, so the cost is
+    the first sentence's latency, not the whole reply's."""
+
+    def __init__(self):
+        self.head = True
+        self.buf = ""
+        self.undangle_pending = False
+        self.q_seen = False
+        self.held = ""
+        self.emitted = ""
+
+    def _emit(self, text: str):
+        if not text:
+            return
+        if self.undangle_pending:
+            self.buf += text
+            if len(self.buf.strip()) < 14:
+                return
+            text, self.buf, self.undangle_pending = _undangle(self.buf.lstrip()), "", False
+        if self.q_seen:
+            self.held += text
+            return
+        i = text.find("?")
+        if i == -1:
+            self.emitted += text
+            yield text
+            return
+        self.q_seen = True
+        self.held = text[i + 1:]
+        self.emitted += text[:i + 1]
+        yield text[:i + 1]
+
+    def feed(self, piece: str):
+        if not piece:
+            return
+        if not self.head:
+            yield from self._emit(piece)
+            return
+        self.buf += piece
+        m = re.search(r"[.!?](?=\s)|\n", self.buf)
+        if not m and len(self.buf) < 220:
+            return
+        yield from self._release_head(m.end() if m else len(self.buf))
+
+    def _release_head(self, end: int):
+        first, rest = self.buf[:end], self.buf[end:]
+        self.head, self.buf = False, ""
+        kept = trim_praise_opener(first)
+        if kept and kept.strip() == first.strip():
+            yield from self._emit(first + rest)
+            return
+        if kept:
+            # keep the reply's own spacing (a line break after the first sentence survives)
+            joined = kept + rest if (not rest or rest[:1].isspace() or kept.endswith((" ", "\n"))) else kept + " " + rest
+            yield from self._emit(joined)
+            return
+        self.undangle_pending = True
+        yield from self._emit(rest.lstrip())
+
+    def flush(self) -> str:
+        out = []
+        if self.head and self.buf:
+            out += list(self._release_head(len(self.buf)))
+        if self.undangle_pending and self.buf:
+            self.undangle_pending = False
+            t, self.buf = _undangle(self.buf.lstrip()), ""
+            out += list(self._emit(t))
+        if self.held.strip():
+            keep = []
+            for x in _sentences(self.held, keep_punct=True):
+                if x.rstrip().endswith("?"):
+                    break
+                keep.append(x)
+            if keep:
+                tail = " " + " ".join(keep)
+                self.emitted += tail
+                out.append(tail)
+        return "".join(out)
 
 _SOLICIT_RE = re.compile(
     r"(?i)\b(please\s+)?(share|tell me|give me|walk me|provide|explain|describe|outline|"
@@ -848,16 +1229,21 @@ _MODE_FALLBACK = {
     "HINT": "Consider a different structural approach here.",
     "REPAIR": "Let's step back and look at the broader picture.",
     "ANSWER_DIRECT": "That is the standard assumption.",
-    "TRANSITION": "Let's move on to the next phase."
+    "TRANSITION": "Let's move on to the next phase.",
+    "WRAP_UP_EARLY": "No problem at all - you can stop here. Tap Submit at the top right to see feedback on what you've done so far, or come back to this case any time.",
+    "FINAL_REVIEW": "That's your final answer noted. Tap Submit at the top right to see your score and the full worked answer.",
+    "SESSION_STATUS": "There's no pass or fail in the room - tap Submit at the top right and you'll get your score, feedback and the full worked answer.",
+    "RESTATE_CASE": "The full brief is on screen - on a phone, tap the menu at the top left to open it. Start with a clarifying question or two, then lay out your structure.",
+    "TEACH": "Let's take it one piece at a time: put a number on the first driver and build from there.",
+    "FOLLOW_UP": "Take that into your next step.",
+    "EXPLAIN_FORMAT": "You lead and I play the interviewer: ask a clarifying question or two, lay out your structure, work the numbers step by step, then give a final answer. Tap Submit at the end for your score and the worked answer.",
 }
 
 def strip_all_questions(text: str) -> str:
-    kept = [s for s in _sentences(text, keep_punct=True) if not s.rstrip().endswith("?")]
-    return " ".join(kept).strip()
+    return _filter_lines(text, lambda x: not x.rstrip().endswith("?"))
 
 def strip_solicitations(text: str) -> str:
-    kept = [s for s in _sentences(text, keep_punct=True) if not _SOLICIT_RE.search(s)]
-    return " ".join(kept).strip()
+    return _filter_lines(text, lambda x: not _SOLICIT_RE.search(x))
 
 def enforce_mode(text: str, mode: str, allow_questions: bool = True, policy: str = "coached") -> str:
     t = sanitize_reply(text, policy)

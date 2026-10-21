@@ -149,7 +149,8 @@ def recommend_next_drill(profile: Optional[dict]) -> Optional[Dict[str, str]]:
 def build_learning_block(profile: Optional[dict], signals: Dict[str, Any], outcome: str) -> str:
     lines = [
         "- MINIMUM ASSISTANCE: give the LEAST help that lets THEM take the next step "
-        "themselves. Coached is not easy -- never hand over the answer just to get them there.",
+        "themselves. Coached is not easy -- never hand over the answer just to get them there. "
+        "(On a TEACH_STEP turn the least help is the named approach, the skeleton and ONE worked step.)",
     ]
     if outcome == "failed":
         bm = best_modality(profile)

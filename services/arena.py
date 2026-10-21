@@ -123,6 +123,7 @@ def run_turn(
     clarifications_exhausted: bool = False,
     user_id: Optional[str] = None,
     channel: str = "text",
+    case_solution: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One interviewer turn for ONE arm, on the production path. Never raises: an
     arm that fails returns an error row so the other arm's reply is still usable.
@@ -160,6 +161,7 @@ def run_turn(
             prompt_overrides=overrides,
             llm_override=llm_override,
             usage_out=usage,
+            case_solution=case_solution,
         ))
         if channel == "voice":
             lane, say, event = interpret_voice_turn(control, parts)

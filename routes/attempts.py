@@ -43,6 +43,7 @@ from services.interview_engine import (
 from services.session_signals import compute_signals
 from services.interviewer_decision import update_session_state, detect_violations
 from prompts.voice_renderer import strip_say_label
+from services.transcript_hygiene import clean_spoken_candidate, clean_spoken_interviewer
 from services.badge_awarder import award_badges_for_submission
 from services.case_figures import pop_figures, bank_figures
 from services.ai_usage import assert_daily_budget, log_realtime_usage
@@ -634,7 +635,7 @@ def _start_or_resume(supabase, user_id: str, body: StartAttemptRequest, case: di
             "attempt_id": attempt_id,
             "role": "system",
             "kind": "system_note",
-            "content": f"Case ready: {case.get('title')}. Ask any clarifying questions before structuring.",
+            "content": f"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the full brief. Ask any clarifying questions before structuring.",
             "is_clarification": False,
         }
     ).execute()
@@ -805,11 +806,18 @@ def post_message(
         new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
         remaining = attempt["clarification_quota"] - new_used
 
+    user_content = body.content
+    if body.kind == "voice":
+        # V12.1: transcription hallucinations ("Thank you for watching.", "www...") are
+        # not the candidate's words: removed before the turn is saved, answered or
+        # scored. If nothing real is left, the text as sent is kept (a /messages turn
+        # always has its row).
+        user_content = clean_spoken_candidate(body.content) or body.content
     user_row = {
         "attempt_id": attempt_id,
         "role": "user",
         "kind": body.kind if body.kind in ("text", "voice", "image", "file") else "text",
-        "content": body.content,
+        "content": user_content,
         "is_clarification": (clar_count > 0) and not quota_exhausted,
     }
 
@@ -839,12 +847,13 @@ def post_message(
                 case_content=llm_case_content(case),
                 case_type=case["type"],
                 transcript=transcript,
-                new_user_message=body.content,
+                new_user_message=user_content,
                 user_id=user_id,
                 clarifications_exhausted=clarifications_spent,
                 teaching_policy=teaching_policy,
                 prior_state=session_state,
                 control_out=ctl,
+                case_solution=case.get("solution"),
             ):
                 if first_ms is None and token:
                     first_ms = _ms(t_stream)
@@ -878,7 +887,7 @@ def post_message(
             # this response, ordered before the next request for this attempt.
             _after_turn(
                 attempt_id, _fold_session_state,
-                supabase, attempt_id, transcript, body.content,
+                supabase, attempt_id, transcript, user_content,
                 teaching_policy, session_state, ctl, final_text,
             )
             if silent:
@@ -986,12 +995,13 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
     ctl: Dict[str, Any] = {}
     pre_ms = _ms(t_req)
     t_engine = time.perf_counter()
+    spoken = clean_spoken_candidate(body.content) or body.content
     try:
         parts = list(stream_interviewer_reply(
             case_content=llm_case_content(case),
             case_type=case["type"],
             transcript=transcript,
-            new_user_message=body.content,
+            new_user_message=spoken,
             user_id=user_id,
             clarifications_exhausted=clarifications_spent,
             teaching_policy=teaching_policy,
@@ -999,6 +1009,7 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
             control_out=ctl,
             channel="voice",
             is_voice_partial=body.is_partial,
+            case_solution=case.get("solution"),
         ))
     except InterviewEngineError as e:
         raise HTTPException(status_code=502, detail=str(e)[:200])
@@ -1013,7 +1024,7 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
         raise HTTPException(status_code=502, detail=str(e))
 
     if not body.is_partial:
-        fold_args = (supabase, attempt_id, transcript, body.content,
+        fold_args = (supabase, attempt_id, transcript, spoken,
                      teaching_policy, session_state, ctl, say or "")
         if body.defer_fold and body.turn_id:
             # Early decision: folded only once the client confirms the words did
@@ -1119,6 +1130,10 @@ def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id
     # transcript while keeping the cost. Spend is metered below instead.
     role = body.role if body.role in ("user", "assistant") else "user"
     content = strip_say_label(body.content) if role == "assistant" else body.content
+    # V12.1: drop what nobody said -- transcription hallucinations on the candidate's
+    # side ("Thank you for watching.", "For more information visit www..."), stage
+    # directions on the interviewer's ("[Inaudible/Waiting for candidate response]").
+    content = clean_spoken_interviewer(content) if role == "assistant" else clean_spoken_candidate(content)
 
     count_res = _unwrap(r_count)
     total = getattr(count_res, "count", None) or len(count_res.data or [])
@@ -1129,9 +1144,22 @@ def _realtime_turn(attempt_id: str, body: RealtimeTurnRequest, supabase, user_id
     # post_message does — the far end has already answered — so this records
     # consumption rather than gating it. See the C9 open item in the realtime
     # handoff before changing this.
+    if not content.strip():
+        # Nothing real was said: meter the audio (below) but save no row.
+        if body.audio_input_tokens or body.audio_output_tokens:
+            log_realtime_usage(
+                user_id=user_id,
+                input_tokens=body.audio_input_tokens or 0,
+                output_tokens=body.audio_output_tokens or 0,
+                meta={"attempt_id": attempt_id, "role": role, "dropped": True},
+            )
+            turn_minutes = (body.audio_input_tokens or 0) / 600.0 + (body.audio_output_tokens or 0) / 1200.0
+            deduct_realtime_credit(supabase, user_id, turn_minutes)
+        return {"message_id": None}
+
     clar_count = 0
     if role == "user":
-        clar_count = count_clarifications(body.content, "voice")
+        clar_count = count_clarifications(content, "voice")
         if clar_count > 0:
             new_used = min(attempt["clarification_quota"], attempt["clarification_used"] + clar_count)
             supabase.table("attempts").update({"clarification_used": new_used}).eq("id", attempt_id).execute()

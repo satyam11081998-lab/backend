@@ -495,7 +495,8 @@ def test_session_opens_with_the_note_every_real_attempt_starts_with(client):
     s = _start(client)
     assert s["opening_transcript"] == [{
         "role": "system", "kind": "system_note",
-        "content": "Case ready: Spice Express. Ask any clarifying questions before structuring."}]
+        "content": ("Case ready: Spice Express. On a phone, tap the menu at the top left to read the full "
+                    "brief. Ask any clarifying questions before structuring.")}]
     # Free is the default: it is the plan most real candidates are on.
     assert s["clarification"] == {"tier": "free", "quota": 7, "used": 0, "remaining": 7}
 

@@ -75,7 +75,7 @@ def opening_transcript(case: Dict[str, Any]) -> List[Dict[str, str]]:
     return [{
         "role": "system",
         "kind": "system_note",
-        "content": f"Case ready: {case.get('title')}. Ask any clarifying questions before structuring.",
+        "content": f"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the full brief. Ask any clarifying questions before structuring.",
     }]
 
 
@@ -425,6 +425,7 @@ def arena_turn(
             model_mode=sess["model_mode"],
             clarifications_exhausted=exhausted_for_turn,
             user_id=uid,
+            case_solution=case.get("solution"),
         )
         for side in ("left", "right")
     }
@@ -833,6 +834,7 @@ def arena_arm_turn(
     assert_daily_budget()
     check_rate_limit(f"arena:arm:{uid}", max_calls=300, window_seconds=600)
 
+    case_solution = None
     if body.scenario_id:
         s = _scenario(body.scenario_id)
         case_type = s.get("case_type") or "profitability"
@@ -847,6 +849,7 @@ def arena_arm_turn(
             raise HTTPException(status_code=404, detail="Case not found")
         case_content = llm_case_content(case)
         case_type = case.get("type") or "profitability"
+        case_solution = case.get("solution")
 
     # Same quota rule as post_message, on this pane's own count.
     quota = CLARIFICATION_QUOTA[body.tier]
@@ -870,6 +873,7 @@ def arena_arm_turn(
         clarifications_exhausted=exhausted_for_turn,
         user_id=uid,
         channel=body.channel,
+        case_solution=case_solution,
     )
     return {
         "build": build_info(),
