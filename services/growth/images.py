@@ -2,8 +2,11 @@
 Pictures for MECE Insights articles.
 
 Owner, 2026-10-06: "add photos", "if image generation is needed, use Gemini only", then "or take open source photos
-strictly related to the topic". So each picture slot (a hero and up to two inline) is filled in this order
-(DAILY_BLOG_PICTURES, default "photos,gemini"):
+strictly related to the topic".
+Owner, 2026-10-27: "I don't want to use paid API for image generation" — Gemini image generation is paid-only, so
+DAILY_BLOG_PICTURES now defaults to "photos" and the `gemini` step is off unless it is explicitly switched back on.
+
+Each picture slot (a hero and up to two inline) is filled in this order (DAILY_BLOG_PICTURES, default "photos"):
 
   photos   a real photograph under an open licence that allows commercial use and resizing (CC0, public domain,
            CC BY, CC BY-SA), found on Wikimedia Commons and Openverse with the writer's search queries (named
@@ -52,9 +55,22 @@ _dead: Dict[str, float] = {}
 
 
 def picture_order() -> List[str]:
-    raw = (os.getenv("DAILY_BLOG_PICTURES") or "photos,gemini").lower()
+    """Which picture sources to use, in order. Default: real photographs only.
+
+    Gemini image generation is a PAID-ONLY feature — Google's pricing page lists image output as "Not available"
+    on the free tier for every current image model, and every call on this key has returned
+    429 RESOURCE_EXHAUSTED since the feature shipped. Owner decision 2026-10-27: do not put the project on a paid
+    image plan. So generation is off by default and nothing here can spend money.
+
+    Everything still in the chain is free: Wikimedia Commons and Openverse need no key, and the Gemini vision
+    model that judges the candidates is a flash text/vision model on the free tier (the same family the writer
+    already runs on) — when its free rate limit bites, `heuristic_pick`/`fallback_pick` take over.
+
+    Set DAILY_BLOG_PICTURES="photos,gemini" to turn generation back on, but only once the key is on a paid plan.
+    """
+    raw = (os.getenv("DAILY_BLOG_PICTURES") or "photos").lower()
     out = [x.strip() for x in raw.split(",") if x.strip() in ("photos", "gemini")]
-    return out or ["photos", "gemini"]
+    return out or ["photos"]
 
 
 def available() -> bool:
@@ -79,6 +95,12 @@ def _is_gone(e: Exception) -> bool:
 
 
 # ============================================================================ Gemini generation
+# Google's image models are not all named "*image*": the Nano Banana line (gemini-nano-banana-2.1, currently the
+# cheapest at ~$0.034 per 1K image) has no "image" in its id, so the old `"image" in name` test filtered it out and
+# the key's best image model was never tried. Match the family names too.
+_IMAGE_NAME = re.compile(r"image|banana|imagen", re.I)
+
+
 def image_models() -> List[str]:
     """Gemini image models to try: DAILY_BLOG_IMAGE_MODEL, then what this key lists (newest first)."""
     out: List[str] = []
@@ -91,7 +113,7 @@ def image_models() -> List[str]:
             for m in _client().models.list():
                 name = (getattr(m, "name", "") or "").removeprefix("models/")
                 actions = getattr(m, "supported_actions", None) or []
-                if name.startswith("gemini") and "image" in name and (not actions or "generateContent" in actions):
+                if name.startswith("gemini") and _IMAGE_NAME.search(name) and (not actions or "generateContent" in actions):
                     names.append(name)
         except Exception as e:  # noqa: BLE001
             print(f"[insights images] model list failed: {type(e).__name__}: {e}")
@@ -144,9 +166,19 @@ def gemini_image(prompt: str, aspect: str = "16:9") -> Dict[str, Any]:
 
 # ============================================================================ open-licensed photos
 _HTTP_TIMEOUT = 12
+# The person/event terms matter because `heuristic_pick` runs without the vision judge whenever Gemini is out of
+# quota, and the judge's "no close-up portraits of an identifiable person" rule would otherwise go unenforced.
+# Wikimedia Commons is full of PIB portraits of governors and ministers, and a story about an RBI rate rise would
+# happily take "Sanjay Malhotra, Governor of the Reserve Bank of India" as its hero and its link preview.
 _BAD_TITLE = re.compile(r"\b(logo|logos|map|maps|flag|coat of arms|emblem|diagram|chart|graph|icon|seal|signature|"
                         r"screenshot|infographic|poster|banner|svg|plan|blueprint|stamp|currency note|document|"
-                        r"letter|newspaper|cartoon|illustration|drawing|painting)\b", re.I)
+                        r"letter|newspaper|cartoon|illustration|drawing|painting|"
+                        r"portrait|headshot|mugshot|selfie|"
+                        r"governor|minister|ministry|chairman|chairperson|ceo|cfo|president|secretary|"
+                        r"commissioner|ambassador|delegation|"
+                        r"press conference|press meet|speaking|speech|addressing|interview|"
+                        r"award|awards|ceremony|felicitation|inauguration|summit|conclave|visit|meeting with|"
+                        r"protest|rally|strike|funeral|accident|disaster)\b", re.I)
 
 
 def _http_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -274,14 +306,104 @@ def candidates(queries: List[str], *, searchers: Optional[List[Callable]] = None
 
 _JUDGE = """You are the photo editor of MECE Insights, a long-form business magazine for Indian MBA students.
 Article: "{title}"
-This picture must show: {want}
+Ideally this picture shows: {want}
 
-Below are {n} candidate photographs, numbered 1 to {n} in order. Choose the ONE that shows this exact subject (the \
-company, place, product, activity or setting named), is sharp, well lit and good enough to print large. Be strict: \
-if none clearly shows the subject, choose none. Reject anything unrelated or merely generic, logos, maps, charts, \
-screenshots, documents, images with large text, watermarks or borders, close-up portraits of an identifiable person, \
-and anything sad, violent or sensitive.
+Below are {n} candidate photographs, numbered 1 to {n} in order. Pick the ONE that best illustrates the story for a \
+reader, in this order of preference:
+  1. it shows the exact subject named above (that company's building, that port, that product, that activity);
+  2. failing that, it is an honest editorial photograph of the same setting or sector (a bank branch for a banking \
+story, a container terminal for a trade story, a street market for a consumption story) that a magazine would run \
+beside this article. The caption printed under it says what it actually shows, so a representative photograph is \
+acceptable and is far better than no photograph at all.
+
+Always reject, whatever else is on offer: logos, wordmarks, maps, flags, charts, diagrams, screenshots, documents, \
+posters, images dominated by text or watermarks, close-up portraits of an identifiable person, and anything sad, \
+violent, political or otherwise sensitive. Also reject anything blurry or too small to print large.
+Answer null ONLY when every candidate falls in one of those reject categories or is plainly about a different topic.
 Return ONLY JSON: {{"best": <number or null>, "why": "<one short sentence>"}}"""
+
+# Words that carry no signal when scoring a photo's title against what a slot wants.
+_STOP = {
+    "the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "for", "with", "from", "by", "its", "their",
+    "india", "indian", "new", "view", "photo", "image", "file", "wikimedia", "commons", "jpg", "png", "jpeg",
+}
+
+
+def _tokens(s: str) -> set:
+    return {w for w in re.findall(r"[a-z]{3,}", (s or "").lower()) if w not in _STOP}
+
+
+def _landscape(c: Dict[str, Any], lo: float = 1.2, hi: float = 2.6) -> bool:
+    """Shape is the cheapest portrait filter there is: a close-up of a person is almost always taller than wide."""
+    w, h = c.get("width") or 0, c.get("height") or 0
+    return bool(w and h and lo <= w / h <= hi)
+
+
+def heuristic_pick(cands: List[Dict[str, Any]], want: str) -> Optional[Dict[str, Any]]:
+    """A photo chosen without a model: the candidate whose title overlaps THIS SLOT'S SUBJECT.
+
+    The safety net for the two ways the Gemini judge stops working — it runs out of quota (429 RESOURCE_EXHAUSTED)
+    or every model on the key errors. Before this, a judge failure threw away a perfectly good candidate set and the
+    article shipped with no picture at all.
+
+    Scored against the subject ONLY, never against the search queries. Scoring against the queries would be
+    circular — the candidates were retrieved *by* those queries, so everything would "match" and a crude-oil
+    pipeline story could take a solar farm because the generic energy query happened to carry more tokens.
+    Only landscape candidates are eligible, which also keeps portraits out on this judge-free path.
+    """
+    want_t = _tokens(want)
+    if not want_t:
+        return None
+    best, best_score = None, 0.0
+    for c in cands:
+        if not _landscape(c):
+            continue
+        overlap = _tokens(c.get("title") or "") & want_t
+        if not overlap:
+            continue
+        score = len(overlap) * 2.0 + min((c.get("width") or 0) / 4000.0, 1.0)
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def fallback_pick(cands: List[Dict[str, Any]], slug: str) -> Optional[Dict[str, Any]]:
+    """Pick from candidates found by the broad sector queries, where title overlap means nothing.
+
+    `widen_queries` is a pure function of sector keywords, so every banking article generates the same query list
+    and `candidates()` ranks them identically. Taking the top one would put the same photograph on every banking
+    story on the site. The slug picks the offset instead: deterministic (the same post always gets the same photo,
+    so a re-run is idempotent) but spread across the set, so four banking stories get four different photographs.
+    Candidates arrive in query order, so this still prefers the first, most on-topic sector query.
+    """
+    pool = [c for c in cands if _landscape(c)] or [c for c in cands if (c.get("width") or 0) >= 900]
+    if not pool:
+        return None
+    window = min(len(pool), 6)
+    idx = int(hashlib.sha1((slug or "").encode("utf-8")).hexdigest(), 16) % window
+    return pool[idx]
+
+
+def recent_photo_urls(supabase, limit: int = 60) -> set:
+    """Photos already used on other posts, so the same picture does not appear across the archive.
+
+    `used` is per-article, which stopped one article repeating a photo but did nothing across articles — and the
+    live site already shows the same IDBI branch photo turning up repeatedly. Best effort: any failure returns an
+    empty set and the pipeline carries on.
+    """
+    out: set = set()
+    try:
+        rows = (supabase.table("seo_pages").select("content")
+                .order("published_at", desc=True).limit(limit).execute().data or [])
+    except Exception:  # noqa: BLE001
+        return out
+    for r in rows:
+        c = r.get("content") or {}
+        for img in ([c.get("hero")] if c.get("hero") else []) + (c.get("images") or []):
+            src = (img or {}).get("source_url") or (img or {}).get("credit_url")
+            if src:
+                out.add(src)
+    return out
 
 
 def vision_models() -> List[str]:
@@ -361,30 +483,116 @@ def photo_credit(c: Dict[str, Any]) -> str:
     return f"Photo: {who} / {c.get('source') or 'Wikimedia Commons'}, {c.get('license') or 'open licence'}"
 
 
+# The writer plans precise, proper-noun queries ("Tata Sons board meeting", "State Bank of India data center").
+# Those are right to try first, but Wikimedia Commons simply has no photograph of most of them, and the slot then
+# went empty. These sector scenes always exist on Commons and are what a magazine would run anyway, so they are
+# tried only after the specific queries have come back empty.
+_SECTOR_QUERIES: List[tuple] = [
+    (("bank", "rbi", "deposit", "lending", "loan", "npa", "monetary", "repo", "inflation", "rupee", "currency"),
+     ["bank branch India", "Reserve Bank of India building Mumbai", "Mumbai financial district"]),
+    (("upi", "payment", "fintech", "merchant", "wallet", "mdr", "npci"),
+     ["QR code payment shop India", "street vendor mobile payment India", "point of sale terminal shop"]),
+    (("port", "shipping", "export", "import", "trade", "tariff", "freight", "logistics", "container"),
+     ["container terminal India", "cargo ship container port", "Jawaharlal Nehru Port"]),
+    (("ipo", "stock", "equity", "investor", "listing", "bourse", "sensex", "nifty", "capital"),
+     ["Bombay Stock Exchange building", "stock exchange trading floor", "Dalal Street Mumbai"]),
+    (("semiconductor", "chip", "data centre", "data center", "cloud", "artificial intelligence", "compute", "server"),
+     ["data center server racks", "semiconductor wafer fabrication", "technology park Bangalore"]),
+    (("telecom", "spectrum", "satellite", "broadband", "network", "starlink"),
+     ["mobile phone tower India", "satellite ground station antenna", "fibre optic cable installation"]),
+    (("retail", "commerce", "delivery", "grocery", "consumer", "fmcg", "kirana"),
+     ["grocery store India", "delivery rider motorcycle India", "supermarket aisle shoppers"]),
+    (("oil", "gas", "pipeline", "refinery", "energy", "solar", "power", "electricity", "coal"),
+     ["oil refinery India", "solar power plant India", "electricity transmission towers"]),
+    (("automobile", "vehicle", "car", "electric vehicle", "mobility"),
+     ["car assembly line factory", "electric vehicle charging station", "Indian highway traffic"]),
+    (("pharma", "drug", "hospital", "health", "medicine", "vaccine"),
+     ["pharmaceutical manufacturing plant", "hospital building India", "laboratory researcher"]),
+    (("agriculture", "farm", "crop", "food", "mandi", "harvest"),
+     ["farmer field India", "wholesale vegetable market India", "grain warehouse"]),
+    (("tax", "budget", "policy", "regulation", "ministry", "parliament", "government", "sebi", "tribunal"),
+     ["North Block New Delhi", "Parliament House New Delhi", "government office building India"]),
+    (("real estate", "housing", "property", "construction", "infrastructure", "metro", "railway"),
+     ["construction site India high rise", "Indian metro train station", "urban skyline construction"]),
+]
+_DEFAULT_QUERIES = ["Mumbai skyline business district", "office building glass facade India", "Nariman Point Mumbai"]
+
+
+def widen_queries(item: Dict[str, Any], title: str) -> List[str]:
+    """Broad sector scenes to fall back on when the writer's precise queries find nothing."""
+    hay = " ".join(str(x) for x in (
+        item.get("subject") or "", item.get("alt") or "", item.get("prompt") or "", title or "",
+        " ".join(item.get("search") or []),
+    )).lower()
+    out: List[str] = []
+    for words, queries in _SECTOR_QUERIES:
+        # Whole words only. Bare substrings matched inside unrelated words -- "car" in "healthcare" and "scarce",
+        # "power" in "empowerment", "trade" in "tradeoff", "gas" in "Vegas" -- and sent a healthcare story to a
+        # car assembly line.
+        if any(re.search(rf"\b{re.escape(w)}\b", hay) for w in words):
+            out += queries
+    return (out or _DEFAULT_QUERIES)[:3]
+
+
 def find_photo(item: Dict[str, Any], title: str, used: set, *, search: Callable = candidates,
-               pick: Callable = judge, fetch: Callable = _http_bytes, errors: Optional[List[str]] = None
-               ) -> Optional[Dict[str, Any]]:
-    """{bytes, meta} for a real, openly licensed photo that shows this slot's subject, or None."""
-    queries = [q for q in (item.get("search") or []) if isinstance(q, str)]
+               pick: Callable = judge, fetch: Callable = _http_bytes, errors: Optional[List[str]] = None,
+               slug: str = "") -> Optional[Dict[str, Any]]:
+    """{bytes, meta} for a real, openly licensed photo for this slot, or None.
+
+    Two paths, deliberately scored differently (2026-10-27):
+
+      PRECISE  the writer's own proper-noun queries. Candidates here are supposed to show the named subject, so a
+               judge failure falls back to `heuristic_pick`, which demands a real title/subject overlap.
+      WIDENED  broad sector scenes, tried only when the precise queries find nothing. Title overlap is meaningless
+               here (the candidates were retrieved by those very queries), so `fallback_pick` chooses by slug
+               instead: topical by construction, varied across articles, stable for one article.
+
+    Either way the photo is landscape and has passed `_BAD_TITLE`, so the judge's hard rejects -- logos, maps,
+    charts, portraits of identifiable people -- still hold on the judge-free path.
+    """
+    queries = [q for q in (item.get("search") or []) if isinstance(q, str) and q.strip()]
     if not queries and item.get("subject"):
         queries = [str(item["subject"])]
+    precise = bool(queries)
     if not queries:
-        return None
+        queries = widen_queries(item, title)
+
     cands = search(queries, used=used, errors=errors)
+    widened: List[str] = []
+    if not cands and precise:
+        widened = [q for q in widen_queries(item, title) if q not in queries]
+        if widened:
+            cands = search(widened, used=used, errors=errors)
     if not cands:
         if errors is not None:
-            errors.append(f"no open-licensed photo found for: {', '.join(queries)[:120]}")
+            errors.append(f"no open-licensed photo found for: {', '.join(queries + widened)[:160]}")
         return None
+
+    on_widened = bool(widened) or not precise
     want = str(item.get("subject") or item.get("alt") or item.get("prompt") or queries[0])[:300]
+
+    def without_judge() -> Optional[Dict[str, Any]]:
+        return fallback_pick(cands, f"{slug}/{item.get('after_section', 0)}") if on_widened \
+            else heuristic_pick(cands, want)
+
+    best = None
     try:
         best = pick(cands, want, title)
+        if not best:
+            best = without_judge()
+            if best and errors is not None:
+                errors.append(f"judge found none close enough for '{queries[0][:50]}'; used a sector photo"
+                              if on_widened else
+                              f"judge found none close enough for '{queries[0][:50]}'; used the closest match by title")
     except Exception as e:  # noqa: BLE001
+        best = without_judge()
         if errors is not None:
-            errors.append(f"photo judge: {type(e).__name__}: {str(e)[:100]}")
-        return None
+            errors.append(f"photo judge unavailable ({type(e).__name__}); "
+                          + ("used a sector photo" if (best and on_widened) else
+                             "picked the closest match by title" if best else "no usable candidate"))
     if not best:
         if errors is not None:
-            errors.append(f"{len(cands)} photo(s) found for '{queries[0][:60]}', none showed the subject closely enough")
+            errors.append(f"{len(cands)} photo(s) found for '{queries[0][:60]}', none usable")
         return None
     data = fetch(best["image_url"])
     used.add(best["image_url"])
@@ -472,18 +680,21 @@ def make_images(supabase, slug: str, art: Dict[str, Any], *, title: str = "", ge
         jobs.append(("inline", i + 1, item))
     results: Dict[int, Dict[str, Any]] = {}
 
-    # 1. real photos, one slot at a time so two slots never get the same photo
+    # 1. real photos, one slot at a time so two slots never get the same photo. `used` is also seeded with the
+    #    photos other posts already use, so a picture does not repeat across the archive.
     if "photos" in order:
-        used: set = set()
+        used: set = recent_photo_urls(supabase)
         for idx, (role, n, item) in enumerate(jobs):
             try:
-                got = photo(item, title, used, errors=out["errors"])
+                got = photo(item, title, used, errors=out["errors"], slug=slug)
                 if got:
                     m = got["meta"]
                     results[idx] = _save(supabase, slug, item, role, n, got["bytes"], upload=upload, extra={
                         "credit": photo_credit(m), "credit_url": m.get("page_url") or "", "license": m.get("license"),
                         "license_url": m.get("license_url") or "", "source": "photo", "photo_title": m.get("title"),
-                        "creator": m.get("creator") or "", "site": m.get("source") or ""})
+                        "creator": m.get("creator") or "", "site": m.get("source") or "",
+                        # the original file URL, so recent_photo_urls() can keep later posts off this photo
+                        "source_url": m.get("image_url") or ""})
             except Exception as e:  # noqa: BLE001
                 out["errors"].append(f"{role} photo: {type(e).__name__}: {str(e)[:120]}")
 
@@ -561,17 +772,24 @@ def diagnose(supabase, *, generate: bool = True) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         rep["photo_search"] = {"ok": False, "errors": [f"{type(e).__name__}: {str(e)[:160]}"]}
     if rep["gemini_key"]:
-        try:
-            rep["image_models"] = image_models()[:6]
-        except Exception as e:  # noqa: BLE001
-            rep["image_models"] = [f"list failed: {type(e).__name__}"]
         rep["vision_models"] = vision_models()
-        if generate:
+        if "gemini" not in rep["order"]:
+            # Don't list or call image models when generation is switched off: it is paid-only, so the call can
+            # only come back 429 and the report would read like a fault when it is a deliberate setting.
+            rep["generation"] = {"ok": None,
+                                 "skipped": "image generation is off (DAILY_BLOG_PICTURES=photos) because it is "
+                                            "paid-only on the Gemini API; open-licensed photos are free"}
+        else:
             try:
-                g = gemini_image("A cup of masala chai on a wooden table by a window, morning light. " + HOUSE_STYLE, "1:1")
-                rep["generation"] = {"ok": True, "model": g.get("model"), "bytes": len(g.get("bytes") or b"")}
+                rep["image_models"] = image_models()[:6]
             except Exception as e:  # noqa: BLE001
-                rep["generation"] = {"ok": False, "error": str(e)[:600]}
+                rep["image_models"] = [f"list failed: {type(e).__name__}"]
+            if generate:
+                try:
+                    g = gemini_image("A cup of masala chai on a wooden table by a window, morning light. " + HOUSE_STYLE, "1:1")
+                    rep["generation"] = {"ok": True, "model": g.get("model"), "bytes": len(g.get("bytes") or b"")}
+                except Exception as e:  # noqa: BLE001
+                    rep["generation"] = {"ok": False, "error": str(e)[:600]}
     try:
         from PIL import Image
         b = io.BytesIO()

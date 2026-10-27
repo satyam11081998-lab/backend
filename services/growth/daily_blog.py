@@ -1909,6 +1909,22 @@ def status(supabase, now: Optional[datetime] = None) -> Dict[str, Any]:
                             "domain": c["domain"]} for c in candidate_topics(supabase, now)]}
 
 
+def _stamp_image_attempt(supabase, page_id: str, meta: Dict[str, Any], errors) -> None:
+    """Record that pictures were tried for this post, whatever the outcome.
+
+    backfill_images() orders its queue on this stamp. Any path out of add_images that does not set it leaves the
+    post pinned to the head of that queue for ever, which is the bug the stamp exists to prevent — so every exit
+    goes through here, including the failures.
+    """
+    try:
+        meta = dict(meta or {})
+        meta.update({"image_errors": list(errors or []),
+                     "images_attempted_at": datetime.now(timezone.utc).isoformat()})
+        supabase.table("seo_pages").update({"agent_meta": meta}).eq("id", page_id).execute()
+    except Exception as e:  # noqa: BLE001 - never let bookkeeping break the caller
+        print(f"[insights images] could not stamp attempt on {page_id}: {type(e).__name__}: {e}")
+
+
 def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make: Optional[Callable] = None) -> Dict[str, Any]:
     """Commission and attach images to an existing article (older posts, or a retry when generation failed)."""
     from services.growth import images
@@ -1922,10 +1938,19 @@ def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make:
     meta = dict(page.get("agent_meta") or {})
     art = meta.get("art") or {}
     if not any((art.get("hero") or {}).get(k) for k in ("search", "subject")):  # older plans had no photo search
-        art = images.art_plan(chat, page) or art
+        try:
+            art = images.art_plan(chat, page) or art
+        except Exception as e:  # noqa: BLE001
+            _stamp_image_attempt(supabase, page_id, meta, [f"art planner: {type(e).__name__}"])
+            return {"ok": False, "reason": f"could not plan the images ({type(e).__name__})"}
     if not art:
+        _stamp_image_attempt(supabase, page_id, meta, ["could not plan the images"])
         return {"ok": False, "reason": "could not plan the images"}
-    pics = make(supabase, page["slug"], art, title=page.get("title") or "")
+    try:
+        pics = make(supabase, page["slug"], art, title=page.get("title") or "")
+    except Exception as e:  # noqa: BLE001
+        _stamp_image_attempt(supabase, page_id, meta, [f"{type(e).__name__}: {str(e)[:160]}"])
+        return {"ok": False, "reason": f"pictures failed ({type(e).__name__})", "errors": [str(e)[:200]]}
     content = dict(page.get("content") or {})
     if pics.get("hero"):
         content["hero"] = pics["hero"]
@@ -1933,7 +1958,10 @@ def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make:
         content["images"] = pics["images"]
     if not content.get("topic_label"):
         content["topic_label"] = topic_label(page, meta.get("domain") or "")
-    meta.update({"art": art, "image_errors": pics.get("errors") or []})
+    # Stamped on every attempt, success or not, so backfill_images can move down the queue instead of retrying the
+    # same few posts forever (2026-10-27).
+    meta.update({"art": art, "image_errors": pics.get("errors") or [],
+                 "images_attempted_at": datetime.now(timezone.utc).isoformat()})
     supabase.table("seo_pages").update({"content": content, "agent_meta": meta}).eq("id", page_id).execute()
     return {"ok": bool(pics.get("hero") or pics.get("images")), "hero": pics.get("hero"),
             "images": len(pics.get("images") or []), "errors": pics.get("errors") or [],
@@ -1942,16 +1970,32 @@ def add_images(supabase, page_id: str, *, chat: Optional[Callable] = None, make:
 
 def backfill_images(supabase, *, limit: int = 3, chat: Optional[Callable] = None,
                     make: Optional[Callable] = None) -> Dict[str, Any]:
-    """Pictures for published posts that have none, newest first, a few per call (each takes ~30-60 s)."""
+    """Pictures for published posts that have none, a few per call (each takes ~30-60 s).
+
+    Posts never tried come first (newest first), then the ones tried longest ago. Before 2026-10-27 the queue was
+    simply "every post with no hero, newest first", so a post whose hero could not be filled sat at the head of it
+    for ever: every click re-ran the same three posts, burned the same API calls, and the posts below them were
+    never reached. That is why 15 of 19 published posts had no picture at all.
+    """
     try:
-        rows = (supabase.table("seo_pages").select("id, slug, title, content").eq("status", "published")
-                .order("published_at", desc=True).limit(200).execute().data or [])
+        rows = (supabase.table("seo_pages").select("id, slug, title, content, agent_meta, published_at")
+                .eq("status", "published").order("published_at", desc=True).limit(200).execute().data or [])
     except Exception as e:  # noqa: BLE001
         return {"done": [], "remaining": None, "error": type(e).__name__}
     todo = [r for r in rows if not ((r.get("content") or {}).get("hero") or {}).get("url")]
+    # "" sorts before any ISO timestamp, so never-attempted posts lead; rows keep newest-first order within a group.
+    todo.sort(key=lambda r: str((r.get("agent_meta") or {}).get("images_attempted_at") or ""))
     done = []
     for r in todo[:limit]:
-        res = add_images(supabase, r["id"], chat=chat, make=make)
+        # One post raising must not abandon the rest of the batch, or a single bad row silently shortens every click.
+        try:
+            res = add_images(supabase, r["id"], chat=chat, make=make)
+        except Exception as e:  # noqa: BLE001
+            _stamp_image_attempt(supabase, r["id"], r.get("agent_meta") or {},
+                                 [f"{type(e).__name__}: {str(e)[:160]}"])
+            res = {"ok": False, "errors": [f"{type(e).__name__}: {str(e)[:160]}"]}
         done.append({"id": r["id"], "title": r.get("title"), "ok": res.get("ok"), "errors": (res.get("errors") or [])[:3],
                      "sources": res.get("sources")})
-    return {"done": done, "remaining": max(0, len(todo) - limit)}
+    never = sum(1 for r in todo if not (r.get("agent_meta") or {}).get("images_attempted_at"))
+    return {"done": done, "remaining": max(0, len(todo) - len(done)),
+            "never_attempted": max(0, never - len(done))}
