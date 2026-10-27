@@ -288,6 +288,75 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
+# ---------------------------------------------------------------------------
+# Story clusters — keyword overlap alone could not stop keyword cannibalisation.
+#
+# On 2026-10-27 the live site had FOUR published essays on the same RBI rate
+# decision and FOUR on UPI/MDR pricing, plus one more of each waiting in drafts.
+# Google picks one page per cluster and suppresses the rest, so none of them
+# ever becomes the authoritative page and the whole cluster underperforms a
+# single good essay.
+#
+# The existing guard compared title tokens with a Jaccard threshold, which the
+# duplicates slipped under for two reasons: the same entity has several names
+# that share no tokens at all ("Reserve Bank" / "central bank" / "RBI" / "MPC"),
+# and two differently-worded headlines about one event score around 0.27.
+# So: normalise the story to a cluster, and refuse a second essay on a cluster
+# already covered recently. The right move for a recurring story is to update
+# the post that exists (rewrite_page keeps the slug and the link equity), not
+# to publish a rival to it.
+# ---------------------------------------------------------------------------
+STORY_CLUSTERS: List[Tuple[str, str]] = [
+    ("rbi-policy", r"\b(rbi|reserve bank|central bank|mpc|monetary policy|repo rate|rate (hike|cut|rise|increase)|"
+                   r"policy rate|crr|slr|inflation target|calibrated tightening)\b"),
+    ("upi-pricing", r"\b(upi|mdr|npci|merchant discount rate|digital payments?|payment (charges|pricing)|"
+                    r"interchange|rupay)\b"),
+    ("quick-commerce", r"\b(quick commerce|q-commerce|blinkit|instamart|zepto|swiggy|zomato|eternal|dark stores?|"
+                       r"ten.?minute delivery)\b"),
+    ("india-ai", r"\b(artificial intelligence|\bai\b|large language models?|llms?|gpu|data cent(re|er)s?|"
+                 r"hyperscalers?|semiconductors?|chip fab)\b"),
+    ("tata-group", r"\b(tata sons|tata group|tata trusts|bombay house)\b"),
+    ("reliance-jio", r"\b(reliance|jio|ril\b|mukesh ambani)\b"),
+    ("adani", r"\b(adani)\b"),
+    ("bank-ma", r"\b(bank (merger|stake sale|acquisition)|idbi|yes bank|rbl|emirates nbd|privatisation of banks?)\b"),
+    ("satellite-telecom", r"\b(starlink|satellite (internet|broadband|spectrum)|telecom spectrum|5g rollout)\b"),
+    ("capital-markets-tax", r"\b(capital gains|securities transaction tax|stt|demat|ipo (market|pipeline)|"
+                            r"foreign portfolio investors?|fpi)\b"),
+    ("energy-oil", r"\b(crude|opec|oil (price|import)|refiner(y|ies)|pipeline|lng|petrol|diesel)\b"),
+    ("ev-auto", r"\b(electric vehicles?|\bevs?\b|auto sales|car sales|battery (plant|cell))\b"),
+]
+_CLUSTER_RES = [(name, re.compile(pat, re.I)) for name, pat in STORY_CLUSTERS]
+
+# How long one cluster is off the table. Three weeks: long enough that the archive stops competing with itself,
+# short enough that a genuinely new development in a running story still gets written up.
+CLUSTER_COOLDOWN_DAYS = 21
+
+
+def clusters_of(text: str) -> set:
+    """The recurring-story buckets this text belongs to (a story can sit in more than one)."""
+    t = text or ""
+    return {name for name, rx in _CLUSTER_RES if rx.search(t)}
+
+
+def recent_clusters(recent: List[Dict[str, Any]], now: datetime,
+                    days: int = CLUSTER_COOLDOWN_DAYS) -> Dict[str, Dict[str, Any]]:
+    """cluster -> the most recent post covering it inside the cooldown window."""
+    out: Dict[str, Dict[str, Any]] = {}
+    cutoff = now - timedelta(days=days)
+    for p in recent:
+        if (p.get("status") or "") == "rejected":
+            continue
+        when = _parse_ts(p.get("created_at"))
+        if when and when < cutoff:
+            continue
+        text = " ".join(str(x) for x in (p.get("title") or "", p.get("topic") or "",
+                                         " ".join(p.get("keywords") or [])))
+        for c in clusters_of(text):
+            if c not in out:
+                out[c] = p
+    return out
+
+
 def is_blocked(text: str) -> bool:
     return bool(_BLOCK_RE.search(text or ""))
 
@@ -353,8 +422,20 @@ def score_headline(h: Dict[str, Any], recent: List[Dict[str, Any]], now: datetim
         score += max(0.0, 2.0 - age_h / 24)  # fresher is better, up to +2
     tt = _tokens(title)
     for p in recent:
-        if _jaccard(tt, _tokens(f"{p.get('title') or ''} {p.get('topic') or ''}")) >= 0.3:
+        # 0.22, not 0.30: two differently-worded headlines about one event score around 0.27, which is exactly how
+        # "Why the Reserve Bank raised rates without wanting a fight" and "Why the central bank hiked rates while
+        # raising growth targets" both got published.
+        if _jaccard(tt, _tokens(f"{p.get('title') or ''} {p.get('topic') or ''}")) >= 0.22:
             return -1, ["too close to a recent post: " + (p.get("title") or "")[:60]], domain
+    # Same story, different words. Token overlap cannot see that "Reserve Bank", "central bank", "RBI" and "MPC"
+    # are one subject; the cluster map can.
+    covered = recent_clusters(recent, now)
+    for c in clusters_of(text):
+        if c in covered:
+            prev = covered[c]
+            when = _parse_ts(prev.get("created_at"))
+            return -1, [f"'{c}' was already covered on {when.date().isoformat() if when else 'a recent day'}: "
+                        f"\"{(prev.get('title') or '')[:60]}\" — update that post instead of writing a rival to it"], domain
     last_domains = [((p.get("agent_meta") or {}).get("domain") or "") for p in recent[:3]]
     if domain and last_domains.count(domain) >= 2:
         score -= 2.5

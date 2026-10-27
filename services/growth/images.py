@@ -165,7 +165,17 @@ def gemini_image(prompt: str, aspect: str = "16:9") -> Dict[str, Any]:
 
 
 # ============================================================================ open-licensed photos
-_HTTP_TIMEOUT = 12
+# 7s, not 12s. api.openverse.org read-times-out from Render often enough that it is the dominant cost of a
+# backfill: six queries x two sources x 12s is 144 seconds of pure waiting per picture slot, three slots per
+# article, three articles per click. Commons answers in well under a second when it answers at all, so a shorter
+# timeout costs nothing real and the circuit breaker below stops a dead source being retried at all.
+_HTTP_TIMEOUT = 7
+
+# A source that times out or refuses a connection is skipped for 10 minutes rather than retried for every query.
+_source_dead: Dict[str, float] = {}
+_SOURCE_COOLDOWN = 600
+# Whole-article ceiling on photo search, so one slow source can never hold a backfill open for minutes.
+PHOTO_BUDGET_S = 45
 # The person/event terms matter because `heuristic_pick` runs without the vision judge whenever Gemini is out of
 # quota, and the judge's "no close-up portraits of an identifiable person" rule would otherwise go unenforced.
 # Wikimedia Commons is full of PIB portraits of governors and ministers, and a story about an RBI rate rise would
@@ -278,14 +288,71 @@ def search_openverse(query: str, *, http: Callable = _http_json, limit: int = 20
     return out
 
 
+def _timed_out(e: Exception) -> bool:
+    return any(k in type(e).__name__.lower() for k in ("timeout", "connection"))
+
+
+def search_pexels(query: str, *, limit: int = 15) -> List[Dict[str, Any]]:
+    """Pexels — free API key, no payment, and far deeper coverage of business subjects than Commons.
+
+    Commons and Openverse are thin on exactly what this publication needs: the admin log is full of
+    "no open-licensed photo found for: delivery executive scooter india" and "8 photo(s) found for
+    'Navi Mumbai data centre', none showed the subject closely enough". Pexels has thousands of usable
+    editorial-style business photographs and its licence allows commercial use and modification.
+
+    Entirely optional: with no PEXELS_API_KEY this returns [] and the chain is exactly as it was.
+    Attribution is not required by the Pexels licence, but the photographer is credited anyway — the page
+    already has the furniture for it and crediting a photographer costs nothing.
+    """
+    key = (os.getenv("PEXELS_API_KEY") or "").strip()
+    if not key:
+        return []
+    import requests
+    r = requests.get("https://api.pexels.com/v1/search",
+                     params={"query": query, "per_page": limit, "orientation": "landscape"},
+                     headers={"Authorization": key, "User-Agent": UA}, timeout=_HTTP_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for p in (r.json() or {}).get("photos") or []:
+        title = (p.get("alt") or "").strip()
+        if not title or _BAD_TITLE.search(title) or (p.get("width") or 0) < 900:
+            continue
+        src = p.get("src") or {}
+        out.append({
+            "source": "Pexels", "title": title, "page_url": p.get("url") or "",
+            "image_url": src.get("large2x") or src.get("original") or "",
+            "thumb_url": src.get("medium") or src.get("small") or "",
+            "width": p.get("width"), "height": p.get("height"),
+            "license": "Pexels licence", "license_url": "https://www.pexels.com/license/",
+            "creator": (p.get("photographer") or "")[:120],
+        })
+    return [c for c in out if c["image_url"] and c["thumb_url"]]
+
+
 def candidates(queries: List[str], *, searchers: Optional[List[Callable]] = None, used: Optional[set] = None,
-               errors: Optional[List[str]] = None, cap: int = 10) -> List[Dict[str, Any]]:
-    """Photos for the queries from every source, deduplicated, landscape and large first."""
-    searchers = searchers if searchers is not None else [search_commons, search_openverse]
+               errors: Optional[List[str]] = None, cap: int = 10, deadline: Optional[float] = None
+               ) -> List[Dict[str, Any]]:
+    """Photos for the queries from every source, deduplicated, landscape and large first.
+
+    Two guards keep a slow source from eating the whole run: a source that times out is skipped for ten minutes
+    (`_source_dead`), and the caller's `deadline` stops the sweep outright. Whatever has been found by then is
+    returned — a shorter candidate list still produces a picture, where waiting produces nothing.
+    """
+    # Order is reliability, not preference: Commons is fast and always up, Pexels is fast and rich (and a no-op
+    # without a key), Openverse is the one that read-times-out from Render, so it goes last and is often skipped
+    # by the circuit breaker before it costs anything.
+    searchers = searchers if searchers is not None else [search_commons, search_pexels, search_openverse]
     used = used or set()
     seen, out = set(), []
     for q in [q for q in queries if q and q.strip()][:3]:
+        if deadline and time.time() > deadline:
+            if errors is not None:
+                errors.append("photo search hit its time budget")
+            break
         for s in searchers:
+            name = getattr(s, "__name__", "search")
+            if time.time() - _source_dead.get(name, 0) < _SOURCE_COOLDOWN:
+                continue
             try:
                 for c in s(q.strip()):
                     key = c["image_url"]
@@ -293,8 +360,11 @@ def candidates(queries: List[str], *, searchers: Optional[List[Callable]] = None
                         seen.add(key)
                         out.append(c)
             except Exception as e:  # noqa: BLE001
+                if _timed_out(e):
+                    _source_dead[name] = time.time()
                 if errors is not None:
-                    errors.append(f"{getattr(s, '__name__', 'search')}('{q[:40]}'): {type(e).__name__}")
+                    errors.append(f"{name}('{q[:40]}'): {type(e).__name__}"
+                                  + (" - skipping this source for 10 min" if _timed_out(e) else ""))
 
     def rank(c):
         w, h = c.get("width") or 0, c.get("height") or 1
@@ -480,7 +550,12 @@ def judge(cands: List[Dict[str, Any]], want: str, title: str, *, vision: Callabl
 
 def photo_credit(c: Dict[str, Any]) -> str:
     who = c.get("creator") or "Unknown photographer"
-    return f"Photo: {who} / {c.get('source') or 'Wikimedia Commons'}, {c.get('license') or 'open licence'}"
+    site = c.get("source") or "Wikimedia Commons"
+    lic = c.get("license") or "open licence"
+    # "Jane Doe / Pexels, Pexels licence" reads badly; the site name already carries the licence there.
+    if site.lower() in lic.lower():
+        return f"Photo: {who} / {site}"
+    return f"Photo: {who} / {site}, {lic}"
 
 
 # The writer plans precise, proper-noun queries ("Tata Sons board meeting", "State Bank of India data center").
@@ -536,7 +611,7 @@ def widen_queries(item: Dict[str, Any], title: str) -> List[str]:
 
 def find_photo(item: Dict[str, Any], title: str, used: set, *, search: Callable = candidates,
                pick: Callable = judge, fetch: Callable = _http_bytes, errors: Optional[List[str]] = None,
-               slug: str = "") -> Optional[Dict[str, Any]]:
+               slug: str = "", deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """{bytes, meta} for a real, openly licensed photo for this slot, or None.
 
     Two paths, deliberately scored differently (2026-10-27):
@@ -557,12 +632,12 @@ def find_photo(item: Dict[str, Any], title: str, used: set, *, search: Callable 
     if not queries:
         queries = widen_queries(item, title)
 
-    cands = search(queries, used=used, errors=errors)
+    cands = search(queries, used=used, errors=errors, deadline=deadline)
     widened: List[str] = []
     if not cands and precise:
         widened = [q for q in widen_queries(item, title) if q not in queries]
         if widened:
-            cands = search(widened, used=used, errors=errors)
+            cands = search(widened, used=used, errors=errors, deadline=deadline)
     if not cands:
         if errors is not None:
             errors.append(f"no open-licensed photo found for: {', '.join(queries + widened)[:160]}")
@@ -684,9 +759,10 @@ def make_images(supabase, slug: str, art: Dict[str, Any], *, title: str = "", ge
     #    photos other posts already use, so a picture does not repeat across the archive.
     if "photos" in order:
         used: set = recent_photo_urls(supabase)
+        deadline = time.time() + PHOTO_BUDGET_S
         for idx, (role, n, item) in enumerate(jobs):
             try:
-                got = photo(item, title, used, errors=out["errors"], slug=slug)
+                got = photo(item, title, used, errors=out["errors"], slug=slug, deadline=deadline)
                 if got:
                     m = got["meta"]
                     results[idx] = _save(supabase, slug, item, role, n, got["bytes"], upload=upload, extra={
@@ -763,11 +839,14 @@ def art_plan(chat: Callable, article: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================================ diagnostics
 def diagnose(supabase, *, generate: bool = True) -> Dict[str, Any]:
     """What works right now, for Admin -> Growth: photo search, the Gemini judge, generation, storage."""
-    rep: Dict[str, Any] = {"order": picture_order(), "gemini_key": available()}
+    rep: Dict[str, Any] = {"order": picture_order(), "gemini_key": available(),
+                           "pexels": bool((os.getenv("PEXELS_API_KEY") or "").strip())}
     errs: List[str] = []
     try:
+        _source_dead.clear()  # a diagnostic should test every source, not inherit a cooldown
         cs = candidates(["Gateway of India Mumbai"], errors=errs)
         rep["photo_search"] = {"ok": bool(cs), "found": len(cs), "errors": errs[:4],
+                               "sources": sorted({c.get("source") for c in cs if c.get("source")}),
                                "example": ({k: cs[0].get(k) for k in ("title", "source", "license", "page_url")} if cs else None)}
     except Exception as e:  # noqa: BLE001
         rep["photo_search"] = {"ok": False, "errors": [f"{type(e).__name__}: {str(e)[:160]}"]}
