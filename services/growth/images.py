@@ -188,7 +188,12 @@ _BAD_TITLE = re.compile(r"\b(logo|logos|map|maps|flag|coat of arms|emblem|diagra
                         r"commissioner|ambassador|delegation|"
                         r"press conference|press meet|speaking|speech|addressing|interview|"
                         r"award|awards|ceremony|felicitation|inauguration|summit|conclave|visit|meeting with|"
-                        r"protest|rally|strike|funeral|accident|disaster)\b", re.I)
+                        r"protest|rally|strike|funeral|accident|disaster|"
+                        # War and conflict: the topic picker already refuses these as story subjects, and the
+                        # picture search must not smuggle one back in. Live example that made this necessary:
+                        # a Starlink article's second Wikipedia hit was "Starlink in the Russo-Ukrainian war",
+                        # whose lead image is two politicians holding a user terminal.
+                        r"war|wartime|conflict|invasion|military|troops?|soldiers?|ukrain\w*|russo[- ]\w+)\b", re.I)
 
 
 def _http_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -292,6 +297,110 @@ def _timed_out(e: Exception) -> bool:
     return any(k in type(e).__name__.lower() for k in ("timeout", "connection"))
 
 
+def search_wikipedia(query: str, *, http: Callable = _http_json, limit: int = 3) -> List[Dict[str, Any]]:
+    """The lead image of the Wikipedia article that matches this subject. No key, no signup.
+
+    This is the right tool for exactly the queries that were failing. The writer plans proper-noun subjects —
+    "Tata Sons building Mumbai", "Reserve Bank of India Mumbai headquarters", "Jawaharlal Nehru Port" — and a
+    full-text search of Commons is bad at finding the one good photograph of a named thing among thousands of
+    loosely tagged files. Wikipedia has already done that curation: a notable company, building, port or city has
+    a lead image chosen by editors, and it is hosted on Commons with a real licence.
+
+    Two calls: Wikipedia search + page image, then Commons imageinfo for the licence (reusing the same
+    extmetadata parsing and the same licence filter as search_commons, so nothing unlicensed can slip in).
+
+    Note the logo hazard: a company's Wikipedia page image is often its wordmark. `_BAD_TITLE` rejects anything
+    with "logo"/"emblem" in the file name, and the mime filter drops SVG, which is what most wordmarks are.
+    """
+    data = http("https://en.wikipedia.org/w/api.php", {
+        "action": "query", "format": "json", "generator": "search", "gsrsearch": query,
+        "gsrnamespace": 0, "gsrlimit": limit, "prop": "pageimages", "piprop": "original|name",
+    })
+    pages = ((data or {}).get("query") or {}).get("pages") or {}
+    pages = list(pages.values()) if isinstance(pages, dict) else list(pages)
+    pages.sort(key=lambda p: p.get("index", 0))
+    files = [(p.get("pageimage"), p.get("title")) for p in pages if p.get("pageimage")]
+    if not files:
+        return []
+
+    # ONLY Wikipedia's own top-ranked article. Taking the second and third results is how a live run answered
+    # "Bombay Stock Exchange" with a photograph of the New York Stock Exchange and "Jawaharlal Nehru Port" with
+    # a suburban train: those pages are related to the query but are not the subject.
+    fname, article = files[0]
+
+    # ...and the top article still has to be about what was asked for. Half the query's meaningful words is the
+    # right bar, not more: the writer's queries are wordier than article titles ("Tata Sons Bombay House" vs the
+    # article "Bombay House"), so a stricter threshold threw away correct matches.
+    q_t = _tokens(query)
+    if not q_t or len(q_t & _tokens(article or "")) / len(q_t) < 0.5:
+        return []
+
+    # imageinfo from en.wikipedia, not commons.wikimedia: enwiki serves metadata for Commons-hosted files AND
+    # for files hosted locally, so asking Commons directly silently missed the local ones.
+    info = http("https://en.wikipedia.org/w/api.php", {
+        "action": "query", "format": "json", "titles": f"File:{fname}",
+        "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 1920,
+    })
+    pages2 = ((info or {}).get("query") or {}).get("pages") or {}
+    pages2 = list(pages2.values()) if isinstance(pages2, dict) else list(pages2)
+    if not pages2:
+        return []
+    ii = (pages2[0].get("imageinfo") or [{}])[0]
+    meta = ii.get("extmetadata") or {}
+    lic = _strip_html((meta.get("LicenseShortName") or {}).get("value") or "")
+    title = re.sub(r"^File:", "", fname).replace("_", " ").rsplit(".", 1)[0]
+
+    if ii.get("mime") not in ("image/jpeg", "image/png", "image/webp") or not license_ok(lic):
+        return []
+    if _BAD_TITLE.search(title) or _BAD_TITLE.search(article or ""):
+        return []
+    # 640, not the 900 the generic searches use. Relevance is already guaranteed here — this is the lead image
+    # of the article about the exact subject — so the trade-off flips: a slightly soft but correct photograph of
+    # Bombay House (808 px) or Jawaharlal Nehru Port (700 px) beats no photograph, and both were being discarded.
+    if (ii.get("width") or 0) < 640:
+        return []
+
+    big = ii.get("thumburl") or ii.get("url") or ""
+    return [{
+        # The article name is a far better relevance signal than the file name: heuristic_pick scores the title,
+        # and "Bombay House" tells it more than "Bombay house mast.jpg" does.
+        "source": "Wikimedia Commons", "title": f"{article} — {title}"[:160],
+        "page_url": ii.get("descriptionurl") or "", "image_url": big,
+        "thumb_url": _commons_thumb(ii.get("url") or big, 500),
+        "width": ii.get("width"), "height": ii.get("height"), "license": lic,
+        "license_url": _strip_html((meta.get("LicenseUrl") or {}).get("value") or ""),
+        "creator": _strip_html((meta.get("Artist") or {}).get("value") or "")[:120],
+    }]
+
+
+def search_pixabay(query: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+    """Pixabay — the same role as Pexels, a different free key. Set PIXABAY_API_KEY; no key means a clean no-op.
+
+    Added because Pexels paused new API-key issuance on 2026-10-27. Whichever of the two you can actually get a
+    key for, the chain works; with neither, Commons and Wikipedia carry it.
+    """
+    key = (os.getenv("PIXABAY_API_KEY") or "").strip()
+    if not key:
+        return []
+    data = _http_json("https://pixabay.com/api/", {
+        "key": key, "q": query, "image_type": "photo", "orientation": "horizontal",
+        "per_page": max(3, limit), "safesearch": "true",
+    })
+    out = []
+    for h in (data or {}).get("hits") or []:
+        title = (h.get("tags") or "").strip()
+        if not title or _BAD_TITLE.search(title) or (h.get("imageWidth") or 0) < 900:
+            continue
+        out.append({
+            "source": "Pixabay", "title": title, "page_url": h.get("pageURL") or "",
+            "image_url": h.get("largeImageURL") or "", "thumb_url": h.get("webformatURL") or "",
+            "width": h.get("imageWidth"), "height": h.get("imageHeight"),
+            "license": "Pixabay licence", "license_url": "https://pixabay.com/service/license-summary/",
+            "creator": (h.get("user") or "")[:120],
+        })
+    return [c for c in out if c["image_url"] and c["thumb_url"]]
+
+
 def search_pexels(query: str, *, limit: int = 15) -> List[Dict[str, Any]]:
     """Pexels — free API key, no payment, and far deeper coverage of business subjects than Commons.
 
@@ -338,10 +447,16 @@ def candidates(queries: List[str], *, searchers: Optional[List[Callable]] = None
     (`_source_dead`), and the caller's `deadline` stops the sweep outright. Whatever has been found by then is
     returned — a shorter candidate list still produces a picture, where waiting produces nothing.
     """
-    # Order is reliability, not preference: Commons is fast and always up, Pexels is fast and rich (and a no-op
-    # without a key), Openverse is the one that read-times-out from Render, so it goes last and is often skipped
-    # by the circuit breaker before it costs anything.
-    searchers = searchers if searchers is not None else [search_commons, search_pexels, search_openverse]
+    # Order is precision first, then reliability:
+    #   wikipedia  the curated lead image of the named subject — the most likely to be the right photo, keyless
+    #   commons    full-text search of the same corpus, for everything Wikipedia has no article for
+    #   pexels     rich editorial stock; no-op without a key (issuance was paused 2026-10-27)
+    #   pixabay    the same role, a different free key; no-op without one
+    #   openverse  last: it is the source that read-times-out from Render, and the circuit breaker usually
+    #              skips it before it costs anything
+    searchers = searchers if searchers is not None else [
+        search_wikipedia, search_commons, search_pexels, search_pixabay, search_openverse,
+    ]
     used = used or set()
     seen, out = set(), []
     for q in [q for q in queries if q and q.strip()][:3]:
@@ -840,7 +955,8 @@ def art_plan(chat: Callable, article: Dict[str, Any]) -> Dict[str, Any]:
 def diagnose(supabase, *, generate: bool = True) -> Dict[str, Any]:
     """What works right now, for Admin -> Growth: photo search, the Gemini judge, generation, storage."""
     rep: Dict[str, Any] = {"order": picture_order(), "gemini_key": available(),
-                           "pexels": bool((os.getenv("PEXELS_API_KEY") or "").strip())}
+                           "pexels": bool((os.getenv("PEXELS_API_KEY") or "").strip()),
+                           "pixabay": bool((os.getenv("PIXABAY_API_KEY") or "").strip())}
     errs: List[str] = []
     try:
         _source_dead.clear()  # a diagnostic should test every source, not inherit a cooldown
