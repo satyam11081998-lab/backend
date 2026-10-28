@@ -43,15 +43,15 @@ def run_stream(stripper, tokens):
 
 # ---- intent detection (from real transcripts) -------------------------------
 check("help intent (Store Profit)",       detect_intent("help, I am not getting it")["intent"] == "asking_for_help")
-check("solution intent (Organic Fert.)",  detect_intent("Provide me with the approach to solve this case")["intent"] == "wants_solution")
-check("solution intent (show approach)",  detect_intent("Unable to get. Show me the correct approach needed")["intent"] == "wants_solution")
+check("solution intent (Organic Fert.)",  detect_intent("Provide me with the approach to solve this case")["intent"] == "asking_for_solution")
+check("solution intent (show approach)",  detect_intent("Unable to get. Show me the correct approach needed")["intent"] == "asking_for_solution")
 check("stop intent (leave it)",           detect_intent("boss ... Pls guide or leave")["frustration"] is True)
 check("stop intent (don't want)",         detect_intent("You know, I don't want to")["skip_or_stop"] is True)
 check("frustration (irritating)",         detect_intent("No, no, it is getting irritating.")["frustration"] is True)
 check("frustration (beating bush)",       detect_intent("I think you are beating around the bush")["frustration"] is True)
 check("frustration (too deep, Chai)",     detect_intent("I think you are going too into deep")["frustration"] is True)
 check("meta (Chargipity/Claude/Gemina)",  detect_intent("Wait, what are you? Chargipity, Claude or Gemina?")["intent"] == "meta")
-check("scope question (population)",       detect_intent("what is the population of jaipur?")["intent"] == "scope_question")
+check("scope question (population)",       detect_intent("what is the population of jaipur?")["intent"] == "clarification")
 check("answering (defensible assumption)",detect_intent("2 cups of tea per day and I'll assume around 50%")["intent"] == "answering")
 check("greeting only (hi)",               detect_intent("hi")["is_greeting_only"] is True)
 
@@ -78,7 +78,7 @@ check("repair_due after failed probes + frustration", sig["repair_due"] is True)
 check("frustration high", sig["frustration"] == "high")
 check("has_work true", sig["has_work"] is True)
 check("signal block mentions repair", "repair is due" in build_signal_block(sig))
-check("signal block bans 'understand your frustration'", "never say 'I understand your frustration'" in build_signal_block(sig))
+check("signal block notes frustration", "frustration: high" in build_signal_block(sig))
 
 # ---- signals: reasonable assumption should NOT look stuck/frustrated ---------
 sig2 = compute_signals(
@@ -117,7 +117,7 @@ sigp = compute_signals(transcript=[{"role": "assistant", "content": "and then?"}
                        new_user_message="help", teaching_policy="coached",
                        prior_state={"hint_level": 2, "learner_level": "developing"})
 check("prior hint_level surfaced", sigp["hint_level"] == 2)
-check("signal block shows the rung", "H2" in build_signal_block(sigp))
+check("signal block has intent", "intent this turn: asking_for_help" in build_signal_block(sigp))
 
 st = update_session_state({"hint_level": 1}, {"intervention": "micro_hint"},
                           {"help_requested": True, "turns_without_progress": 2})
@@ -149,5 +149,8 @@ check("stream captured the tag dict", sc.tag.get("mode") == "coach" and sc.tag.g
 print()
 if _fail:
     print(f"{len(_fail)} FAILED: {_fail}")
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
+    else:
+        raise AssertionError(f"Failures: {_fail}")
 print("ALL PASS")

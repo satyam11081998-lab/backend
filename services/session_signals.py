@@ -67,8 +67,8 @@ _INTERROGATIVE = (
     "will",
 )
 _DIRECTIVES = (
-    "tell me", "give me", "explain", "share", "what is", "what's", 
-    "how much", "how many", "can you", "could you", "provide", "clarify",
+    "tell me", "give me", "explain to me", "share the", "share with", "please share", 
+    "provide the", "provide me", "please provide", "clarify",
     "i need to know", "let me know"
 )
 _GREETING = ("hi", "hii", "hello", "hey", "ok", "okay", "start", "let's start",
@@ -635,11 +635,24 @@ _HELP_WORD_RE = re.compile(
     r"|\bhelp me(?: out| here| with this| please)?[\s.!?]*$|\bhelp me (?:with|out|here|please|pls|start|understand|structure|solve)\b")
 
 
+# "not helping" has to be aimed at the INTERVIEWER, not used as ordinary case analysis. As a bare substring it
+# fired on "the current pricing strategy is not helping the client retain customers" - a completely normal
+# sentence in a profitability case - and the interviewer would abandon the case to hand out a hint. It counts
+# only with a second-person subject ("you're not helping"), an explicit object ("not helping me"), or when the
+# utterance trails off on it ("...round and round, not helping").
+_NOT_HELPING_RE = re.compile(
+    r"(?:\b(?:you(?:'?re| are)?|u|ur|this|that|it)\s+(?:is\s+|are\s+)?not\s+helping\b)"
+    r"|(?:\bnot\s+helping\s+(?:me|us|at all)\b)"
+    r"|(?:\bnot\s+helping\s*[.!]*\s*$)")
+
+
 def _help_hit(t: str) -> bool:
     """_HELP phrases, with 'help' itself counted only as a request (V12.1)."""
     if _HELP_WORD_RE.search(t):
         return True
     if len(t.split()) <= 4 and re.search(r"\bhelp\b", t):
+        return True
+    if _NOT_HELPING_RE.search(t):
         return True
     return any(n in t for n in _HELP if n != "help")
 
@@ -726,6 +739,18 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
 
     # V10.2: Fixed historic memory bug. has_work is evaluated ONLY on the current turn to prevent infinite acks.
     has_work = (len(new_norm) > 60 or bool(re.search(r"\d", new_norm)) or _has_any(new_norm, _WORK_MARKERS))
+
+    # V12.1 (2026-10-28): has_work being current-turn-only is correct for deciding whether to acknowledge, and
+    # wrong for deciding how to HELP. "help na i'm not getting this at all" and "i've got the demand but i'm
+    # stuck on what to do next" both read has_work=False, so a candidate who had already solved an equation or
+    # computed a demand figure was offered a from-scratch restart instead of a hint tied to their own numbers.
+    # Both failed the behavioural eval on BOTH models, which is what gives it away as a signal bug rather than a
+    # model one. prior_work is session-level and purely additive: nothing that reads has_work changes.
+    def _is_worky(t: str) -> bool:
+        # Deliberately stricter than has_work: a figure or an explicit work marker, never mere length.
+        return bool(re.search(r"\d", t)) or _has_any(t, _WORK_MARKERS)
+
+    prior_work = any(_is_worky(t) for t in cand)
     
     recent_probes = sum(1 for a in asst[-3:] if a.endswith("?"))
     interviewer_repeating = len(asst) >= 2 and (_similar(asst[-1], asst[-2]) or asst[-1] in asst[:-1])
@@ -907,6 +932,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "is_scope_question": intent["intent"] == "clarification",
         "looks_garbage": intent["looks_garbage"],
         "has_work": has_work,
+        "prior_work": prior_work,
         "is_affirmation_only": is_affirmation_only,
         "recent_probes": recent_probes,
         "interviewer_repeating": interviewer_repeating,
@@ -1019,7 +1045,14 @@ def build_signal_block(signals: Dict[str, Any]) -> str:
     lines.append(f"- case phase: {signals.get('case_phase', 'unknown')}")
     lines.append(f"- progress status: {signals.get('progress', 'unknown')}")
     
-    lines.append("- learner has real work on the table already" if signals.get("has_work") else "- learner has put little/nothing concrete down yet")
+    if signals.get("has_work"):
+        lines.append("- learner has real work on the table already")
+    elif signals.get("prior_work"):
+        # The distinction that matters when they ask for help: they are not starting from nothing.
+        lines.append("- learner put real work down in EARLIER turns (nothing concrete this turn)"
+                     " -> build any hint on THEIR numbers; do NOT restart from scratch")
+    else:
+        lines.append("- learner has put little/nothing concrete down yet")
     if signals.get("repair_due"):
         lines.append("- YOUR RECENT MOVES ARE NOT WORKING -> repair is due: stop probing, change strategy.")
     if signals.get("turns_without_progress", 0) >= 2:
