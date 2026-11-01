@@ -71,12 +71,20 @@ DEFAULT_TIER = "free"
 # 2. The system note seeded as the first row of every attempt. The interviewer reads
 #    it on every turn (and the variants differ in how they treat a system turn), so a
 #    conversation without it is not the production conversation.
-def opening_transcript(case: Dict[str, Any]) -> List[Dict[str, str]]:
-    return [{
-        "role": "system",
-        "kind": "system_note",
-        "content": f"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the full brief. Ask any clarifying questions before structuring.",
-    }]
+def opening_transcript(case: Dict[str, Any], mode: str = "whiteboard") -> List[Dict[str, str]]:
+    """The row production seeds at the top of every attempt.
+
+    Must stay byte-identical to routes/attempts.py::_start_or_resume -- an arena turn
+    that opens on a different first line is measuring a different conversation.
+    tests/test_arena_parity.py asserts both halves against that source.
+    """
+    brief = f"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the full brief."
+    note = (
+        f"{brief} This is a scored interview — the interviewer will not help you, and this attempt is ranked."
+        if mode == "interview"
+        else f"{brief} Ask any clarifying questions before structuring. Your structure is drawn on the right as you work; this run is practice and isn't ranked."
+    )
+    return [{"role": "system", "kind": "system_note", "content": note}]
 
 
 def _require_admin(authorization: Optional[str]) -> str:
@@ -331,8 +339,12 @@ def start_session(
         "teaching_policy": body.teaching_policy,
         "model_mode": body.model_mode,
         # What a real attempt starts with. The client seeds BOTH arms with it, so
-        # every turn the interviewer reads the same conversation production would.
-        "opening_transcript": opening_transcript(case),
+        # every turn the interviewer reads the same conversation production would --
+        # including the note, which is per mode since 0076. Seeding the Whiteboard note
+        # into an exam run would have both arms reading an opening line no exam candidate
+        # is ever shown.
+        "opening_transcript": opening_transcript(
+            case, "interview" if body.teaching_policy == "exam" else "whiteboard"),
         "clarification": {
             "tier": body.tier,
             "quota": CLARIFICATION_QUOTA[body.tier],
@@ -764,6 +776,7 @@ def scenario_case_content(case_type: str) -> str:
 @router.get("/case")
 def arena_case(
     case_id: str,
+    teaching_policy: str = "coached",
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     """One case with its brief, plus the opening note every real attempt starts with
@@ -785,7 +798,8 @@ def arena_case(
             "difficulty": case.get("difficulty"),
             "content": case.get("content"),
         },
-        "opening_transcript": opening_transcript(case),
+        "opening_transcript": opening_transcript(
+            case, "interview" if teaching_policy == "exam" else "whiteboard"),
     }
 
 

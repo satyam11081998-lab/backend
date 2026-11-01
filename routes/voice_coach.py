@@ -33,6 +33,13 @@ from prompts.voice_interviewer_playbook import build_voice_interviewer_instructi
 router = APIRouter()
 
 
+def _resolve_policy(attempt: Dict[str, Any], case: Dict[str, Any]) -> str:
+    # One definition, in routes/attempts.py. Imported lazily for the same reason
+    # _attempt_ctx does: these two modules import each other.
+    from routes.attempts import _resolve_policy as _rp
+    return _rp(attempt, case)
+
+
 def _attempt_ctx(supabase, attempt_id: str, user_id: str):
     # Same owner / availability checks as /messages and /voice-decision.
     from routes.attempts import _load_attempt, _load_case, _fetch_transcript
@@ -66,7 +73,7 @@ def voice_coach(attempt_id: str, authorization: Optional[str] = Header(default=N
         attempt, case, transcript = _attempt_ctx(supabase, attempt_id, user_id)
         session_state = attempt.get("session_state") or {}
         notes, _sig = vc.coach_notes(transcript, attempt, session_state,
-                                     (case.get("teaching_policy") or "coached"))
+                                     _resolve_policy(attempt, case))
         v = vc.voice_state(session_state)
         changed = notes != list(v.get("coach_notes") or [])
         if changed:
@@ -108,15 +115,21 @@ def voice_tool(attempt_id: str, body: VoiceToolRequest, authorization: Optional[
         attempt, case, transcript = _attempt_ctx(supabase, attempt_id, user_id)
         session_state = attempt.get("session_state") or {}
         content = llm_case_content(case)
-        if body.name == "get_hint":
+        if body.name not in ("get_hint", "answer_request"):
+            raise HTTPException(status_code=400, detail=f"Unknown tool: {body.name}")
+        # Interview mode has no hint ladder and no answer rule. Gated here, at the
+        # boundary, because the speech model can call these tools whatever the prompt
+        # says -- and a hint handed over in a scored run invalidates the score.
+        if _resolve_policy(attempt, case) == "exam":
+            output, v = vc.exam_refusal(body.name, session_state)
+            answer_given = False
+        elif body.name == "get_hint":
             output, v = vc.hint(case, content, transcript, session_state,
                                 reason=str(args.get("reason") or ""),
                                 where_stuck=str(args.get("where_stuck") or "")[:200], user_id=user_id)
             answer_given = False
-        elif body.name == "answer_request":
-            output, v, answer_given = vc.answer_request(case, content, transcript, session_state, user_id=user_id)
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown tool: {body.name}")
+            output, v, answer_given = vc.answer_request(case, content, transcript, session_state, user_id=user_id)
         _save_state(supabase, attempt_id, vc.with_voice_state(session_state, v))
     print(f"[voice_coach] tool={body.name} attempt={attempt_id} hint_level={v.get('hint_level')} "
           f"answer_requests={v.get('answer_requests')} answer_given={answer_given}")

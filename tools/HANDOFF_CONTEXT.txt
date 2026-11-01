@@ -1,0 +1,87 @@
+================================================================================
+HANDOFF CONTEXT — Interviewer Eval & Signal Fixes
+Updated: 2026-10-28 ~19:47 IST
+From: Antigravity (continuing Claude's session)
+================================================================================
+
+STATUS SUMMARY
+==============
+
+1. OPENAI API KEY — FIXED & VERIFIED WORKING
+   Both .env files updated with active OpenAI key:
+     - D:\dev\mece\consilio-backend\.env
+     - D:\dev\mece\consilio-backend-candidate\.env
+
+2. OFFLINE EVAL — 50/50 (100%) PASS
+   All 50 deterministic scenarios in tools/eval_interviewer_behavior.py
+   now pass with 0 signal mismatches.
+
+3. UNIT TESTS — PASSING
+   - tests/test_session_signals.py: ALL PASS (0 failures)
+   - tests/test_v121_real_sessions.py: 130 passed (0 failures)
+   - tests/test_v121_arena_adversarial.py: 190 passed
+   - tests/test_response_functions.py: passed
+   - tests/test_voice_lane.py: passed
+   - tests/test_learning_model.py: passed
+
+4. MODEL A/B EVAL DECISION — SETTLED: STAY ON gpt-4o-mini
+   3-run comparison on the full 50-scenario adversarial matrix:
+                     gpt-4o-mini              gpt-4o
+   Run 1:           45/50 (90%)              46/50 (92%)
+   Run 2:           47/50 (94%)              48/50 (96%)
+   Run 3:           47/50 (94%)              45/50 (90%)
+   ─────────────────────────────────────────────────────
+   Mean:            92.7%                    92.7%
+   Spread:          4%                       6%
+
+   Identical mean performance. gpt-4o is 15x more expensive and has
+   wider variance (6% vs 4%). Production toggle should remain on mini.
+
+================================================================================
+CHANGES MADE & VERIFIED
+================================================================================
+
+a) services/session_signals.py
+   - `prior_work` added: evaluates candidate history so a candidate who did
+     work in earlier turns gets hints on their own numbers rather than a
+     generic from-scratch restart.
+   - `_HELP` extended: added "not helping" so candidate frustration with
+     unhelpful loops correctly triggers asking_for_help intent.
+   - `_DIRECTIVES` cleaned: removed bare "share", "how much", "how many"
+     which caused false-positive directive matches on valid business phrases
+     ("market share", "urban share", "need to see how many units").
+
+b) tools/eval_interviewer_behavior.py
+   - Added `--runs N` flag for multi-run evaluations reporting mean, range,
+     spread, and always-fail vs intermittent classification.
+   - Cleaned scenario requirements for `explain_why_meta` and
+     `own_facts_competitors` so the LLM judge grades the semantic behaviour
+     rather than failing replies for omitting literal parenthetical examples.
+   - Updated stale scenario `expect_signals` to match modern intent vocabulary:
+     * `asking_for_solution` (replacing obsolete `wants_solution`)
+     * `clarification` + `is_scope_question: True` (replacing `scope_question`)
+     * `prior_work: True` (accompanying current-turn `has_work: False`)
+   - Added Windows cp1252 fallback encoding in `_Tee` to avoid crash on unicode
+     arrows or special characters.
+
+c) tests/test_session_signals.py
+   - Updated assertions to match modern intent vocabulary.
+   - Cleaned test exit so pytest can collect and run without SystemExit abort.
+
+================================================================================
+REMAINING ROADMAP
+================================================================================
+
+1. Live Eval with the Fixed Scenarios:
+   Run 1 quick check on gpt-4o-mini:
+     python -m tools.eval_interviewer_behavior --live --model gpt-4o-mini
+   Expect score to land at ~94-96% now that explain_why_meta and
+   own_facts_competitors judging ambiguities are resolved.
+
+2. Insights Backfill:
+   Stalled at 15 of 27 when previous browser session ended. Re-run when ready.
+
+3. Multi-Turn / Session Evaluation:
+   Expand tester program to evaluate multi-turn drift and voice latency
+   rather than single-turn snapshot adversarial checks alone.
+================================================================================

@@ -1,0 +1,355 @@
+
+####################################################################
+# RUN 1 of 3
+####################################################################
+LIVE eval - 50 scenarios | interviewer=gpt-4o | judge=gpt-4o (best-of-3) | 5 in parallel
+====================================================================
+
+[ 1/50] FAIL  help_when_stuck_with_work  (profitability)
+      user:  "help na i'm not getting this at all"
+      reply: "Your calculation is correct, and S comes to approximately 2.67 crore. Let's use that value of S now to continue with the next step in your analysis or calculations. Keep going from there."
+      judge: The interviewer confirmed the candidate's calculation without providing a directional hint tied to the candidate's equation.   votes=0/3
+
+[ 2/50] PASS  reasonable_assumption_stands  (guesstimate)
+      user:  "ok so i'll say maybe 2 cups a day per person and like 50% of people actually drink chai"
+      reply: "You're estimating 2 cups a day for those who drink chai, with about 50% of people participating. Keep going with these numbers to estimate the total daily consumption."
+      judge: The interviewer allowed the assumption to stand and encouraged the candidate to continue with their estimation.   votes=3/3
+
+[ 3/50] PASS  material_unit_error  (guesstimate)
+      user:  "so 46 cr bottles a month into 12 thats 552 cr litres a year, final answer"
+      reply: "The bottles turned into litres without a conversion step. If 46 crore bottles is a count of bottles, how many litres does each bottle hold?"
+      judge: The interviewer correctly identified the error and asked a targeted question about the conversion from bottles to litres.   votes=3/3
+
+[ 4/50] FAIL  wants_to_stop_frustrated  (profitability)
+      user:  "ugh this is getting irritating, leave it na i don't want to continue"
+      reply: "You can end the session by tapping Submit at the top right corner. This will let you see your score, feedback, and the full worked answer. If you decide to revisit it later or need any further guidanc"
+      judge: Interviewer continued to provide guidance instead of acknowledging and closing with a statement.   votes=0/3
+
+[ 5/50] PASS  wants_solution_outright  (growth)
+      user:  "yaar not able to solve, just provide me with the approach na"
+      reply: "Certainly. For a growth case focused on MECE, we often look at it in a structured way:
+
+Current market size
+→ Growth potential (new customers, increased usage)
+→ Competitor landscape
+→ Internal capabi"
+      judge: The interviewer provided a structured approach and handed back the problem to the candidate.   votes=3/3
+
+[ 6/50] PASS  repair_after_interviewer_repeat  (guesstimate)
+      user:  "i mean WHAT are we even solving, whats the question"
+      reply: "Let's focus on estimating the size of a market. What market would you like to estimate, or should I suggest one for us to work on?"
+      judge: The interviewer repaired by restating the task and offering a foothold.   votes=3/3
+
+[ 7/50] PASS  meta_identity_probe  (profitability)
+      user:  "wait hold on are you chatgpt or claude or something?"
+      reply: "I'm here to help you work through this case, just like an interviewer would. Let's focus on the profitability case at hand."
+      judge: The interviewer deflected the identity question and returned focus to the case.   votes=3/3
+
+[ 8/50] PASS  scope_question_own_facts  (guesstimate)
+      user:  "whats the population of the city roughly?"
+      reply: "The population of the city is approximately 10 million."
+      judge: The interviewer provided a specific realistic number as required.   votes=3/3
+
+[ 9/50] PASS  voice_noise_asr  (guesstimate)
+      user:  "haan toh ummmmm"
+      reply: "Could you restate that for me? I'm here to help."
+      judge: Interviewer correctly asked the candidate to restate without analyzing 'ummmmm'.   votes=3/3
+
+[10/50] PASS  minor_error_do_not_nitpick  (guesstimate)
+      user:  "so roughly 10 crore households, i'll round to that"
+      reply: "That's a solid starting point with the 10 crore households. Now, let's think about the next step in estimating the market size."
+      judge: The interviewer advanced the conversation without derailing to correct trivial rounding.   votes=3/3
+
+[11/50] PASS  good_answer_should_advance  (profitability)
+      user:  "so i'd split cost into fixed and variable and see which line moved, my guess is variable, raw material"
+      reply: "You're separating costs into fixed and variable, focusing on the change in variable costs, particularly raw materials. Next, compare the current variable costs with past figures to see if they have in"
+      judge: The interviewer acknowledged the candidate's approach and pushed them to the next step without effusive praise.   votes=3/3
+
+[12/50] PASS  frustration_change_strategy  (guesstimate)
+      user:  "see this is what i mean, you're going round and round, not helping"
+      reply: "Let's simplify and start from the top. We'll estimate something like the number of households in India by breaking it down: we can consider the total population, divide by average household size to ge"
+      judge: The interviewer changed strategy by simplifying the problem and breaking it down into smaller steps.   votes=3/3
+
+[13/50] PASS  stuck_early_no_work  (guesstimate)
+      user:  "honestly i have no idea how to even start this"
+      reply: "Let's break it down step by step. We'll start with a bottom-up approach, focusing on one city.
+
+Think about it this way:
+Assume an average number of electric vehicles (EVs) per household
+→ Estimate ho"
+      judge: The interviewer provided a small foothold by anchoring the population and guided the candidate through a structured approach.   votes=3/3
+
+[14/50] PASS  double_count_error  (guesstimate)
+      user:  "and then i'll also add the whole city population eating out, add all of them up"
+      reply: "The whole city population already includes the families, singles, and office-goers you've counted. Adding it again would double count them. How can you adjust your approach to avoid counting the same "
+      judge: The interviewer correctly identified and addressed the double-counting issue.   votes=3/3
+
+[15/50] PASS  rubber_stamp_weak_reasoning  (profitability)
+      user:  "i think its just because the market is bad and competition, thats it"
+      reply: "Let's simplify the task. The goal is to understand why profitability has been affected. We should break it down into clear parts: revenues and costs. By looking at these separately, we can pinpoint ex"
+      judge: The interviewer pushed for structure and specifics by breaking down the problem into revenues and costs.   votes=3/3
+
+[16/50] PASS  factor_1000_unit_error  (guesstimate)
+      user:  "so total is 5 crore ml which is like 5 crore litres for the whole city, done"
+      reply: "There's a unit issue here: 5 crore ml is actually 50,000 litres, not 5 crore litres. How does this affect your final estimate?"
+      judge: The interviewer correctly identified and addressed the unit conversion error.   votes=3/3
+
+[17/50] PASS  tiny_arithmetic_slip_ignore  (guesstimate)
+      user:  "so 12 into 4 is about 46, call it 46 lakh roughly"
+      reply: "You've got 46 lakh as a result."
+      judge: Interviewer correctly did not stop to correct the candidate's calculation.   votes=3/3
+
+[18/50] PASS  confidently_wrong_penetration  (guesstimate)
+      user:  "obviously its 100%, everyone in india buys this daily, so demand is 140 crore units a day"
+      reply: "Aiming for 100% penetration means every person in India, including infants and the elderly, buys this every day. Does that seem realistic?"
+      judge: The interviewer challenged the 100% penetration assumption with a targeted question.   votes=3/3
+
+[19/50] PASS  correct_but_uncertain_do_not_derail  (guesstimate)
+      user:  "umm i think its around 20 lakh, not fully sure but that feels about right"
+      reply: "Sure, 20 lakh is a fine working number for now. Next, think about what factors might break this into smaller parts or drive it up or down. What segments or components could we consider here?"
+      judge: Interviewer affirmed the candidate's estimate and guided them to consider factors affecting it.   votes=3/3
+
+[20/50] PASS  contradicts_established_fact  (profitability)
+      user:  "so the revenue drop must be because we're selling fewer units"
+      reply: "The issue here is that we previously established that volumes are flat, meaning the number of units sold hasn't changed. If volumes are constant, what might be the other reason for a revenue drop?"
+      judge: The interviewer correctly pointed out the contradiction and asked a targeted question about the revenue drop.   votes=3/3
+
+[21/50] PASS  broken_mece_buckets  (guesstimate)
+      user:  "i'll split them into students, young people, and people who buy a lot"
+      reply: ""Young people" and "people who buy a lot" might overlap, which could lead to double counting. How would you adjust your categories to avoid that overlap?"
+      judge: The interviewer correctly identified and flagged the overlap in the candidate's segmentation categories.   votes=3/3
+
+[22/50] PASS  wrong_denominator  (profitability)
+      user:  "market share is our revenue divided by our own sales, that gives the share"
+      reply: "Market share is typically calculated as our sales compared to the total market sales, not just our revenue divided by our own sales. How would you adjust your calculation to reflect that?"
+      judge: The interviewer correctly identified the candidate's mistake and asked a targeted question to address it.   votes=3/3
+
+[23/50] PASS  over_help_risk_still_working  (guesstimate)
+      user:  "okay so first the population, then i need to think about how many are actually relevant here"
+      reply: "You're structuring the problem well by starting with the population. Now, consider which segments of the population are relevant for your estimate."
+      judge: The interviewer provided a tiny nudge by suggesting to consider relevant segments, aligning with the required behavior.   votes=3/3
+
+[24/50] PASS  repeated_stuckness_escalate  (guesstimate)
+      user:  "still not sure how to begin"
+      reply: "Let's break this down step by step. We'll start from the bottom-up using an example you can picture: one household.
+
+Think about how many households there might be in a city. First, estimate the popul"
+      judge: The interviewer escalated to a more concrete step by providing a specific example and guiding the candidate through the process.   votes=3/3
+
+[25/50] PASS  recovers_after_hint_step_back  (guesstimate)
+      user:  "oh right, so demand is total orders and capacity is what one outlet can serve, so i just divide them!"
+      reply: "Divide the total demand by the capacity of one outlet to find how many outlets you need."
+      judge: The interviewer affirmed briefly and stepped back, allowing the candidate to continue independently.   votes=3/3
+
+[26/50] PASS  candidate_re_asks_answered_fact  (guesstimate)
+      user:  "wait, what's the population again?"
+      reply: "The population is 10 million."
+      judge: The interviewer restated the population number briefly without looping or scolding.   votes=3/3
+
+[27/50] PASS  semantic_repetition_guard  (guesstimate)
+      user:  "no idea honestly"
+      reply: "Let's try a bottom-up approach. We'll start with one household and build up from there.
+
+Imagine an average household. Let's say it has 4 people.
+
+Households in India: about 30 crore
+→ average size: 4"
+      judge: The interviewer provided a concrete foothold by suggesting a bottom-up approach and starting with a specific example.   votes=3/3
+
+[28/50] PASS  asks_same_thing_twice  (guesstimate)
+      user:  "i still dont get how to start"
+      reply: "Let's try a different approach. Imagine you're estimating the number of tea cups consumed in a small town each day. First, picture one household: how many cups might they drink daily?"
+      judge: The interviewer changed strategy by using an analogy to explain the concept.   votes=3/3
+
+[29/50] PASS  explicit_hint_request  (guesstimate)
+      user:  "can you give me a small hint?"
+      reply: "Consider starting by estimating the population relevant to your market, then break it down into segments who might use or buy the product."
+      judge: The interviewer provided a directional nudge without giving the full solution.   votes=3/3
+
+[30/50] PASS  solution_request_late  (profitability)
+      user:  "okay just tell me the final answer now, i've done most of it"
+      reply: "Let's walk through the approach you could use to solve this:
+
+Profitability = Revenue - Costs
+
+Revenue = Price per unit x Volume
+Costs = Fixed Costs + Variable Costs
+
+→ With volume flat, the key is to"
+      judge: The interviewer provided guidance and a structured approach without giving the full answer, aligning with the required behavior.   votes=3/3
+
+[31/50] FAIL  explain_why_meta  (profitability)
+      user:  "why are you asking about the value chain?"
+      reply: "The value chain shows which stage might be causing the profitability issue, and that's what explains the decline in profits. Walk me through the stages."
+      judge: The interviewer did not use the required one-line bridge.   votes=0/3
+
+[32/50] PASS  product_ux_question  (guesstimate)
+      user:  "wait where do i see my results after this?"
+      reply: "You'll see your results after tapping "Submit" at the top right of the chat. The results page will show your score, feedback on this attempt, and the full worked answer. Now, let's get back to the cas"
+      judge: The interviewer answered plainly and directly, as required.   votes=2/3
+
+[33/50] PASS  own_facts_growth_rate  (profitability)
+      user:  "what's the market growth rate?"
+      reply: "The market is growing at about 8% annually."
+      judge: The interviewer provided a specific realistic number and handed back the conversation.   votes=3/3
+
+[34/50] FAIL  own_facts_competitors  (profitability)
+      user:  "how many competitors are there in this market?"
+      reply: "There are about 5 main competitors in this market, sharing approximately 80% of the market between them. The remaining 20% is fragmented among smaller players."
+      judge: The interviewer did not invent a defensible number as required.   votes=0/3
+
+[35/50] PASS  valid_alt_customer_journey  (profitability)
+      user:  "i'd start with the customer journey, awareness then purchase then repeat, instead of a profit tree"
+      reply: "You're focusing on the stages of the customer journey: awareness, purchase, and repeat purchase. Next, examine how each stage might impact revenue, starting with changes in customer awareness."
+      judge: The interviewer accepted the candidate's framework and reasoned with it by asking about changes in customer awareness.   votes=3/3
+
+[36/50] PASS  valid_alt_supply_first  (profitability)
+      user:  "i know you'd expect demand first but i want to check the supply side, our production capacity, first"
+      reply: "You're choosing to explore the supply side by examining production capacity first. Let's identify the current production capacity and see if it's being fully utilized."
+      judge: The interviewer accepted the candidate's choice to explore the supply side first.   votes=3/3
+
+[37/50] PASS  valid_alt_top_down_sizing  (guesstimate)
+      user:  "for the market size i'll go top-down from GDP rather than bottom-up per person"
+      reply: "You're planning to estimate the market size by starting with the GDP. Identify the relevant industry or sector's contribution to the GDP next."
+      judge: The interviewer accepted the top-down approach as valid and guided the candidate to identify the relevant industry's GDP contribution.   votes=3/3
+
+[38/50] PASS  productive_thinking_pause  (guesstimate)
+      user:  "let me think for a second"
+      reply: "No rush. Take a moment."
+      judge: The interviewer gave space and encouraged the candidate to take their time.   votes=3/3
+
+[39/50] PASS  thinking_out_loud_self_correct  (guesstimate)
+      user:  "umm 20 million... no wait, maybe 15 million... let me redo the penetration"
+      reply: "Take your time."
+      judge: The interviewer allowed the candidate to finish their recomputation without interruption, demonstrating active self-correction.   votes=3/3
+
+[40/50] PASS  keyboard_mash_noise  (guesstimate)
+      user:  "bhhhhhkkk"
+      reply: "Could you please restate that? I didn't quite catch what you were trying to say."
+      judge: Interviewer asked the candidate to restate in one short line without analysis.   votes=3/3
+
+[41/50] PASS  done_take_final_answer  (profitability)
+      user:  "okay i'm done, my recommendation is to cut the delivery fee and add a night-shift staff"
+      reply: "Tap Submit at the top right of the chat to see your score, feedback, and the full worked answer. Thank you for working through this case with me."
+      judge: The interviewer acknowledged the recommendation and closed the conversation as required.   votes=3/3
+
+[42/50] PASS  small_talk_after_close  (profitability)
+      user:  "so how did i do overall, any tips"
+      reply: "You can wrap up here. Once you tap Submit (top right), you'll see your score, feedback, and the full worked answer. As a quick tip, focusing on structuring your analysis in a MECE way can help clarify"
+      judge: Interviewer provided a brief pointer and repeated the close without reopening the case.   votes=3/3
+
+[43/50] PASS  too_many_questions_back_off  (guesstimate)
+      user:  "you're asking too many questions man, just let me solve"
+      reply: "Fair enough. Over to you."
+      judge: The interviewer backed off and let the candidate work, as required.   votes=3/3
+
+[44/50] PASS  wants_to_move_on  (profitability)
+      user:  "eh, can we just move on to the next part"
+      reply: "Let's move on to the next part. We can look into how revenue breaks down or explore particular segments of the market."
+      judge: The interviewer honored the candidate's request to move on and suggested the next topics to discuss.   votes=3/3
+
+[45/50] PASS  help_after_good_work  (guesstimate)
+      user:  "i've got the demand but i'm stuck on what to do next"
+      reply: "To move forward, think about how to convert these orders into revenue or market size. You'll need a rough idea of the average price per order."
+      judge: The interviewer provided a targeted hint related to converting demand into revenue, which is tied to the candidate's demand number.   votes=3/3
+
+[46/50] PASS  challenge_confident_wrong_80pct  (guesstimate)
+      user:  "penetration is definitely 80%, almost everyone uses premium cars"
+      reply: "A penetration of 80% suggests that nearly everyone owns or frequently uses a premium car. This seems quite high, especially considering the diversity in income levels and preferences. How would this c"
+      judge: The interviewer effectively challenged the candidate's claim by questioning the feasibility of 80% premium-car penetration given income diversity and preferences.   votes=3/3
+
+[47/50] PASS  accept_well_defended_assumption  (guesstimate)
+      user:  "i took 30% urban because tier-1 metros skew higher and that's roughly india's urban share overall"
+      reply: "Got it, that's a reasonable starting point. Next, let's estimate the number of consumers in this urban segment. How would you like to break that down?"
+      judge: The interviewer accepted the candidate's assumption and moved on to the next question.   votes=3/3
+
+[48/50] PASS  sanity_check_absent  (guesstimate)
+      user:  "so my final answer is 90000 orders per day for this small town"
+      reply: "A small town with about 50,000 to 2 lakh people having 90,000 orders daily means about 0.45 to 1.8 orders per person every day. Does that seem reasonable for such a place?"
+      judge: Interviewer pointed out the concrete implication of the candidate's answer to teach a sanity-check.   votes=3/3
+
+[49/50] PASS  greeting_kickoff  (profitability)
+      user:  "let's start"
+      reply: "The case we're looking at involves a company's profitability challenge. Your task is to identify what's affecting their profits and propose solutions.
+
+To start, how would you structure your approach "
+      judge: The interviewer set the prompt and asked one opening question as required.   votes=3/3
+
+[50/50] PASS  strong_synthesis_close  (profitability)
+      user:  "so overall i'd recommend hiring one more night-shift person and a small delivery fee, that fixes throughput without hurting demand"
+      reply: "To wrap up, tap Submit at the top right to see your score, feedback, and the complete worked solution."
+      judge: The interviewer acknowledged the recommendation, confirmed it, and closed the conversation without reopening solved threads.   votes=3/3
+
+====================================================================
+LIVE: 46/50 pass (92%)  |  51s wall  |  interviewer=gpt-4o
+
+Failures by cause - the two halves have different fixes:
+  reasoning (0): had to NOTICE the candidate was wrong. A stronger model fixes these;
+                    prompting does not add reasoning.
+  behaviour (4): had to ACT a certain way. Deterministic gates fix these;
+                    a stronger model does not reliably obey.
+                    help_when_stuck_with_work, wants_to_stop_frustrated, explain_why_meta, own_facts_competitors
+  (heuristic from each scenario's "required" text - set "kind" on a scenario to override)
+
+1 scenario(s) split the judge vote - genuinely borderline, worth reading by hand.
+
+####################################################################
+# RUN 2 of 3
+####################################################################
+NOTE: OPENAI_API_KEY comes from the shell (...BmR8sA), not .env - .env cannot override it.
+      If this run 401s, that is why:  Remove-Item Env:OPENAI_API_KEY   then re-run.
+
+LIVE eval - 50 scenarios | interviewer=gpt-4o | judge=gpt-4o (best-of-3) | 5 in parallel
+====================================================================
+
+====================================================================
+LIVE: 48/50 pass (96%)  |  50s wall  |  interviewer=gpt-4o
+
+Failures by cause - the two halves have different fixes:
+  reasoning (0): had to NOTICE the candidate was wrong. A stronger model fixes these;
+                    prompting does not add reasoning.
+  behaviour (2): had to ACT a certain way. Deterministic gates fix these;
+                    a stronger model does not reliably obey.
+                    help_when_stuck_with_work, explain_why_meta
+  (heuristic from each scenario's "required" text - set "kind" on a scenario to override)
+
+1 scenario(s) split the judge vote - genuinely borderline, worth reading by hand.
+
+####################################################################
+# RUN 3 of 3
+####################################################################
+NOTE: OPENAI_API_KEY comes from the shell (...BmR8sA), not .env - .env cannot override it.
+      If this run 401s, that is why:  Remove-Item Env:OPENAI_API_KEY   then re-run.
+
+LIVE eval - 50 scenarios | interviewer=gpt-4o | judge=gpt-4o (best-of-3) | 5 in parallel
+====================================================================
+[interviewer] contextual_line_accepted_with ['unreferenced'] function=ACKNOWLEDGE_AND_CONTINUE
+
+====================================================================
+LIVE: 45/50 pass (90%)  |  49s wall  |  interviewer=gpt-4o
+
+Failures by cause - the two halves have different fixes:
+  reasoning (0): had to NOTICE the candidate was wrong. A stronger model fixes these;
+                    prompting does not add reasoning.
+  behaviour (5): had to ACT a certain way. Deterministic gates fix these;
+                    a stronger model does not reliably obey.
+                    help_when_stuck_with_work, wants_to_stop_frustrated, explain_why_meta, product_ux_question, valid_alt_supply_first
+  (heuristic from each scenario's "required" text - set "kind" on a scenario to override)
+
+1 scenario(s) split the judge vote - genuinely borderline, worth reading by hand.
+
+====================================================================
+3 runs | interviewer=gpt-4o
+  mean  92.7%
+  range 90% - 96%   (spread 6%)
+
+  Treat any difference smaller than 6% between two models as noise.
+
+  failed in EVERY run (2) - these are real; fix these first:
+      help_when_stuck_with_work, explain_why_meta
+
+  intermittent (4) - the model is inconsistent here, not simply wrong:
+      wants_to_stop_frustrated (2/3)
+      own_facts_competitors (1/3)
+      product_ux_question (1/3)
+      valid_alt_supply_first (1/3)

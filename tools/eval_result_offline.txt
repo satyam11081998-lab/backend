@@ -1,0 +1,205 @@
+OFFLINE signal eval — 50 scenarios (deterministic, no API)
+====================================================================
+
+[ 1/50] PASS  help_when_stuck_with_work  (profitability)
+      user: "help na i'm not getting this at all"
+      read: intent=asking_for_help  frustration=high  repair_due=True  has_work=False  garbage=False
+
+[ 2/50] PASS  reasonable_assumption_stands  (guesstimate)
+      user: "ok so i'll say maybe 2 cups a day per person and like 50% of people actually drink chai"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[ 3/50] PASS  material_unit_error  (guesstimate)
+      user: "so 46 cr bottles a month into 12 thats 552 cr litres a year, final answer"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[ 4/50] PASS  wants_to_stop_frustrated  (profitability)
+      user: "ugh this is getting irritating, leave it na i don't want to continue"
+      read: intent=wants_to_stop  frustration=high  repair_due=True  has_work=True  garbage=False
+
+[ 5/50] PASS  wants_solution_outright  (growth)
+      user: "yaar not able to solve, just provide me with the approach na"
+      read: intent=asking_for_solution  frustration=mild  repair_due=False  has_work=False  garbage=False
+
+[ 6/50] PASS  repair_after_interviewer_repeat  (guesstimate)
+      user: "i mean WHAT are we even solving, whats the question"
+      read: intent=answering  frustration=none  repair_due=True  has_work=False  garbage=False
+
+[ 7/50] PASS  meta_identity_probe  (profitability)
+      user: "wait hold on are you chatgpt or claude or something?"
+      read: intent=meta  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[ 8/50] PASS  scope_question_own_facts  (guesstimate)
+      user: "whats the population of the city roughly?"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[ 9/50] PASS  voice_noise_asr  (guesstimate)
+      user: "haan toh ummmmm"
+      read: intent=answering  frustration=mild  repair_due=False  has_work=False  garbage=True
+
+[10/50] PASS  minor_error_do_not_nitpick  (guesstimate)
+      user: "so roughly 10 crore households, i'll round to that"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[11/50] PASS  good_answer_should_advance  (profitability)
+      user: "so i'd split cost into fixed and variable and see which line moved, my guess is variable, raw material"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[12/50] PASS  frustration_change_strategy  (guesstimate)
+      user: "see this is what i mean, you're going round and round, not helping"
+      read: intent=asking_for_help  frustration=high  repair_due=True  has_work=True  garbage=False
+
+[13/50] PASS  stuck_early_no_work  (guesstimate)
+      user: "honestly i have no idea how to even start this"
+      read: intent=asking_for_help  frustration=mild  repair_due=False  has_work=False  garbage=False
+
+[14/50] PASS  double_count_error  (guesstimate)
+      user: "and then i'll also add the whole city population eating out, add all of them up"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[15/50] PASS  rubber_stamp_weak_reasoning  (profitability)
+      user: "i think its just because the market is bad and competition, thats it"
+      read: intent=hypothesis  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[16/50] PASS  factor_1000_unit_error  (guesstimate)
+      user: "so total is 5 crore ml which is like 5 crore litres for the whole city, done"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[17/50] PASS  tiny_arithmetic_slip_ignore  (guesstimate)
+      user: "so 12 into 4 is about 46, call it 46 lakh roughly"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[18/50] PASS  confidently_wrong_penetration  (guesstimate)
+      user: "obviously its 100%, everyone in india buys this daily, so demand is 140 crore units a day"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[19/50] PASS  correct_but_uncertain_do_not_derail  (guesstimate)
+      user: "umm i think its around 20 lakh, not fully sure but that feels about right"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[20/50] PASS  contradicts_established_fact  (profitability)
+      user: "so the revenue drop must be because we're selling fewer units"
+      read: intent=hypothesis  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[21/50] PASS  broken_mece_buckets  (guesstimate)
+      user: "i'll split them into students, young people, and people who buy a lot"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[22/50] PASS  wrong_denominator  (profitability)
+      user: "market share is our revenue divided by our own sales, that gives the share"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[23/50] PASS  over_help_risk_still_working  (guesstimate)
+      user: "okay so first the population, then i need to think about how many are actually relevant here"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[24/50] PASS  repeated_stuckness_escalate  (guesstimate)
+      user: "still not sure how to begin"
+      read: intent=asking_for_help  frustration=high  repair_due=True  has_work=False  garbage=False
+
+[25/50] PASS  recovers_after_hint_step_back  (guesstimate)
+      user: "oh right, so demand is total orders and capacity is what one outlet can serve, so i just divide them!"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[26/50] PASS  candidate_re_asks_answered_fact  (guesstimate)
+      user: "wait, what's the population again?"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[27/50] PASS  semantic_repetition_guard  (guesstimate)
+      user: "no idea honestly"
+      read: intent=asking_for_help  frustration=high  repair_due=True  has_work=False  garbage=False
+
+[28/50] PASS  asks_same_thing_twice  (guesstimate)
+      user: "i still dont get how to start"
+      read: intent=asking_for_help  frustration=high  repair_due=True  has_work=False  garbage=False
+
+[29/50] PASS  explicit_hint_request  (guesstimate)
+      user: "can you give me a small hint?"
+      read: intent=asking_for_help  frustration=mild  repair_due=False  has_work=False  garbage=False
+
+[30/50] PASS  solution_request_late  (profitability)
+      user: "okay just tell me the final answer now, i've done most of it"
+      read: intent=asking_for_solution  frustration=high  repair_due=True  has_work=False  garbage=False
+
+[31/50] PASS  explain_why_meta  (profitability)
+      user: "why are you asking about the value chain?"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[32/50] PASS  product_ux_question  (guesstimate)
+      user: "wait where do i see my results after this?"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[33/50] PASS  own_facts_growth_rate  (profitability)
+      user: "what's the market growth rate?"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[34/50] PASS  own_facts_competitors  (profitability)
+      user: "how many competitors are there in this market?"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[35/50] PASS  valid_alt_customer_journey  (profitability)
+      user: "i'd start with the customer journey, awareness then purchase then repeat, instead of a profit tree"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[36/50] PASS  valid_alt_supply_first  (profitability)
+      user: "i know you'd expect demand first but i want to check the supply side, our production capacity, first"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[37/50] PASS  valid_alt_top_down_sizing  (guesstimate)
+      user: "for the market size i'll go top-down from GDP rather than bottom-up per person"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[38/50] PASS  productive_thinking_pause  (guesstimate)
+      user: "let me think for a second"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[39/50] PASS  thinking_out_loud_self_correct  (guesstimate)
+      user: "umm 20 million... no wait, maybe 15 million... let me redo the penetration"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[40/50] PASS  keyboard_mash_noise  (guesstimate)
+      user: "bhhhhhkkk"
+      read: intent=answering  frustration=mild  repair_due=False  has_work=False  garbage=True
+
+[41/50] PASS  done_take_final_answer  (profitability)
+      user: "okay i'm done, my recommendation is to cut the delivery fee and add a night-shift staff"
+      read: intent=wants_to_stop  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[42/50] PASS  small_talk_after_close  (profitability)
+      user: "so how did i do overall, any tips"
+      read: intent=clarification  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[43/50] PASS  too_many_questions_back_off  (guesstimate)
+      user: "you're asking too many questions man, just let me solve"
+      read: intent=answering  frustration=high  repair_due=True  has_work=True  garbage=False
+
+[44/50] PASS  wants_to_move_on  (profitability)
+      user: "eh, can we just move on to the next part"
+      read: intent=wants_to_stop  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[45/50] PASS  help_after_good_work  (guesstimate)
+      user: "i've got the demand but i'm stuck on what to do next"
+      read: intent=asking_for_help  frustration=high  repair_due=True  has_work=False  garbage=False
+
+[46/50] PASS  challenge_confident_wrong_80pct  (guesstimate)
+      user: "penetration is definitely 80%, almost everyone uses premium cars"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[47/50] PASS  accept_well_defended_assumption  (guesstimate)
+      user: "i took 30% urban because tier-1 metros skew higher and that's roughly india's urban share overall"
+      read: intent=hypothesis  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[48/50] PASS  sanity_check_absent  (guesstimate)
+      user: "so my final answer is 90000 orders per day for this small town"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+[49/50] PASS  greeting_kickoff  (profitability)
+      user: "let's start"
+      read: intent=greeting  frustration=none  repair_due=False  has_work=False  garbage=False
+
+[50/50] PASS  strong_synthesis_close  (profitability)
+      user: "so overall i'd recommend hiring one more night-shift person and a small delivery fee, that fixes throughput without hurting demand"
+      read: intent=answering  frustration=none  repair_due=False  has_work=True  garbage=False
+
+====================================================================
+OFFLINE: all 50 scenarios classified correctly. Signals are ready to drive the model.

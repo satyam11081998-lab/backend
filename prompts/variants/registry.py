@@ -164,10 +164,25 @@ def _code_shape(fn: Any) -> Optional[str]:
         return None
 
 
+# Every persona the layer defines. Two until 2026-10-29, six after: the live module gained
+# Interview and Whiteboard variants for case and guesstimate, and the original two are now
+# dead code kept only so they stay part of this fingerprint.
+#
+# Including the new names is the point. A frozen snapshot predates them, so it can no
+# longer equal the live stack and live_matches() returns None -- which is the TRUTH, and
+# exactly what the docstring below promises to tell you. The arena's "frozen main is
+# byte-identical to production" tests skip on None rather than comparing production
+# against a persona no user is served any more. Matching resumes the moment someone
+# freezes a snapshot that carries all six.
+_PERSONA_NAMES = (
+    "CASE_INTERVIEWER_V2", "GUESSTIMATE_INTERVIEWER_V2",
+    "CASE_INTERVIEWER_EXAM_V2", "GUESSTIMATE_INTERVIEWER_EXAM_V2",
+    "CASE_INTERVIEWER_COACHED_V2", "GUESSTIMATE_INTERVIEWER_COACHED_V2",
+)
+
+
 def _stack(prompts_mod: Any, packet_rules: Any, assessor_prompt: Any, assessor_fn: Any) -> tuple:
-    return (
-        getattr(prompts_mod, "CASE_INTERVIEWER_V2", None),
-        getattr(prompts_mod, "GUESSTIMATE_INTERVIEWER_V2", None),
+    return tuple(getattr(prompts_mod, n, None) for n in _PERSONA_NAMES) + (
         packet_rules,
         assessor_prompt,
         _code_shape(assessor_fn) if assessor_fn else None,
@@ -189,7 +204,10 @@ def live_matches() -> Optional[str]:
     live = _stack(live_mod, getattr(live_mode, "_PACKET_RULES", None),
                   getattr(live_dec, "_ASSESSOR_PROMPT", None),
                   getattr(live_dec, "assess_context_with_llm", None))
-    if not all(live):
+    # A persona slot may be absent on a layer that has dropped the legacy names; what
+    # matters is that the layer produced SOMETHING for each of the three non-persona
+    # pieces and at least one persona.
+    if not any(live[:len(_PERSONA_NAMES)]) or not all(live[len(_PERSONA_NAMES):]):
         return None
     for spec in _SPECS:
         mod = spec["module"]

@@ -397,12 +397,30 @@ def failure_kind(scenario: dict) -> str:
     return "reasoning" if any(w in req for w in _REASONING_WORDS) else "behaviour"
 
 
+# --policy. Every scenario in SCENARIOS was written without a `policy` key, so both call
+# sites below defaulted to "coached" and the eval has ONLY ever measured the coached
+# persona. Since 2026-10-29 there are two personas (Interview / Whiteboard), and the exam
+# one was shipped unmeasured until this flag existed.
+#
+# READ THE FAILURES, NOT THE SCORE, when running with --policy exam. The scenarios and the
+# judge rubric were authored against coached expectations: a scenario that expects a hint
+# ladder rung WILL be marked wrong under exam, correctly, because exam refuses to hint.
+# A lower exam score is therefore not a regression. What a clean exam run looks like:
+# every failure is "declined to help", and NONE are broken character, no question asked,
+# a refused data request, a praise opener, or a revealed figure.
+POLICY_OVERRIDE = ""
+
+
+def _policy_of(s: dict) -> str:
+    return POLICY_OVERRIDE or s.get("policy", "coached")
+
+
 def run_offline(verbose: bool = False) -> bool:
     print(f"OFFLINE signal eval — {len(SCENARIOS)} scenarios (deterministic, no API)")
     print("=" * 68)
     fails = []
     for i, s in enumerate(SCENARIOS, 1):
-        sig = compute_signals(s["transcript"], s["new"], s.get("policy", "coached"))
+        sig = compute_signals(s["transcript"], s["new"], _policy_of(s))
         bad = []
         for k, v in s["expect_signals"].items():
             got = sig.get(k)
@@ -505,7 +523,7 @@ def _run_one(i: int, s: dict, complete, detect_violations, client, judge_model: 
         reply = complete(
             case_content=f"A {s['case_type']} case for practice on MECE.",
             case_type=s["case_type"], transcript=s["transcript"],
-            new_user_message=s["new"], teaching_policy=s.get("policy", "coached"),
+            new_user_message=s["new"], teaching_policy=_policy_of(s),
             control_out=ctl,
         )
     except Exception as e:  # noqa: BLE001
@@ -703,6 +721,10 @@ if __name__ == "__main__":
                          "for the process only, so comparing two models never touches the live provider toggle "
                          "and never affects a real user. Results land in eval_result_live_<model>.txt.")
     ap.add_argument("--judge-model", default="", metavar="NAME", help="override JUDGE_MODEL (default gpt-4o)")
+    ap.add_argument("--policy", default="", choices=["exam", "coached"], metavar="P",
+                    help="force the teaching policy for every scenario. Default: whatever each scenario "
+                         "declares, which today is coached for all 50. Use 'exam' to measure the "
+                         "Interview persona - and read the failures, not the score (see POLICY_OVERRIDE).")
     ap.add_argument("--workers", type=int, default=5, metavar="N",
                     help="scenarios in flight at once (default 5). Lower it if you hit rate limits.")
     ap.add_argument("--best-of", type=int, default=3, metavar="N",
@@ -718,11 +740,17 @@ if __name__ == "__main__":
         os.environ["INTERVIEWER_ADAPTIVE_MODEL"] = args.model
     if args.judge_model:
         os.environ["JUDGE_MODEL"] = args.judge_model
+    if args.policy:
+        globals()["POLICY_OVERRIDE"] = args.policy
 
     # Full run is saved to a .txt right next to this script — open it or paste it back.
     _mode = ("live_" + os.getenv("INTERVIEWER_ADAPTIVE_MODEL", "gpt-4o-mini").replace("/", "-")) if args.live else "offline"
+    # The policy goes in the filename. A stale eval_result_*.txt read as the current run has
+    # already cost a wrong conclusion once (2026-10-27); two personas writing to one path
+    # would guarantee a repeat.
+    _pol = f"_{args.policy}" if args.policy else ""
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f"eval_result_{_mode}.txt")
+                            f"eval_result_{_mode}{_pol}.txt")
     tee = _Tee(out_path)
     sys.stdout = tee
     rc = 0

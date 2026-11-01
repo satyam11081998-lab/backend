@@ -259,6 +259,27 @@ def hint(case: Dict[str, Any], case_content: str, transcript: List[Dict[str, str
     return output, v
 
 
+def exam_refusal(tool: str, session_state: Optional[dict]) -> Tuple[str, Dict[str, Any]]:
+    """Interview mode: the hint ladder and the answer rule do not exist.
+
+    An Interview that dispenses hints when asked is not an interview, and the model-led
+    voice path reaches these tools directly -- so the refusal has to live here rather
+    than relying on the prompt to leave the tool alone. Returns (tool_output, state)
+    with the state UNCHANGED: nothing is spent, because nothing was given. The ladder
+    is still there intact if the candidate runs the same case on the Whiteboard.
+    """
+    v = voice_state(session_state)
+    if tool == "answer_request":
+        said = ("Do NOT give the answer or any part of it. Say, in your own words and in one sentence, that in an "
+                "interview this is theirs to work out, and that the full worked answer is on their results page "
+                "when they finish. Then ask what their best read is.")
+    else:
+        said = ("Do NOT give a hint. Say, in your own words and in one sentence, that you want to hear their "
+                "thinking rather than lead them. Then ask the one question that makes them commit: what they "
+                "would look at first, or what their current number rests on.")
+    return said + " Keep it short and hand the floor straight back.", v
+
+
 def answer_request(case: Dict[str, Any], case_content: str, transcript: List[Dict[str, str]],
                    session_state: Optional[dict], user_id: Optional[str] = None,
                    llm=None) -> Tuple[str, Dict[str, Any], bool]:

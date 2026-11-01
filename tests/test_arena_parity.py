@@ -20,9 +20,16 @@ import pytest
 os.environ["ADAPTIVE_INTERVIEWER"] = "true"
 
 CASE = "Spice Express sales fell 12% YoY.\n- 240 outlets\n- AOV Rs 420"
+# The opening note is per MODE since 2026-10-29 (Interview / Whiteboard). Whiteboard is
+# opening_transcript's default and the policy every pre-0076 attempt ran under.
 NOTE = {"role": "system", "kind": "system_note",
         "content": ("Case ready: Spice Express. On a phone, tap the menu at the top left to read the full "
-                    "brief. Ask any clarifying questions before structuring.")}
+                    "brief. Ask any clarifying questions before structuring. Your structure is drawn on "
+                    "the right as you work; this run is practice and isn't ranked.")}
+NOTE_INTERVIEW = {"role": "system", "kind": "system_note",
+                  "content": ("Case ready: Spice Express. On a phone, tap the menu at the top left to read "
+                              "the full brief. This is a scored interview — the interviewer will not help "
+                              "you, and this attempt is ranked.")}
 
 # A reply that production's post-processing treats differently by lane: a praise
 # opener, then two questions.
@@ -244,14 +251,25 @@ def test_quota_ladder_matches_the_route_that_enforces_it():
 
 
 def test_opening_note_matches_the_row_production_seeds():
+    """Production seeds TWO notes now, one per mode. Both halves are asserted against the
+    route's own source, so changing the copy there fails here until routes/arena.py is
+    updated to match -- an arena turn that opens on a different first line is measuring a
+    different conversation."""
     from routes import arena as ar
-    expr = ('f"Case ready: {case.get(\'title\')}. On a phone, tap the menu at the top left to read the full '
-            'brief. Ask any clarifying questions before structuring."')
     src = _attempts_source()
-    assert expr in src, "the system_note production seeds has changed: update routes/arena.py"
+    shared = ("f\"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the "
+              'full brief."')
+    exam_tail = ('This is a scored interview — the interviewer will not help you, and this attempt '
+                 'is ranked.')
+    coached_tail = ("Ask any clarifying questions before structuring. Your structure is drawn on the "
+                    "right as you work; this run is practice and isn't ranked.")
+    assert shared in src, "the system_note production seeds has changed: update routes/arena.py"
+    assert exam_tail in src and coached_tail in src, \
+        "a per-mode system_note changed: update routes/arena.py::opening_transcript"
     assert '"kind": "system_note"' in src
-    row = ar.opening_transcript({"title": "Spice Express"})[0]
-    assert row == NOTE
+    assert ar.opening_transcript({"title": "Spice Express"})[0] == NOTE
+    assert ar.opening_transcript({"title": "Spice Express"}, "whiteboard")[0] == NOTE
+    assert ar.opening_transcript({"title": "Spice Express"}, "interview")[0] == NOTE_INTERVIEW
 
 
 @pytest.mark.parametrize("name,transcript,message,expect_fn", LANES, ids=[l[0] for l in LANES])

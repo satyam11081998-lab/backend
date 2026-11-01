@@ -1224,6 +1224,13 @@ def trim_praise_opener(sentence: str) -> str:
 
 
 def sanitize_reply(text: str, policy: str = "coached") -> str:
+    # `policy` is accepted for call-site symmetry and is deliberately NOT read: praise is
+    # wrong in both modes, so the strip is unconditional. Do not add an exam-only
+    # correctness strip here without the control packet -- `arithmetic_check` legitimately
+    # lets the interviewer confirm maths that code has verified, and this function cannot
+    # see that, so it would delete a required sentence. (2026-10-29: the same
+    # accepted-but-unread parameter in build_adaptive_interviewer_messages is what kept
+    # every attempt on the coach persona for a year. Unread means unread on purpose here.)
     t = (text or "").strip()
     if not t:
         return t

@@ -100,8 +100,50 @@ ALLOWED_MIME_EXACT = (
 # Pydantic schemas
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# Interview vs Whiteboard
+# -----------------------------------------------------------------------------
+# The engine has carried a teaching policy of 'exam' | 'coached' since V10, threaded
+# all the way through compute_signals -> decide_response -> the control packet -> the
+# prompt -> detect_violations. It was never reachable by a candidate: both turn routes
+# read it from `cases.teaching_policy`, which migration 0066 created with a default of
+# 'coached' for every case. So every attempt by every user has run coached for the life
+# of the product -- which is why the interviewer reads as over-helpful and never quite
+# like an interview.
+#
+# The choice belongs to the candidate at the start of a run, not to the case author and
+# not to the deployment. These are the two names they see; the internal values are
+# unchanged so nothing downstream needs renaming.
+_MODE_TO_POLICY = {"interview": "exam", "whiteboard": "coached"}
+_POLICY_TO_MODE = {"exam": "interview", "coached": "whiteboard"}
+
+
+def _policy_from_mode(mode: Optional[str]) -> Optional[str]:
+    """None when the client sent nothing -- the caller then falls back to the case."""
+    return _MODE_TO_POLICY.get((mode or "").strip().lower())
+
+
+def _resolve_policy(attempt: dict, case: dict) -> str:
+    """Attempt first, case second, 'coached' last.
+
+    The attempt row is authoritative once it exists, because that is the choice the
+    candidate actually made. The case column survives as the per-case default (an
+    'exam'-authored case still opens in Interview when the client sends no mode), and
+    an attempt row written before migration 0076 has no column at all -> the case
+    answers, exactly as it did before. No path can return anything but a valid policy.
+    """
+    for candidate in (attempt.get("teaching_policy"), case.get("teaching_policy")):
+        p = (candidate or "").strip().lower()
+        if p in ("exam", "coached"):
+            return p
+    return "coached"
+
+
 class StartAttemptRequest(BaseModel):
     case_id: str
+    # 'interview' | 'whiteboard'. Absent -> the case's own default, so every existing
+    # client keeps working untouched.
+    mode: Optional[str] = Field(None, description="interview | whiteboard")
 
 
 class AttemptSummary(BaseModel):
@@ -112,6 +154,10 @@ class AttemptSummary(BaseModel):
     clarification_used: int
     clarification_remaining: int
     status: str
+    # Echoed back on both start and resume: a resumed attempt keeps the mode it was
+    # started in (the policy is immutable), so the client must render what it got
+    # rather than what it asked for.
+    mode: str = "whiteboard"
 
 
 class MessageOut(BaseModel):
@@ -197,6 +243,13 @@ class SubmitRequest(BaseModel):
 class SubmitResponse(BaseModel):
     submission_id: str
     attempt_id: str
+    # 'interview' | 'whiteboard', and whether this run counts. A Whiteboard run is
+    # scored but not ranked: the client shows the written debrief and does NOT lead
+    # with the number or a percentile (owner, 2026-10-29). The score stays in the
+    # payload because it is the candidate's own data and the eval harness reads it --
+    # what changes is that nothing compounds off it and nothing headlines it.
+    mode: str = "whiteboard"
+    ranked: bool = True
     score: int
     breakdown: Dict[str, int]
     strengths: List[str]
@@ -585,8 +638,22 @@ def start_attempt(
 
 def _start_or_resume(supabase, user_id: str, body: StartAttemptRequest, case: dict,
                      tier: str, quota: int) -> AttemptSummary:
-    # Resume any active attempt for this user+case rather than spawning a new one,
-    # so a refresh doesn't lose state.
+    # The mode this start is asking for. No mode sent -> the case's own default, which
+    # is what every caller got before Interview/Whiteboard existed.
+    want = _policy_from_mode(body.mode) or _resolve_policy({}, case)
+
+    # Resume an active attempt for this user+case rather than spawning a new one, so a
+    # refresh doesn't lose state -- but only one in the SAME mode. The policy is
+    # immutable once an attempt exists (migration 0076), so dropping someone who asked
+    # for an Interview back into their half-finished Whiteboard run would be both wrong
+    # and unfixable from inside that attempt. An unfinished run in the other mode is
+    # left alone: it stays active and reachable from their history, and nothing is
+    # silently discarded.
+    #
+    # Not filtered in the query on purpose: `.eq("teaching_policy", ...)` is a 400 from
+    # PostgREST until 0076 is applied, and this route must survive the backend
+    # deploying before the migration (same contract as session_state in 0066). At most
+    # two rows can match now -- one per mode -- so five is slack, not a scan.
     existing = (
         supabase.table("attempts")
         .select("*")
@@ -594,11 +661,19 @@ def _start_or_resume(supabase, user_id: str, body: StartAttemptRequest, case: di
         .eq("case_id", body.case_id)
         .eq("status", "active")
         .order("created_at", desc=True)
-        .limit(1)
+        .limit(5)
         .execute()
     )
-    if existing.data:
-        a = existing.data[0]
+    for a in (existing.data or []):
+        have = (a.get("teaching_policy") or "").strip().lower()
+        # An attempt row with NO policy predates 0076, so it can serve either request:
+        # it has no mode to conflict with. Matching strictly here instead would spawn a
+        # fresh attempt on every refresh for the whole window between the backend
+        # deploying and the migration running -- unbounded active attempts, each one
+        # burning a case-access credit. Once 0076 is applied the column is NOT NULL and
+        # this branch can no longer be taken, so strict matching resumes by itself.
+        if have and have != want:
+            continue
         return AttemptSummary(
             attempt_id=a["id"],
             case_id=a["case_id"],
@@ -607,35 +682,55 @@ def _start_or_resume(supabase, user_id: str, body: StartAttemptRequest, case: di
             clarification_used=a["clarification_used"],
             clarification_remaining=max(0, a["clarification_quota"] - a["clarification_used"]),
             status=a["status"],
+            # What they actually get, which pre-0076 may not be what they asked for.
+            mode=_POLICY_TO_MODE[_resolve_policy(a, case)],
         )
 
-    inserted = (
-        supabase.table("attempts")
-        .insert(
-            {
-                "user_id": user_id,
-                "case_id": body.case_id,
-                "tier_at_start": tier,
-                "clarification_quota": quota,
-                "clarification_used": 0,
-                "status": "active",
-            }
-        )
-        .execute()
-    )
+    row = {
+        "user_id": user_id,
+        "case_id": body.case_id,
+        "tier_at_start": tier,
+        "clarification_quota": quota,
+        "clarification_used": 0,
+        "status": "active",
+        "teaching_policy": want,
+    }
+    try:
+        inserted = supabase.table("attempts").insert(row).execute()
+    except Exception as _e:  # noqa: BLE001
+        # Pre-0076 database: the column does not exist yet. Starting a case must never
+        # fail because a migration is outstanding, so drop the new column and insert
+        # exactly as before -- the attempt then resolves its policy from the case,
+        # which is the behaviour that shipped before this feature.
+        if "teaching_policy" not in str(_e):
+            raise
+        print(f"WARN: attempts.teaching_policy not present (run migration 0076): {_e}")
+        row.pop("teaching_policy", None)
+        inserted = supabase.table("attempts").insert(row).execute()
+
     if not inserted.data:
         raise HTTPException(status_code=500, detail="Failed to create attempt")
 
     attempt_id = inserted.data[0]["id"]
+    started_mode = _POLICY_TO_MODE[_resolve_policy(inserted.data[0], case)]
 
     # Seed the conversation with the case prompt as a system note,
     # so the client can render the same "interviewer just briefed me" feel.
+    # The note differs by mode because the two runs promise different things, and the
+    # first line a candidate reads is where that promise has to land. An Interview that
+    # opens by inviting questions and then declines to answer them reads as broken.
+    brief = f"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the full brief."
+    note = (
+        f"{brief} This is a scored interview — the interviewer will not help you, and this attempt is ranked."
+        if started_mode == "interview"
+        else f"{brief} Ask any clarifying questions before structuring. Your structure is drawn on the right as you work; this run is practice and isn't ranked."
+    )
     supabase.table("attempt_messages").insert(
         {
             "attempt_id": attempt_id,
             "role": "system",
             "kind": "system_note",
-            "content": f"Case ready: {case.get('title')}. On a phone, tap the menu at the top left to read the full brief. Ask any clarifying questions before structuring.",
+            "content": note,
             "is_clarification": False,
         }
     ).execute()
@@ -648,6 +743,7 @@ def _start_or_resume(supabase, user_id: str, body: StartAttemptRequest, case: di
         clarification_used=0,
         clarification_remaining=quota,
         status="active",
+        mode=started_mode,
     )
 
 
@@ -700,6 +796,7 @@ def get_attempt(
             clarification_used=attempt["clarification_used"],
             clarification_remaining=max(0, attempt["clarification_quota"] - attempt["clarification_used"]),
             status=attempt["status"],
+            mode=_POLICY_TO_MODE[_resolve_policy(attempt, case)],
         ),
         case={
             "id": case["id"],
@@ -776,10 +873,11 @@ def post_message(
 
     case = _load_case(supabase, attempt["case_id"], user_id)
 
-    # Adaptive interviewer (Phase 2): persisted learner state + per-case teaching policy.
-    # Both are select("*")-safe -- an absent column just yields None, handled below.
+    # Adaptive interviewer (Phase 2): persisted learner state + the mode this attempt
+    # was started in. Both are select("*")-safe -- an absent column just yields None,
+    # and _resolve_policy then falls back to the case exactly as this line used to.
     session_state = attempt.get("session_state") or {}
-    teaching_policy = case.get("teaching_policy") or None
+    teaching_policy = _resolve_policy(attempt, case)
 
     # Does this turn consume clarification quota?
     clar_count = count_clarifications(body.content, body.kind)
@@ -983,7 +1081,9 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
 
     case = _load_case(supabase, attempt["case_id"], user_id)
     session_state = attempt.get("session_state") or {}
-    teaching_policy = case.get("teaching_policy") or None
+    # Same resolution as /messages: voice and text must run the same mode, or a
+    # candidate switches transport mid-case and the interviewer changes personality.
+    teaching_policy = _resolve_policy(attempt, case)
 
     # Read-only mirror of /messages: tell V11 when this turn's clarification
     # cannot be answered. Consumption is still recorded by /realtime-turn when
@@ -1325,6 +1425,16 @@ def submit_attempt(
     if len(transcript) == 0:
         raise HTTPException(status_code=400, detail="No conversation to submit")
 
+    # A Whiteboard run is still scored -- the candidate gets the full written debrief,
+    # and the number is what my own eval work reads -- but it is NOT ranked. The
+    # interviewer handed over structure, hints and sometimes a corrected figure, so the
+    # score is partly the model's. Everything that compounds off a score is skipped
+    # below: points, badges, the exemplar bank, the case-figures bank. Without this,
+    # Whiteboard would be the rational way to farm the leaderboard, and the exemplar
+    # bank -- which calibrates future scoring against "real strong answers" -- would
+    # slowly fill with answers the AI co-wrote.
+    ranked = _resolve_policy(attempt, case) == "exam"
+
     # Persist the final recommendation as the closing message.
     supabase.table("attempt_messages").insert(
         {
@@ -1407,41 +1517,48 @@ def submit_attempt(
         "answer_text": answer_text,
         "score": feedback["score"],
         "feedback_json": feedback,
+        # 0076. Every consumer that ranks, averages or percentiles a score filters on
+        # this, so the rule lives in one queryable place instead of being re-derived.
+        "ranked": ranked,
     }
     try:
         sub_res = supabase.table("submissions").insert(_sub_row).execute()
     except Exception as _e:  # noqa: BLE001
-        # Pre-0068 database: the column does not exist yet. Scoring a real
+        # Pre-0068/0076 database: a column does not exist yet. Scoring a real
         # attempt must never fail because a migration is outstanding, so drop
         # the new column and insert exactly as before. attempts.submission_id
         # below still records the forward link, and 0068's backfill recovers
         # this row's attempt_id the moment the migration is run.
-        if "attempt_id" not in str(_e):
+        _msg = str(_e)
+        _late = [c for c in ("attempt_id", "ranked") if c in _msg]
+        if not _late:
             raise
-        print(f"WARN: submissions.attempt_id not present (run migration 0068): {_e}")
-        _sub_row.pop("attempt_id", None)
+        print(f"WARN: submissions.{'/'.join(_late)} not present (run migrations 0068/0076): {_e}")
+        for _c in _late:
+            _sub_row.pop(_c, None)
         sub_res = supabase.table("submissions").insert(_sub_row).execute()
     submission_id = sub_res.data[0]["id"]
 
-    # Bank the case's figures — one row per CASE, best-scoring answer wins.
-    # Best-effort inside the helper; never fails a scored submit.
-    bank_figures(supabase, attempt["case_id"], _figures, submission_id, feedback["score"])
+    if ranked:
+        # Bank the case's figures — one row per CASE, best-scoring answer wins.
+        # Best-effort inside the helper; never fails a scored submit.
+        bank_figures(supabase, attempt["case_id"], _figures, submission_id, feedback["score"])
 
-    # Silent self-improvement: if this scored session clears the bar, bank an
-    # anonymised exemplar for THIS case so future scoring calibrates against real
-    # strong answers. Fully non-blocking — never affects the response or the score.
-    try:
-        from services.exemplar_bank import maybe_capture_exemplar
-        maybe_capture_exemplar(
-            case_id=attempt["case_id"],
-            submission_id=submission_id,
-            case_content=llm_case_content(case),
-            case_type=case["type"],
-            feedback=feedback,
-            user_id=user_id,
-        )
-    except Exception as _e:
-        print(f"WARN: exemplar capture skipped: {_e}")
+        # Silent self-improvement: if this scored session clears the bar, bank an
+        # anonymised exemplar for THIS case so future scoring calibrates against real
+        # strong answers. Fully non-blocking — never affects the response or the score.
+        try:
+            from services.exemplar_bank import maybe_capture_exemplar
+            maybe_capture_exemplar(
+                case_id=attempt["case_id"],
+                submission_id=submission_id,
+                case_content=llm_case_content(case),
+                case_type=case["type"],
+                feedback=feedback,
+                user_id=user_id,
+            )
+        except Exception as _e:
+            print(f"WARN: exemplar capture skipped: {_e}")
 
     # Mark the attempt submitted.
     supabase.table("attempts").update(
@@ -1506,7 +1623,9 @@ def submit_attempt(
     except Exception as e:
         print(f"WARN: case_attempts insert failed: {e}")
 
-    if is_first_attempt:
+    # Points and badges are the leaderboard. A Whiteboard run earns neither, however
+    # well it scored — see `ranked` above.
+    if is_first_attempt and ranked:
         try:
             ur = supabase.table("users").select("points").eq("id", user_id).maybe_single().execute()
             current_points = (ur.data or {}).get("points", 0)
@@ -1532,6 +1651,8 @@ def submit_attempt(
     return SubmitResponse(
         submission_id=submission_id,
         attempt_id=attempt_id,
+        mode="interview" if ranked else "whiteboard",
+        ranked=ranked,
         score=feedback["score"],
         breakdown=feedback["breakdown"],
         strengths=feedback["strengths"],
