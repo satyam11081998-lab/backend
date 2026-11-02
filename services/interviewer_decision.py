@@ -749,7 +749,7 @@ def _case_context(sig: Dict[str, Any], fn: str, case_id: Optional[str] = None,
         from services import quant_graph as _qg
         ctx.update(_qg.packet_block(prior_state, candidate_text))
     except Exception as _qe:  # noqa: BLE001 - a side-channel must never break a turn
-        print(f"[quant] skipped: {type(_qe).__name__}")
+        print(f"[quant] skipped: {type(_qe).__name__}: {_qe}")
     return ctx
 
 

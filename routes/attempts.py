@@ -989,11 +989,23 @@ def post_message(
         t_stream = time.perf_counter()
         first_ms = None
         try:
+            # `engine` is a diagnostic, not a feature. The whole V12 architecture --
+            # control packet, response functions, the control tag everything downstream
+            # folds -- is behind the ADAPTIVE_INTERVIEWER env var, and when that is unset
+            # the service silently serves V11 while every test still passes, because the
+            # tests call the adaptive path directly. That failure is invisible from
+            # outside the process, which is how it survives. Now it is one field.
+            try:
+                from services.interview_engine import _adaptive_enabled as _ae
+                _engine = "v12" if _ae() else "v11"
+            except Exception:  # noqa: BLE001
+                _engine = "unknown"
             yield (
                 f"event: meta\ndata: {{"
                 f"\"clarification_remaining\": {max(0, remaining)}, "
                 f"\"is_clarification\": {str(clar_count > 0 and not quota_exhausted).lower()}, "
-                f"\"clarifications_spent\": {str(clarifications_spent).lower()}"
+                f"\"clarifications_spent\": {str(clarifications_spent).lower()}, "
+                f"\"engine\": \"{_engine}\""
                 f"}}\n\n"
             )
             for token in stream_interviewer_reply(
@@ -1061,7 +1073,9 @@ def post_message(
             if silent:
                 yield "event: done\ndata: {\"message_id\": null}\n\n"
             else:
-                yield f"event: done\ndata: {{\"message_id\": \"{msg_id}\"}}\n\n"
+                yield (f"event: done\ndata: {{\"message_id\": \"{msg_id}\", "
+                       f"\"function\": {json.dumps(ctl.get('function'))}, "
+                       f"\"tagged\": {str(bool(ctl.get('tag'))).lower()}}}\n\n")
             if _TIMING_LOG:
                 print(f"[timing] /messages attempt={attempt_id} pre_ms={pre_ms} "
                       f"first_token_ms={first_ms} reply_ms={_ms(t_stream)} total_ms={_ms(t_req)} "

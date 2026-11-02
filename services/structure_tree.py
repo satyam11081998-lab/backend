@@ -205,3 +205,88 @@ def _prune(nodes: List[Dict[str, Any]], depth: int) -> None:
 
 def active_id(state: Optional[Dict[str, Any]]) -> Optional[str]:
     return (state or {}).get("structure_active") or None
+
+
+# =============================================================================
+# INFERRING THE EDGES WHEN THE MODEL DOES NOT REPORT THEM
+# =============================================================================
+#
+# The tag-reporting path above is free -- the interviewer is already running and the key
+# rides along. It is also a COMPLIANCE DEPENDENCY, and measuring it on the live site showed
+# gpt-4o-mini simply not emitting `tree=`, twice, through two rounds of prompt work. A
+# feature that silently produces nothing when a small model ignores one instruction is the
+# wrong foundation, however cheap it is.
+#
+# So the tag is now the fast path, not the only path. When a turn arrives without it, a
+# dedicated call infers the same edges from the last few turns.
+#
+# WHY A SECOND CALL IS ACCEPTABLE HERE AND WAS NOT BEFORE
+#
+# I rejected a second model call earlier on latency grounds. That reasoning was right about
+# the CRITICAL PATH and wrong as a blanket rule. This runs inside _fold_session_state, which
+# _after_turn already executes once the reply has finished streaming -- the candidate is
+# reading the interviewer's line while it happens. It cannot delay a turn, because the turn
+# is over. The diagram therefore lags by one turn, which for a picture that builds up as you
+# talk is not a defect.
+#
+# It returns the SAME grammar the tag uses, so parse_edges and its tests are unchanged: one
+# parser, one format, two sources.
+
+_INFER_SYSTEM = (
+    "You extract the structure of a candidate's estimate. Output ONE line and nothing else.\n"
+    "Format: parent>child#figure, several joined by |, a top-level node written with nothing "
+    "before the > . Omit #figure when the candidate gave no number for that node.\n"
+    "Use the candidate's own words, three or four words per node. Report ONLY branches the "
+    "LAST candidate message added. If it added none, output exactly: none\n"
+    "Examples:\n"
+    "candidate: \"start with chennai population, 1.2 crore\" -> >population#1.2 crore\n"
+    "candidate: \"a third of them own cars, so 40 lakh\" (known: population) -> "
+    "population>car owners#40 lakh\n"
+    "candidate: \"what do you mean by pre-owned?\" -> none"
+)
+
+
+def infer_edges(transcript, new_user_message: str,
+                state: Optional[Dict[str, Any]] = None, *, llm=None) -> str:
+    """Infer this turn's edges. Returns a `tree=` value, or "" when there is nothing.
+
+    Never raises and never retries: this is a side-channel on a background path, so a
+    failure means the diagram waits for the next turn, nothing more.
+    """
+    msg = (new_user_message or "").strip()
+    if not msg:
+        return ""
+    try:
+        from services.ai_providers import openai_client
+        import os
+        cli = llm or openai_client()
+        if cli is None:
+            return ""
+        known = [n["label"] for n in ((state or {}).get("structure") or [])][:12]
+        recent = [t.get("content") or "" for t in (transcript or []) if t.get("role") == "user"][-2:]
+        user = ""
+        if known:
+            user += "known nodes: " + ", ".join(known) + "\n"
+        if recent:
+            user += "earlier: " + " | ".join(r[:160] for r in recent) + "\n"
+        user += "candidate: " + msg[:400]
+        resp = cli.chat.completions.create(
+            model=(os.getenv("STRUCTURE_MODEL") or "gpt-4o-mini").strip(),
+            messages=[{"role": "system", "content": _INFER_SYSTEM},
+                      {"role": "user", "content": user}],
+            temperature=0,
+            max_tokens=60,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+    except Exception as e:  # noqa: BLE001
+        print(f"[structure] infer failed: {type(e).__name__}")
+        return ""
+    # The model may wrap it, prefix "tree=", or answer "none".
+    out = out.strip().strip("`").strip()
+    if out.lower().startswith("tree="):
+        out = out[5:]
+    if not out or out.lower() in ("none", "none.", "-"):
+        return ""
+    out = out.splitlines()[0].strip()
+    # Anything that survives still goes through parse_edges, which caps and validates it.
+    return out if parse_edges(out) else ""
