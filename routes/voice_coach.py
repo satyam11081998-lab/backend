@@ -84,7 +84,10 @@ def voice_coach(attempt_id: str, authorization: Optional[str] = Header(default=N
     instructions = build_voice_interviewer_instructions(
         llm_case_content(case), case.get("type") or "", notes, hint=case.get("hint"), solution=case.get("solution"),
         transcript=[dict(t, content=strip_say_label(t.get("content") or "")) for t in transcript],
-        market=case_market(case))
+        market=case_market(case),
+        # Without this the realtime session runs the coached playbook on a ranked attempt:
+        # its ANSWER RULE hands over the worked answer to anyone who asks twice.
+        teaching_policy=_resolve_policy(attempt, case))
     return {"changed": changed, "notes": notes, "instructions": instructions if changed else None}
 
 

@@ -634,5 +634,11 @@ os.environ.pop("VOICE_INTERVIEWER")
 print()
 if _fail:
     print(f"{len(_fail)} FAILED: {_fail}")
-    sys.exit(1)
-print("ALL PASS")
+    if __name__ == "__main__":
+        sys.exit(1)
+    else:
+        raise AssertionError(f"{len(_fail)} FAILED: {_fail}")
+else:
+    print("ALL PASS")
+    if __name__ == "__main__":
+        sys.exit(0)

@@ -268,17 +268,28 @@ async def create_realtime_session(
         from services.markets import llm_case_content, case_market
         row = case.data[0]
         notes, history = [], []
+        # The mode this attempt was started in. Resolved from the attempt row, then the
+        # case, then coached - the same order as the text path (routes/attempts.py).
+        # select("*") rather than a column list on purpose: naming teaching_policy
+        # explicitly is a 400 from PostgREST until migration 0076 is applied, and a voice
+        # session must not fail because a migration is outstanding.
+        policy = "coached"
         if body.attempt_id:
             try:
-                att = (supabase.table("attempts").select("user_id, session_state")
+                att = (supabase.table("attempts").select("*")
                        .eq("id", body.attempt_id).limit(1).execute())
                 if att.data and att.data[0].get("user_id") == uid:
+                    from routes.attempts import _resolve_policy
+                    policy = _resolve_policy(att.data[0], row)
                     notes = voice_state(att.data[0].get("session_state")).get("coach_notes") or []
                     msgs = (supabase.table("attempt_messages").select("role, content, created_at")
                             .eq("attempt_id", body.attempt_id).order("created_at", desc=False).execute())
                     history = [m for m in (msgs.data or []) if m.get("role") in ("user", "assistant")]
             except Exception as e:  # noqa: BLE001 -- context is a nicety, never a blocker
                 print(f"[realtime] attempt context not read: {type(e).__name__}")
+        if not body.attempt_id:
+            from routes.attempts import _resolve_policy
+            policy = _resolve_policy({}, row)
         coach_on = os.getenv("VOICE_COACH", "off").strip().lower() in ("1", "on", "true", "yes")
         level = normalize_level(body.level, row.get("difficulty"))
         resume = bool(history)
@@ -286,7 +297,13 @@ async def create_realtime_session(
             llm_case_content(row), row.get("type") or "", notes if coach_on else None,
             hint=row.get("hint"), solution=row.get("solution"),
             transcript=[dict(m, content=strip_say_label(m.get("content") or "")) for m in history],
-            market=case_market(row), level=level)
+            market=case_market(row), level=level,
+            # Without this the coached playbook runs on a ranked attempt: its ANSWER RULE
+            # tells the model to read the worked answer out to anyone who asks twice, and
+            # its go-ahead line tells the candidate they are on the right track. Gating
+            # /voice-tool was not enough - no tools are offered by default, so THIS prompt
+            # is the only control surface on the model-led path.
+            teaching_policy=policy)
         if os.getenv("VOICE_TOOLS", "off").strip().lower() in ("1", "on", "true", "yes"):
             tools_cfg = {"tools": VOICE_TOOLS, "tool_choice": "auto"}
     else:

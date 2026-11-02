@@ -69,5 +69,12 @@ check("debrief carries a next drill", db["next_drill"] and db["next_drill"]["foc
 
 print()
 if _fail:
-    print(f"{len(_fail)} FAILED: {_fail}"); sys.exit(1)
-print("ALL PASS")
+    print(f"{len(_fail)} FAILED: {_fail}")
+    if __name__ == "__main__":
+        sys.exit(1)
+    else:
+        raise AssertionError(f"{len(_fail)} FAILED: {_fail}")
+else:
+    print("ALL PASS")
+    if __name__ == "__main__":
+        sys.exit(0)

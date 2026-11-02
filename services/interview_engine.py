@@ -35,6 +35,7 @@ from services.interviewer_decision import (
     decide_response, build_interviewer_control_packet, validate_contextual_line,
     CONTEXTUAL_PRESENCE, scrub_control_leak, StreamLeakGuard,
     StreamReplyGuard, StreamShapeGuard, looks_like_refusal, is_praise_only, strip_all_questions, strip_solicitations,
+    certifies_correctness,
     _filter_lines,
 )
 from services import numbers_check
@@ -410,27 +411,49 @@ _RETRY_NOTES = {
                        "requires as plain statements. Write the reply again."),
     "praise_only": ("Your reply was only praise; it gave the candidate nothing to use. Do what the turn "
                     "requires, specifically, without praise. Write the reply again."),
+    "certified_correct": ("You told the candidate their own figure or working is correct. Nothing in this "
+                          "turn verified it, and endorsing a number both spoils the exercise and misleads "
+                          "them when it is wrong. Do what the turn requires without saying anything is "
+                          "correct, right or accurate. Write the reply again."),
 }
 
 
-def _no_question_problem(clean: str, mode: str, allow_questions: bool, policy: str) -> Optional[str]:
+def _no_question_problem(clean: str, mode: str, allow_questions: bool, policy: str,
+                         may_confirm: bool = False) -> Optional[str]:
     """Why a no-question reply cannot ship as written (None = it can)."""
     if looks_like_refusal(clean):
         return "refusal"
-    if is_praise_only(clean):
+    if is_praise_only(clean, policy):
         return "praise_only"
+    # 2026-11-02: help_when_stuck_with_work failed 3/3 live coached runs on
+    # "Your calculation of 2.67 crore is correct ..." -- the only scenario that failed
+    # every run. Certifying the candidate's own figure is forbidden in BOTH modes unless
+    # code checked the arithmetic this turn (may_confirm_correctness).
+    if not may_confirm and certifies_correctness(clean):
+        return "certified_correct"
     body = sanitize_reply(scrub_control_leak(clean), policy)
     if not allow_questions and not strip_solicitations(strip_all_questions(body)).strip():
         return "questions_only"
     return None
 
 
-def _finish_no_question(cli, model, messages, raw_text, mode, allow_questions, policy, record):
+def _may_confirm(plan) -> bool:
+    """Did code actually verify the arithmetic this turn? Only then may the interviewer
+    say anything of the candidate's is correct (see _no_question_problem)."""
+    try:
+        return bool(plan["packet"]["interviewer_control"]["interviewer_decision"]
+                    .get("may_confirm_correctness"))
+    except Exception:  # noqa: BLE001 - a missing packet means "no, it was not verified"
+        return False
+
+
+def _finish_no_question(cli, model, messages, raw_text, mode, allow_questions, policy, record,
+                        may_confirm: bool = False):
     """V12.1: one regeneration when the reply refuses data, is only praise, or is
     only questions (which used to ship as the stock 'Let's move on to the next
     phase.'). Returns (tag, final_text, raw_text)."""
     tag, clean = parse_control_tag(raw_text)
-    problem = _no_question_problem(clean, mode, allow_questions, policy)
+    problem = _no_question_problem(clean, mode, allow_questions, policy, may_confirm)
     if problem:
         try:
             t0 = time.time()
@@ -443,7 +466,7 @@ def _finish_no_question(cli, model, messages, raw_text, mode, allow_questions, p
             record(resp2, int((time.time() - t0) * 1000))
             raw2 = (resp2.choices[0].message.content or "").strip()
             tag2, clean2 = parse_control_tag(raw2)
-            if clean2 and _no_question_problem(clean2, mode, allow_questions, policy) is None:
+            if clean2 and _no_question_problem(clean2, mode, allow_questions, policy, may_confirm) is None:
                 tag, clean, raw_text = (tag2 or tag), clean2, raw2
             print(f"[interviewer] regenerated reason={problem} ok={clean2 == clean}")
         except Exception as e:  # noqa: BLE001 - the first reply is still usable after filtering
@@ -451,7 +474,7 @@ def _finish_no_question(cli, model, messages, raw_text, mode, allow_questions, p
     if looks_like_refusal(clean):
         clean = _filter_lines(clean, lambda x: not looks_like_refusal(x))
     final_text = enforce_mode(scrub_control_leak(clean), mode, allow_questions, policy)
-    if is_praise_only(final_text):
+    if is_praise_only(final_text, policy):
         final_text = enforce_mode("", mode, False, policy)  # never ship "Great job!" as the turn
     return tag, final_text, raw_text
 
@@ -600,7 +623,8 @@ def stream_interviewer_reply(
                            response=r, latency_ms=ms, provider=_p)
 
         tag, final_text, raw_text = _finish_no_question(cli, model, messages, raw_text, mode,
-                                                        allow_questions, policy, _record_retry)
+                                                        allow_questions, policy, _record_retry,
+                                                        may_confirm=_may_confirm(plan))
 
         if control_out is not None:
             _set_control(control_out, plan, tag or {}, "model")
@@ -632,7 +656,7 @@ def stream_interviewer_reply(
     final = _U()
     stripper = StreamTagStripper() if adaptive else None
     guard = StreamLeakGuard() if adaptive else None
-    reply_guard = StreamReplyGuard() if adaptive else None
+    reply_guard = StreamReplyGuard(policy) if adaptive else None
     # V12.1 (arena adversarial run): lists become short lines and prose stops after four
     # sentences (the final question still goes out). Chat only; voice has its own limits.
     shape_guard = StreamShapeGuard(budget=4) if (adaptive and channel == "text") else None
@@ -792,7 +816,8 @@ def complete_interviewer_reply(
     text = (resp.choices[0].message.content or "").strip()
     if adaptive:
         tag, text, _raw = _finish_no_question(cli, used_model, messages, text, mode, allow_questions,
-                                              policy, lambda r, ms: None)
+                                              policy, lambda r, ms: None,
+                                              may_confirm=_may_confirm(plan))
         if control_out is not None:
             _set_control(control_out, plan, tag or {}, "model")
     return text

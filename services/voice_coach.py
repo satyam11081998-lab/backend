@@ -260,24 +260,27 @@ def hint(case: Dict[str, Any], case_content: str, transcript: List[Dict[str, str
 
 
 def exam_refusal(tool: str, session_state: Optional[dict]) -> Tuple[str, Dict[str, Any]]:
-    """Interview mode: the hint ladder and the answer rule do not exist.
+    """Interview mode: the hint ladder and the answer rule are not callable.
 
-    An Interview that dispenses hints when asked is not an interview, and the model-led
-    voice path reaches these tools directly -- so the refusal has to live here rather
-    than relying on the prompt to leave the tool alone. Returns (tool_output, state)
-    with the state UNCHANGED: nothing is spent, because nothing was given. The ladder
-    is still there intact if the candidate runs the same case on the Whiteboard.
+    The model-led voice path reaches these tools directly, so the gate has to live here
+    rather than relying on the prompt to leave the tool alone. Returns (tool_output,
+    state) with the state UNCHANGED: nothing is spent, because nothing was given. The
+    ladder is intact if the candidate runs the same case on the Whiteboard.
+
+    The output is a CROSS-QUESTION, not a refusal (owner, 2026-11-02). An interviewer
+    never announces that it will not help; it asks a sharper question, and the question
+    is the help. Saying "that's yours to work out" out loud turns the room into a
+    transaction and tells the candidate they are being managed.
     """
     v = voice_state(session_state)
+    base = ("Do NOT give a hint, the approach, the answer or any figure, and do NOT say that you cannot help, "
+            "that it is theirs to work out, or anything about their results page. Do not apologise. Instead ask "
+            "ONE sharper question, built from what they just said, that narrows it without naming the answer: "
+            "turn their own last move back on them, force the unit or the denominator into the open, make them "
+            "choose between two things they have already said, or ask what they would need to know to decide. ")
     if tool == "answer_request":
-        said = ("Do NOT give the answer or any part of it. Say, in your own words and in one sentence, that in an "
-                "interview this is theirs to work out, and that the full worked answer is on their results page "
-                "when they finish. Then ask what their best read is.")
-    else:
-        said = ("Do NOT give a hint. Say, in your own words and in one sentence, that you want to hear their "
-                "thinking rather than lead them. Then ask the one question that makes them commit: what they "
-                "would look at first, or what their current number rests on.")
-    return said + " Keep it short and hand the floor straight back.", v
+        base += "They asked outright for the answer; the question is all they get. "
+    return base + "One short spoken sentence, one question, then hand the floor straight back.", v
 
 
 def answer_request(case: Dict[str, Any], case_content: str, transcript: List[Dict[str, str]],

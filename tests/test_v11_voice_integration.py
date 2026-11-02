@@ -424,6 +424,11 @@ import google  # noqa: E402
 
 sys.modules["google.genai"] = fake_genai
 google.genai = fake_genai
+_orig_v11_rtg = {k: getattr(rtg, k, None) for k in [
+    "GEMINI_API_KEY", "get_supabase_client", "get_verified_user", "is_guest_user",
+    "check_rate_limit", "assert_daily_budget", "get_ai_input_quota", "has_credit",
+    "get_balance", "log_ai_usage", "_resolve_live_model"
+]}
 rtg.GEMINI_API_KEY = "test"
 rtg.get_supabase_client = lambda: FakeDB([])
 rtg.get_verified_user = lambda sb, a: ("u1", {"id": "u1"})
@@ -444,6 +449,9 @@ check("Gemini session minted", out.get("token") == "auth_tokens/test")
 check("Gemini system_instruction == voice renderer only", cfg.get("system_instruction") == VOICE_RENDERER_INSTRUCTIONS)
 check("Gemini instructions carry no old interviewer text", not any(p in str(cfg) for p in OLD_PHRASES))
 check("Gemini still transcribes input + output", "input_audio_transcription" in cfg and "output_audio_transcription" in cfg)
+for k, v in _orig_v11_rtg.items():
+    if v is not None:
+        setattr(rtg, k, v)
 
 print()
 print("=" * 72)
@@ -589,5 +597,13 @@ check("app still registers /messages and /voice-decision",
       {"/attempts/{attempt_id}/messages", "/attempts/{attempt_id}/voice-decision"} <= {r.path for r in main.app.routes})
 
 print()
-print(f"{len(_fail)} FAILED: {_fail}" if _fail else "ALL PASS")
-sys.exit(1 if _fail else 0)
+if _fail:
+    print(f"{len(_fail)} FAILED: {_fail}")
+    if __name__ == "__main__":
+        sys.exit(1)
+    else:
+        raise AssertionError(f"{len(_fail)} FAILED: {_fail}")
+else:
+    print("ALL PASS")
+    if __name__ == "__main__":
+        sys.exit(0)

@@ -41,6 +41,8 @@ ALLOW_QUESTIONS: Dict[str, bool] = {
     "REFLECT_PROGRESS": False,
     "VALIDATE_AND_HAND_BACK": False,
     "TARGETED_QUESTION": True,
+    # The whole turn IS a question. Without it there is nothing left.
+    "CROSS_QUESTION": True,
     "MICRO_HINT": False,
     "CORRECT_AND_CONTINUE": True,
     "REPAIR_AND_RESET": False,
@@ -174,6 +176,19 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
         "(pick it out of their message: the step, the split, the number they reached) and hand the "
         "floor back so they continue. Do not grade it, do not repeat their arithmetic, do not add "
         "analysis of your own. No question."),
+    "CROSS_QUESTION": (
+        "The candidate asked you for the answer, the approach or a hint. Do NOT announce that you are "
+        "not going to help, do not say it is theirs to work out, do not mention the results page, do "
+        "not apologise, and do not refuse in words. A real interviewer simply asks a sharper question "
+        "instead - and the question is the help.\n"
+        "Ask ONE cross-question that narrows the problem for them without naming the answer: turn their "
+        "own last move back on them (\"what has to be true for that to hold?\"), force the unit or the "
+        "denominator into the open (\"per month or per year?\"), make them pick between two things they "
+        "already said, or ask what they would need to know to decide. Build it out of their own words, "
+        "not out of the model solution. One or two sentences, one question mark, no preamble.\n"
+        "Never, in doing this: name the approach or framework, name the branch they have missed, give or "
+        "correct a figure, do their next calculation, or ask a question whose wording contains the hint "
+        "(\"have you considered the cost side?\" is the hint wearing a question mark)."),
     "REFLECT_PROGRESS": (
         "The candidate just made a distinction or laid out a plan. In one short, neutral sentence say what "
         "it separates or what they are about to check - no evaluative words (smart, good, insightful, "
@@ -308,6 +323,9 @@ _EXAM_NOTES = {
                              "recheck it; do NOT give the corrected figure, even on a second pointer."),
     "FINAL_REVIEW": " TEACHING POLICY exam: no reference answer; the sanity check and the Submit pointer only.",
     "MICRO_HINT": " TEACHING POLICY exam: say which step to recheck; never give the corrected figure.",
+    "CROSS_QUESTION": (" TEACHING POLICY exam: the question must not contain the hint. \"What would you "
+                       "look at first?\" and \"per month or per year?\" are fine; \"Have you thought about "
+                       "the cost side?\" is the hint in question form and is a failed turn."),
 }
 
 

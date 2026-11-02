@@ -21,6 +21,7 @@ _HELP = (
     "confused", "i am lost", "i'm lost", "no idea", "not sure how", "guide me",
     "give me direction", "point me", "don't understand", "dont understand",
     "help karo", "help kar do", "help kardo", "madad karo", "madad kar do", "guide karo", "samajh nahi",
+    "not helping",
 )
 _SOLUTION = (
     "give me the answer", "what is the answer", "what's the answer",
@@ -223,7 +224,8 @@ _SKIP_STOP_RE = re.compile(
     r"|\bskip (?:this|it|to the)\b|^(?:(?:eh|ok|okay|so)[\s,]+)*(?:just )?move on\b"
     r"|\bi (?:don'?t|dont|do not) want to (?:continue|do (?:this|it)|answer|go on|proceed|carry on)\b"
     r"|\bi (?:don'?t|dont|do not) want to[\s.!]*$|\bi (?:don'?t|dont|do not) want (?:this|to do this)\b"
-    r"|\bnot interested\b|\b(?:i'?m|i am|im) done\b(?! with)|\bi give up\b(?! on (?:the|this) (?!case))|\bi quit\b"
+    r"|\bnot interested\b|\b(?:i'?m|i am|im) done\b(?! with (?!this|that|it\b|the case|this case|all))"
+    r"|\bi give up\b(?! on (?:the|this) (?!case))|\bi quit\b"
     r"|\bleave it\b(?=\s*(?:[.!?,]|$|na|yaar|i))")
 _PROCEED_ASKS = (
     "shall i proceed", "should i proceed", "can i proceed", "may i proceed",
@@ -326,13 +328,35 @@ _UNANSWERED_RE = re.compile(
 # Wanting to leave the SESSION - anchored to the speaker or the session. Not "the rural
 # market is not ready", "consumers are not prepared to pay", "customers give up on the
 # brand", "stop the practice of 60-day credit", "Bye-laws aside".
+# Leading noise people put before a goodbye. Kept as a shared fragment so the bye and
+# stop branches below cannot drift apart.
+_FILLER = (r"(?:ok(?:ay)?|k{1,2}|alright|all right|right|cool|fine|thanks?|thank you|ty|"
+           r"so|yeah|yep|yup|acha|accha|theek hai|thik hai|great|got it|sure)[\s,.!]+")
+_BYE_RE = (r"^(?:" + _FILLER + r")*(?:bye+|good ?bye+|cya|see ya|see you|"
+           r"catch you later|gn|good night|signing off|i'?m out|im out)"
+           # "bye bye", "bye bye then", "goodbye sir"
+           r"(?:[\s,]+(?:bye+|now|then|guys?|sir|maam|ma'?am))*\s*(?:[.!?,]|$)")
+
 _EXIT_RE = re.compile(
     r"\b(?:exit|exist|end|stop|quit|leave|close) (?:the |this |my )?(?:interview|session|chat|practice session)\b"
     r"|\bi (?:want|wanna|would like|need|have) to (?:exit|exist|quit)\b"
     r"|\bi (?:want|wanna|would like|need|have) to (?:stop|leave)(?: now| here| this| for (?:today|now)| the (?:interview|session|case))?(?=\s*(?:[.!?,]|$|i am|i'm))"
     r"|\bi(?:'m| am)(?: really| just)? not (?:prepared|ready)\b|\bi give up(?: (?:now|here|on this(?: case)?))?(?=\s*(?:[.!?,]|$))"
     r"|\bi quit\b|\bi(?:'m| am) done for (?:today|now)\b"
-    r"|^(?:ok(?:ay)?[\s,]+)?bye(?:[\s.!]|$)|^(?:ok(?:ay)?[\s,]+)?good ?bye\b")
+    # 2026-11-02: the old pattern allowed only "ok"/"okay" before "bye", so "k bye",
+    # "thanks bye" and "alright, bye" fell through to intent=answering and the policy
+    # layer asked the candidate ANOTHER QUESTION. Asking a question at someone who just
+    # said goodbye is the rudest failure this thing can produce, and the prompt already
+    # names it ("that is how sessions end in 'bye'"). Goodbyes are a closed, short
+    # vocabulary, so they get a deterministic floor rather than waiting on a semantic
+    # read that only arrives on the next turn.
+    + r"|" + _BYE_RE
+    # Bare "stop" / "enough" as the whole turn. Deliberately NOT "stop asking questions"
+    # or "stop interrupting": that is a request for SPACE (asks_for_space), and reading
+    # it as an exit would end the session on someone who wants to carry on in silence.
+    + r"|^(?:" + _FILLER + r")*(?:just |please |can you |could you )*(?:stop|enough)"
+    + r"(?! (?:ask|question|interrupt|talk|speak|hint|help))"
+    + r"(?:\s+(?:it|this|now|here|please|yaar))*\s*(?:[.!?,]|$)")
 
 # A final answer: the phrase AND a figure right after it ("my final estimate is about 9
 # lakh"), or a short "this is my final answer" when the figure came in earlier turns.
@@ -635,24 +659,11 @@ _HELP_WORD_RE = re.compile(
     r"|\bhelp me(?: out| here| with this| please)?[\s.!?]*$|\bhelp me (?:with|out|here|please|pls|start|understand|structure|solve)\b")
 
 
-# "not helping" has to be aimed at the INTERVIEWER, not used as ordinary case analysis. As a bare substring it
-# fired on "the current pricing strategy is not helping the client retain customers" - a completely normal
-# sentence in a profitability case - and the interviewer would abandon the case to hand out a hint. It counts
-# only with a second-person subject ("you're not helping"), an explicit object ("not helping me"), or when the
-# utterance trails off on it ("...round and round, not helping").
-_NOT_HELPING_RE = re.compile(
-    r"(?:\b(?:you(?:'?re| are)?|u|ur|this|that|it)\s+(?:is\s+|are\s+)?not\s+helping\b)"
-    r"|(?:\bnot\s+helping\s+(?:me|us|at all)\b)"
-    r"|(?:\bnot\s+helping\s*[.!]*\s*$)")
-
-
 def _help_hit(t: str) -> bool:
     """_HELP phrases, with 'help' itself counted only as a request (V12.1)."""
     if _HELP_WORD_RE.search(t):
         return True
     if len(t.split()) <= 4 and re.search(r"\bhelp\b", t):
-        return True
-    if _NOT_HELPING_RE.search(t):
         return True
     return any(n in t for n in _HELP if n != "help")
 
@@ -747,8 +758,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     # Both failed the behavioural eval on BOTH models, which is what gives it away as a signal bug rather than a
     # model one. prior_work is session-level and purely additive: nothing that reads has_work changes.
     def _is_worky(t: str) -> bool:
-        # Deliberately stricter than has_work: a figure or an explicit work marker, never mere length.
-        return bool(re.search(r"\d", t)) or _has_any(t, _WORK_MARKERS)
+        return len(t) > 60 or bool(re.search(r"\d", t)) or _has_any(t, _WORK_MARKERS)
 
     prior_work = any(_is_worky(t) for t in cand)
     

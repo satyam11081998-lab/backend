@@ -1,0 +1,143 @@
+================================================================================
+CONSILIO BACKEND: STATUS, DIAGNOSTICS & HANDOFF FOR CLAUDE
+Date: 2026-11-02
+Repo: D:\dev\mece\consilio-backend
+Shell & Environment: Windows PowerShell, Python 3.13.14 (Microsoft Store build)
+================================================================================
+
+1. EXECUTIVE SUMMARY & CURRENT STATUS
+--------------------------------------------------------------------------------
+- Test Suite Status: FULLY GREEN (428 passed, 0 failed, 5 skipped, 0 collection errors in ~30s).
+- Live Behavioral Eval: 47/50 PASS (94%), 0 reasoning errors with gpt-4o-mini in 32s.
+- Offline Behavioral Eval: 50/50 PASS (100%).
+- OpenAI Key Status: Fixed and validated. Live calls succeed with HTTP 200.
+- No git push has been performed.
+
+--------------------------------------------------------------------------------
+2. ROOT CAUSE & FIX: 401 AUTHENTICATION ERROR
+--------------------------------------------------------------------------------
+Symptom:
+  Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-proj-...qf8A'}}
+Root Cause:
+  The environment had a revoked / stale OpenAI API key ending in '...qf8A' stored in .env.
+Fix Applied:
+  Updated .env with the valid key provided by the user (ending in '...R8sA').
+  Verified via direct OpenAI API call and end-to-end eval run. All live calls now authenticate cleanly.
+
+--------------------------------------------------------------------------------
+3. TEST SUITE REPAIR: ALL ROOT CAUSES & EXACT FIXES (Exhaustive)
+--------------------------------------------------------------------------------
+Initial State:
+  Suite failed during collection on 8 test files with:
+  "ImportError: cannot import name 'openai_client' from 'services.ai_providers' (unknown location)"
+  Followed by collection abortion due to module-level SystemExit in test files.
+
+Root Cause A: "unknown location" on services.ai_providers / services.ai_usage
+  - File: tests/test_broadcast_market.py
+  - Mechanism: Lines 50-56 created raw types.ModuleType("services.ai_providers") and
+    assigned them into sys.modules without __file__. When pytest collected subsequent
+    test files that legitimately imported services.ai_providers, Python found the stub
+    in sys.modules lacking __file__, raising ImportError (unknown location).
+  - Fix: Wrapped the import in a try...finally block in test_broadcast_market.py that
+    restores the original sys.modules references immediately after import.
+
+Root Cause B: Pytest INTERNALERROR from module-level sys.exit
+  - Files: test_v11_voice_integration.py, test_learning_model.py,
+           test_response_functions.py, test_voice_model_led.py
+  - Mechanism: Module-level sys.exit(...) calls executed during pytest collection.
+    SystemExit escaping collection caused pytest to fail with INTERNALERROR.
+  - Fix: Converted to:
+      if __name__ == "__main__":
+          sys.exit(...)
+      else:
+          raise AssertionError(...)
+
+Root Cause C: .pytest_cache Access Denied on Windows
+  - Mechanism: .pytest_cache had restricted Windows ACLs from another user / elevated process.
+  - Fix: Added `addopts = -p no:cacheprovider` to pytest.ini. Pytest now runs cleanly without
+    attempting to write to .pytest_cache.
+
+Root Cause D: Model Bump Desync in test_daily_blog.py (Line 363 & 703)
+  - File: tests/test_daily_blog.py
+  - Mechanism: services/ai_providers._GEMINI_LLM had been bumped from "gemini-3.6-flash" to
+    "gemini-3.8-flash". The test mock flaky() hardcoded `if model != "gemini-3.6-flash"`,
+    and line 703 expected "gemini-3.6-flash" in writer_models().
+  - Fix: Replaced hardcoded "gemini-3.6-flash" with db._gemini_default(), ensuring tests
+    track the system's configured default Gemini model dynamically.
+
+Root Cause E: Cross-Test Monkey-Patching Leaks in routes.realtime_gemini (11 Failures)
+  - Files: tests/test_gemini_free_trial.py & tests/test_v11_voice_integration.py
+  - Mechanism: Both files patched routes.realtime_gemini (rtg.voice_interviewer_mode = lambda: "renderer"
+    and rtg._resolve_live_model = lambda: "fake-live") without saving or restoring module state.
+    When test_voice_model_led.py ran later, it inherited the stale "renderer" mode and "fake-live"
+    resolver, failing 11 Gemini live assertions.
+  - Fix: Added save & restore blocks in both test files to restore all patched attributes on
+    routes.realtime_gemini to their original state upon completion.
+
+Root Cause F: Mode-Aware Opening Note in test_arena_routes.py
+  - File: tests/test_arena_routes.py
+  - Mechanism: Line 496 expected the old opening note without mode-specific whiteboard text.
+  - Fix: Updated expected string to include: "Your structure is drawn on the right as you work;
+    this run is practice and isn't ranked." (matching test_arena_parity.py).
+
+Root Cause G: Leaked Environment Variable INTERVIEWER_NUMBERS_AUDIT (2 Failures)
+  - File: tests/test_response_functions.py
+  - Mechanism: Set `os.environ["INTERVIEWER_NUMBERS_AUDIT"] = "off"` at line 41 but never popped it.
+    This caused tests in test_v121_real_sessions.py to fail because nc.should_audit() returned False.
+  - Fix: Added `os.environ.pop("INTERVIEWER_NUMBERS_AUDIT", None)` at end of test_response_functions.py.
+
+Root Cause H: Missing CROSS_QUESTION in _USES_LATEST_WORK (1 Failure)
+  - File: services/interviewer_decision.py
+  - Mechanism: Today's changes introduced CROSS_QUESTION for exam mode when a candidate asks for
+    help ("give it as ONE sharper question built from their own last move"). But CROSS_QUESTION was
+    not in _USES_LATEST_WORK, so build_interviewer_control_packet cleared candidate_state.latest_work_check
+    to None, failing test_exam_policy_never_carries_the_corrected_figure.
+  - Fix: Added "CROSS_QUESTION" to _USES_LATEST_WORK in services/interviewer_decision.py:619.
+
+Root Cause I: Cleanup of Temporary Diagnostics
+  - Removed tests/test_zz_import_diagnostic.py.
+
+--------------------------------------------------------------------------------
+4. EVALUATION RESULTS
+--------------------------------------------------------------------------------
+A. Offline Signal Eval (Deterministic, 50 scenarios):
+   Result: 50/50 PASS (100%)
+
+B. Live Model Eval (50 scenarios, gpt-4o-mini, judge gpt-4o):
+   Command: python -m tools.eval_interviewer_behavior --live --model gpt-4o-mini --best-of 1 --workers 5
+   Result: 47/50 PASS (94%) in 32s wall time
+   Failures breakdown:
+     - reasoning (0): ZERO reasoning errors. Catches bottles/litres, factor-of-1000,
+       contradictions, MECE overlap, double count, etc.
+     - behaviour (3): help_when_stuck_with_work, tiny_arithmetic_slip_ignore, product_ux_question.
+
+--------------------------------------------------------------------------------
+5. MODIFIED FILES SUMMARY
+--------------------------------------------------------------------------------
+Core Logic:
+  - services/interviewer_decision.py  (Added CROSS_QUESTION to _USES_LATEST_WORK)
+  - pytest.ini                        (Added addopts = -p no:cacheprovider)
+
+Tests:
+  - tests/test_arena_routes.py        (Updated opening transcript assertion)
+  - tests/test_broadcast_market.py    (Saved/restored sys.modules)
+  - tests/test_daily_blog.py          (Dynamic _gemini_default() instead of hardcoded 3.6-flash)
+  - tests/test_gemini_free_trial.py   (Saved/restored routes.realtime_gemini monkey patches)
+  - tests/test_learning_model.py      (Safe module-level assertion instead of sys.exit)
+  - tests/test_response_functions.py  (Popped INTERVIEWER_NUMBERS_AUDIT, safe assertion)
+  - tests/test_v11_voice_integration.py (Saved/restored rtg monkey patches, safe assertion)
+  - tests/test_voice_model_led.py     (Safe assertion instead of sys.exit)
+
+Removed:
+  - tests/test_zz_import_diagnostic.py
+
+--------------------------------------------------------------------------------
+6. READY FOR CLAUDE TO PICK UP
+--------------------------------------------------------------------------------
+Everything is in a clean, reproducible, 100% green state.
+To verify locally anytime:
+  python -m pytest -q
+To run live eval with 3 runs:
+  python -m tools.eval_interviewer_behavior --live --runs 3 --policy coached
+  python -m tools.eval_interviewer_behavior --live --runs 3 --policy exam
+================================================================================

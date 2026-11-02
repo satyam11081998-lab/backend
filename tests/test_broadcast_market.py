@@ -47,6 +47,8 @@ def _chat_with_fallback(feature, **kw):
     return _Resp(json.dumps(_reply["value"])), "test-model", "test-provider"
 
 
+_orig_providers = sys.modules.get("services.ai_providers")
+_orig_usage = sys.modules.get("services.ai_usage")
 _ai_providers = types.ModuleType("services.ai_providers")
 _ai_providers.chat_with_fallback = _chat_with_fallback
 sys.modules["services.ai_providers"] = _ai_providers
@@ -55,7 +57,17 @@ _ai_usage = types.ModuleType("services.ai_usage")
 _ai_usage.log_ai_usage = lambda **kw: _usage_meta.append(kw.get("meta"))
 sys.modules["services.ai_usage"] = _ai_usage
 
-from services import broadcast_gen as bg  # noqa: E402
+try:
+    from services import broadcast_gen as bg  # noqa: E402
+finally:
+    if _orig_providers is not None:
+        sys.modules["services.ai_providers"] = _orig_providers
+    else:
+        sys.modules.pop("services.ai_providers", None)
+    if _orig_usage is not None:
+        sys.modules["services.ai_usage"] = _orig_usage
+    else:
+        sys.modules.pop("services.ai_usage", None)
 
 passed = 0
 

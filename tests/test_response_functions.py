@@ -530,8 +530,16 @@ sent = [m["content"] for m in calls[0]["messages"] if m["role"] == "assistant"]
 check("the interviewer model never sees an old 'SAY:' line (it would copy the pattern)",
       sent and not any(c.startswith("SAY:") for c in sent), sent)
 
+os.environ.pop("INTERVIEWER_NUMBERS_AUDIT", None)
+
 print()
 if _fail:
     print(f"{len(_fail)} FAILED: {_fail}")
-    sys.exit(1)
-print("ALL PASS")
+    if __name__ == "__main__":
+        sys.exit(1)
+    else:
+        raise AssertionError(f"{len(_fail)} FAILED: {_fail}")
+else:
+    print("ALL PASS")
+    if __name__ == "__main__":
+        sys.exit(0)

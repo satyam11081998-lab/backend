@@ -279,7 +279,12 @@ def check(name, cond):
     global passed
     if not cond:
         print("  ✗", name)
-        raise SystemExit(1)
+        # AssertionError, NOT SystemExit. These checks run at MODULE level, so pytest
+        # executes them during collection -- and a SystemExit escaping collection is an
+        # INTERNALERROR that kills the entire session. One failing check here used to
+        # take all 24 test files down with it, which is how this suite looked "broken"
+        # rather than "one assertion is wrong" (2026-11-02).
+        raise AssertionError(name)
     passed += 1
     print("  ✓", name)
 
@@ -347,7 +352,7 @@ calls = []
 
 def flaky(prompt, model):
     calls.append(model)
-    if model != "gemini-3.6-flash":
+    if model != db._gemini_default():
         raise RuntimeError("404 NOT_FOUND. This model is no longer available to new users")
     return fake_grounded(prompt, model)
 
@@ -356,7 +361,7 @@ env(GEMINI_MODEL="gemini-9-pro")
 db._dead_models.clear()
 r2 = db.research("x", grounded=flaky, resolve=fake_resolve, fetch=fake_fetch)
 check("research skips a retired model and uses one that works",
-      r2["linked"] >= 3 and calls[:2] == ["gemini-9-pro", "gemini-3.6-flash"] and r2["engines"] == ["gemini:gemini-3.6-flash"])
+      r2["linked"] >= 3 and calls[:2] == ["gemini-9-pro", db._gemini_default()] and r2["engines"] == [f"gemini:{db._gemini_default()}"])
 calls.clear()
 db.research("y", grounded=flaky, resolve=fake_resolve, fetch=fake_fetch)
 check("a retired model is remembered: it costs one failed call, not one per topic", "gemini-9-pro" not in calls)
@@ -488,7 +493,7 @@ def fake_upload(_sb, path, data, ctype):
 art = {"hero": {"prompt": "Scene A", "alt": "A", "caption": "Cap A"},
        "inline": [{"after_section": 3, "prompt": "Scene C", "alt": "C", "caption": "Cap C"},
                   {"after_section": 1, "prompt": "Scene B", "alt": "B", "caption": "Cap B"}]}
-out = im.make_images(None, "my-post", art, generate=fake_gen, upload=fake_upload)
+out = im.make_images(None, "my-post", art, generate=fake_gen, upload=fake_upload, order=["gemini"])
 check("hero (16:9) and inline (3:2) pictures are generated in one house style",
       out["hero"]["width"] == 2000 and out["hero"]["height"] == 1125 and len(out["images"]) == 2
       and all("No text" in p or "no text" in p for p, _ in prompts) and {a for _, a in prompts} == {"16:9", "3:2"})
@@ -498,7 +503,7 @@ check("pictures are stored as WebP for the page and a JPEG link preview for the 
       and out["hero"]["og_url"].startswith("https://store.example/my-post/og-"))
 check("inline pictures keep their place in the article", [i["after_section"] for i in out["images"]] == [1, 3])
 broken = im.make_images(None, "p", art, generate=lambda p, a: (_ for _ in ()).throw(RuntimeError("quota")),
-                        upload=fake_upload)
+                        upload=fake_upload, order=["gemini"])
 check("a failed picture never breaks the article", broken.get("hero") is None and broken["errors"])
 
 
@@ -695,7 +700,7 @@ check("an edit that invents a number is thrown away", "7777" not in json.dumps(r
       and not res["page"]["agent_meta"]["edited"])
 db._discovered.update(at=10 ** 12, all=["gemini-9.1-pro-preview", "gemini-9.1-pro", "gemini-9.1-flash", "gemini-8-pro"])
 check("the writer is the newest Gemini Pro on the key, stable before preview, then the default",
-      _orig_writer_models()[:3] == ["gemini-9.1-pro", "gemini-9.1-pro-preview", "gemini-3.6-flash"])
+      _orig_writer_models()[:3] == ["gemini-9.1-pro", "gemini-9.1-pro-preview", db._gemini_default()])
 env(DAILY_BLOG_WRITER_MODEL="gpt-9, gemini-x")
 check("DAILY_BLOG_WRITER_MODEL wins (comma-separated)", _orig_writer_models() == ["gpt-9", "gemini-x"])
 env()
@@ -754,11 +759,17 @@ hero_item = {"subject": "Bombay House, the Tata group headquarters", "search": [
              "prompt": "A stone building", "alt": "Bombay House", "caption": "Where the group is run"}
 inline_item = {"after_section": 2, "subject": "a steel rolling mill", "search": ["steel mill India"],
                "prompt": "A steel plant at dusk", "alt": "Steel plant", "caption": "The old core"}
-srch = lambda qs, used=None, errors=None: im.candidates(  # noqa: E731
+# These doubles take **kw so they keep working when production grows a new keyword.
+# They did not, and when find_photo gained `slug` (photo variety across articles) and
+# `deadline` (the photo-search budget), make_images started passing both -> TypeError ->
+# swallowed by the broad `except Exception` in make_images -> no photo was ever found and
+# every slot silently fell through to Gemini. The checks below then failed for a reason
+# that had nothing to do with what they test (2026-11-02).
+srch = lambda qs, used=None, errors=None, **kw: im.candidates(  # noqa: E731
     qs, searchers=[lambda q: im.search_commons(q, http=lambda u, p: COMMONS)], used=used, errors=errors)
-pick = lambda c, want, title: im.judge(c, want, title, vision=fake_vision, fetch=fetch_png)  # noqa: E731
-photo = lambda item, title, used, errors=None: im.find_photo(  # noqa: E731
-    item, title, used, search=srch, pick=pick, fetch=fetch_png, errors=errors)
+pick = lambda c, want, title, **kw: im.judge(c, want, title, vision=fake_vision, fetch=fetch_png)  # noqa: E731
+photo = lambda item, title, used, errors=None, **kw: im.find_photo(  # noqa: E731
+    item, title, used, search=srch, pick=pick, fetch=fetch_png, errors=errors, **kw)
 uploads.clear()
 out = im.make_images(None, "tata-trusts", {"hero": hero_item, "inline": [inline_item]}, title="Who owns Tata Sons",
                      generate=fake_gen, upload=fake_upload, photo=photo, order=["photos", "gemini"])

@@ -85,6 +85,19 @@ def _rate_limit(key, max_calls, window_seconds):
         raise HTTPException(status_code=429, detail="Too many requests")
 
 
+_orig_rg = {
+    "get_supabase_client": getattr(rg, "get_supabase_client", None),
+    "get_verified_user": getattr(rg, "get_verified_user", None),
+    "is_guest_user": getattr(rg, "is_guest_user", None),
+    "check_rate_limit": getattr(rg, "check_rate_limit", None),
+    "assert_daily_budget": getattr(rg, "assert_daily_budget", None),
+    "get_ai_input_quota": getattr(rg, "get_ai_input_quota", None),
+    "get_balance": getattr(rg, "get_balance", None),
+    "log_ai_usage": getattr(rg, "log_ai_usage", None),
+    "voice_interviewer_mode": getattr(rg, "voice_interviewer_mode", None),
+    "_resolve_live_model": getattr(rg, "_resolve_live_model", None),
+}
+
 rg.get_supabase_client = lambda: _SB()
 rg.get_verified_user = lambda sb, auth: ("u1", types.SimpleNamespace(email="a@b.c"))
 rg.is_guest_user = lambda u: STATE["guest"]
@@ -170,3 +183,9 @@ r = start(tier="free")
 check("no response says 'Pro feature' any more", "Pro feature" not in r.text)
 
 print(f"\n{passed} checks passed.")
+
+for k, v in _orig_rg.items():
+    if v is not None:
+        setattr(rg, k, v)
+    elif hasattr(rg, k):
+        delattr(rg, k)
