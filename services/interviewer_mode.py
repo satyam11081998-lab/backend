@@ -184,8 +184,12 @@ FUNCTION_INSTRUCTIONS: Dict[str, str] = {
         "Ask ONE cross-question that narrows the problem for them without naming the answer: turn their "
         "own last move back on them (\"what has to be true for that to hold?\"), force the unit or the "
         "denominator into the open (\"per month or per year?\"), make them pick between two things they "
-        "already said, or ask what they would need to know to decide. Build it out of their own words, "
-        "not out of the model solution. One or two sentences, one question mark, no preamble.\n"
+        "already said, or ask what they would need to know to decide.\n"
+        "THE QUESTION MUST CONTAIN SOMETHING THEY ACTUALLY WROTE - their figure, their expression, their "
+        "bucket name, quoted back. candidate_state.latest_work is what they last put on the table; use "
+        "it. \"What has to be true for 0.95S - 2 = 0.80(S - 2) to hold?\" is a cross-question; \"What "
+        "specific part are you finding most challenging?\" is a question that would fit any case on any "
+        "day, and is a failed turn. One or two sentences, one question mark, no preamble.\n"
         "Never, in doing this: name the approach or framework, name the branch they have missed, give or "
         "correct a figure, do their next calculation, or ask a question whose wording contains the hint "
         "(\"have you considered the cost side?\" is the hint wearing a question mark)."),
@@ -358,15 +362,76 @@ _PACKET_RULES = (
     "invent a figure for them to sanity-check. If visual_structure_allowed is true you may lay a structure "
     "out on separate short lines joined by arrows (→); otherwise plain sentences only. Never use numbered "
     "lists ('1.', '2.'). Never tell the "
-    "candidate a fact is not given or not available: you own the facts. "
-    # The handles cost a dozen output tokens and no extra call: StreamShapeGuard already
-    # strips this tag before a token reaches the candidate.
-    "If case_context lists not_covered_yet or common_errors_on_this_case, add to your "
-    "control tag which of them THIS candidate turn touched, using their ids exactly: "
-    "touched=<ids they covered>; missed=<ids they fell into>, comma-separated, ids only, "
-    "omitted entirely when none apply. Never mention these ids or their text to the "
-    "candidate."
+    "candidate a fact is not given or not available: you own the facts."
 )
+
+# Only sent when the packet actually carries expectations (see case_expectations.
+# packet_block). Unconditional, it told the model to report ids for fields that are not
+# there on every case type nobody has seeded yet - instruction noise on every single turn.
+EXPECTATION_RULES = (
+    " REPORTING WHAT THEY COVERED: case_context lists not_covered_yet and/or "
+    "common_errors_on_this_case. Add to your control tag which of them THIS candidate turn "
+    "touched, using their ids exactly: touched=<ids they covered>; missed=<ids they fell "
+    "into>, comma-separated, ids only, each key omitted when none apply. The handles cost "
+    "a dozen tokens and are stripped before the candidate sees anything. Never mention "
+    "these ids, or the text next to them, to the candidate."
+)
+
+
+# Whiteboard only (control_packet.draw_structure). The candidate's decomposition, reported
+# on the tag the model already emits -- no second model call, no extra round trip. See
+# services/structure_tree.py for why it is reported rather than extracted.
+TREE_RULES = (
+    " DRAWING THEIR STRUCTURE: a diagram beside the conversation shows the candidate's own "
+    "decomposition. You keep it current by adding to your control tag ONLY what THIS "
+    "candidate turn put on the table, as tree=<parent>><child>, several separated by | , "
+    "a figure appended as #<figure>. A branch with no parent yet is written with nothing "
+    "before the > . Example, for a turn where they said the 1.2 crore metro population "
+    "splits into 40 lakh car owners: tree=>population#1.2 crore|population>car owners#40 lakh. "
+    "Use THEIR words, not yours, three or four words a node. Never restate a branch you "
+    "already reported, and omit tree= entirely on a turn that added nothing -- a question, "
+    "a clarification, or an answer that opened no new branch. Never mention the diagram, "
+    "the tag, or that you are drawing anything."
+)
+
+
+# Only sent when the packet actually carries arithmetic. The division is already done and
+# exact; what the model adds is whether the result is plausible in the real world, which is
+# the one half of this no amount of Python can cover. See services/quant_graph.py.
+NUMBERS_RULES = (
+    " WHAT THEIR OWN NUMBERS IMPLY: case_context.from_their_numbers states relations "
+    "computed exactly from figures the candidate themselves gave. The arithmetic is "
+    "correct; judging it is your job. Read each one and ask whether it could be true of "
+    "the real world -- a third of a city owning cars, a household drinking forty litres a "
+    "week, a shop serving more customers than the town has people. When one is clearly off, "
+    "that is your turn: put THEIR figure to them and ask what it works out to, in one "
+    "question. Quote the numbers; do not say they are wrong, do not give the right value, "
+    "and do not name this block. Anything listed under arithmetically_impossible is a part "
+    "bigger than the whole it came from -- raise that before anything else on the table. "
+    "When every relation looks fine, say nothing about them and take your turn as briefed."
+)
+
+
+def _rules_for(control_packet: Optional[Dict[str, Any]], packet_rules: Optional[str]) -> str:
+    """The packet rules, plus the expectation-reporting rules only when the packet has
+    expectations in it."""
+    base = packet_rules or _PACKET_RULES
+    try:
+        ic = (control_packet or {}).get("interviewer_control") or {}
+        cc = ic.get("case_context") or {}
+        # track_structure is set in the response_generation block, not at the top of
+        # interviewer_control -- read it from where build_interviewer_control_packet
+        # actually puts it, checked against a real packet in tests/test_e2e_quant.py.
+        rg = ic.get("response_generation") or {}
+        if cc.get("not_covered_yet") or cc.get("common_errors_on_this_case"):
+            base += EXPECTATION_RULES
+        if rg.get("track_structure"):
+            base += TREE_RULES
+        if cc.get("from_their_numbers"):
+            base += NUMBERS_RULES
+    except Exception:  # noqa: BLE001
+        pass
+    return base
 
 
 def build_mode_block(mode: str, instruction: str, allow_questions: bool,
@@ -385,7 +450,7 @@ def build_mode_block(mode: str, instruction: str, allow_questions: bool,
     if control_packet:
         block += ("\n\nINTERVIEWER CONTROL PACKET (decision brief for this turn):\n"
                   + json.dumps(control_packet, ensure_ascii=False)
-                  + "\n" + (_PACKET_RULES if packet_rules is None else packet_rules))
+                  + "\n" + _rules_for(control_packet, packet_rules))
     return block
 
 # -----------------------------------------------------------------------------

@@ -694,7 +694,8 @@ def _sentence_target(fn: str, voice: bool, contextual: bool) -> int:
 
 def _case_context(sig: Dict[str, Any], fn: str, case_id: Optional[str] = None,
                   case_type: Optional[str] = None,
-                  prior_state: Optional[dict] = None) -> Dict[str, Any]:
+                  prior_state: Optional[dict] = None,
+                  candidate_text: str = "") -> Dict[str, Any]:
     """Facts the turn may lean on, computed in code: never a line to copy."""
     ctx: Dict[str, Any] = {}
     facts = list(sig.get("reference_facts") or [])
@@ -739,6 +740,16 @@ def _case_context(sig: Dict[str, Any], fn: str, case_id: Optional[str] = None,
         ctx.update(_ce.packet_block(case_id, case_type or sig.get("case_type"), prior_state))
     except Exception as _e:  # noqa: BLE001 - a side-channel must never break a turn
         print(f"[expectations] packet skipped: {type(_e).__name__}")
+    # What the candidate's OWN figures entail, computed -- not matched. The structure tree
+    # has the model label each number with what it is and where it hangs; division then
+    # works regardless of how the candidate phrased it, which is the half of this that
+    # services/numbers_check.py cannot reach (every check in that file is keyed to a word).
+    # Plausibility is deliberately left to the model: see services/quant_graph.py.
+    try:
+        from services import quant_graph as _qg
+        ctx.update(_qg.packet_block(prior_state, candidate_text))
+    except Exception as _qe:  # noqa: BLE001 - a side-channel must never break a turn
+        print(f"[quant] skipped: {type(_qe).__name__}")
     return ctx
 
 
@@ -859,7 +870,13 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
                               "a few short lines" if fn in VISUAL_FUNCTIONS else "short"),
             "target_sentence_count": _sentence_target(fn, voice, contextual),
             "content_specificity": "required" if contextual else "normal",
-            "must_reference_candidate_content": contextual,
+            # CROSS_QUESTION joins the contextual functions here. Its whole premise is a
+            # sharper question built from the candidate's OWN last move, and three live
+            # exam runs failed help_when_stuck_with_work on exactly this: the model asked
+            # "What specific part are you finding most challenging?" when the candidate
+            # had 0.95S - 2 = 0.80(S - 2) sitting on the table. A question that would make
+            # sense on any case is not a cross-question.
+            "must_reference_candidate_content": contextual or fn == "CROSS_QUESTION",
             "generic_acknowledgement_only": False,
             "do_not_overpraise": True,
             # WHITEBOARD (coached): the candidate is here to learn, so a turn that moves
@@ -869,12 +886,18 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
             # the arithmetic, the sanity check, the figure worth memorising. In exam this
             # is false: there, teaching is what the debrief is for.
             "must_leave_a_transferable_move": not exam_policy,
+            # Tracked in BOTH modes. The figures the model reports here are what
+            # services/quant_graph.py does arithmetic on, and "your 40 lakh owners against
+            # a 1.2 crore population -- what is that per person?" is the best cross-question
+            # an Interview can ask. Only the DRAWING is Whiteboard-only; the route gates
+            # that, not this. Reporting it costs ~15 output tokens a turn.
+            "track_structure": True,
             # Teaching turns do ONE step with the candidate; everything else leaves the
             # reasoning with them.
             "do_not_take_over_candidate_reasoning": fn not in ("TEACH_STEP", "EXPLAIN_CONCEPT", "DELIVER_SOLUTION"),
         },
         "case_context": _case_context(sig, fn, case_id=case_id, case_type=case_type,
-                                      prior_state=prior_state),
+                                      prior_state=prior_state, candidate_text=candidate_text),
         "conversation_memory": {
             "recent_response_functions": list(sig.get("recent_functions") or []),
             "recent_interviewer_lines": [l for l in (recent_lines or [])][-3:],
@@ -927,18 +950,34 @@ def references_candidate(line: str, candidate_text: str) -> bool:
 
 
 def validate_contextual_line(text: str, candidate_text: str, channel: str = "text",
-                             max_sentences: int = 2, may_confirm: bool = False) -> Tuple[str, List[str]]:
+                             max_sentences: int = 2, may_confirm: bool = False,
+                             policy: str = "coached") -> Tuple[str, List[str]]:
     """Clean a model-worded presence line. Returns (line, problems).
 
     Problems: "leak" (control metadata in the text), "empty", "unreferenced"
     (nothing the candidate said is picked up). Questions, solicitations, gush and
     unverified correctness claims are removed, not just flagged: no check verified
     the candidate's work, so the line may not certify it.
+
+    `policy` matters. This is the CONTEXTUAL_PRESENCE path -- ACKNOWLEDGE_AND_CONTINUE,
+    REFLECT_PROGRESS, VALIDATE_AND_HAND_BACK -- and it returns early, so it never reaches
+    enforce_mode. Until 2026-11-02 it called sanitize_reply with the default, which meant
+    Interview mode's praise strip never ran on a large share of turns: a live exam run
+    shipped "That's a good adjustment in your thinking about demand and capacity." through
+    exactly here. A line that is ALL praise now comes back empty, and the caller falls
+    through to its fallback, which is the right outcome -- an honest stock line beats
+    approval in a scored room.
     """
     t = (text or "").strip()
     if _LEAK_RE.search(t):
         return "", ["leak"]
-    t = sanitize_reply(t)
+    t = sanitize_reply(t, policy)
+    # sanitize_reply deliberately returns the ORIGINAL when its filter would leave nothing
+    # (never ship an empty bubble), so a line that is ALL approval survives it. In an
+    # Interview that must not ship, and it must not be kept as `best` by the caller
+    # either -- hence an empty line, not a flagged one.
+    if is_praise_only(t, policy):
+        return "", ["praise"]
     t = strip_solicitations(strip_all_questions(t)).strip()
     kept = [s for s in _sentences(t, keep_punct=True) if may_confirm or not _CLAIM_RE.search(s)]
     n = 1 if channel == "voice" else max(1, max_sentences)

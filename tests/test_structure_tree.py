@@ -1,0 +1,118 @@
+"""services/structure_tree.py — the live structure diagram.
+
+Pure functions over (state, control tag), so the whole feature is testable without a
+model, a database or a live conversation. That is the point of reporting the tree on the
+tag the interviewer already emits rather than extracting it with a second call: the part
+that can be wrong is the part that can be tested here.
+
+The adversarial cases are the ones that matter. A model that misbehaves must cost a
+branch, never a turn — every malformed tag below has to degrade the picture and return.
+"""
+import json
+
+from services import structure_tree as S
+
+
+def _depth(n, k=1):
+    return max([_depth(c, k + 1) for c in n.get("children", [])] or [k])
+
+
+# ---------------------------------------------------------------- the happy path
+def test_real_conversation_builds_a_spine():
+    """The Chennai pre-owned-cars guesstimate, turn by turn, as it actually ran."""
+    st = {}
+    for tag in [{"tree": ">population#1.2 crore"},
+                {"tree": "population>car owners#40 lakh"},
+                {"tree": "car owners>replacement cycle"},
+                {"tree": "replacement cycle>cars sold per year"}]:
+        st = S.fold_turn(st, tag)
+    root = S.to_tree(st, "Pre-owned cars sold annually in Chennai")
+    assert _depth(root) == 5                      # synthetic root + the four they stated
+    assert "40 lakh" in json.dumps(root)
+    assert S.active_id(st) == "cars-sold-per-year"
+
+
+def test_candidates_own_words_survive():
+    st = S.fold_turn({}, {"tree": ">car owners"})
+    assert st["structure"][0]["label"] == "Car owners"   # sentence case, not Title Case
+
+
+def test_figure_refines_an_existing_node():
+    st = S.fold_turn(S.fold_turn({}, {"tree": ">revenue"}), {"tree": ">revenue#2 cr"})
+    assert len(st["structure"]) == 1 and st["structure"][0]["value"] == "2 cr"
+
+
+def test_replaying_an_edge_changes_nothing():
+    a = S.fold_turn({}, {"tree": "population>owners"})
+    b = S.fold_turn(dict(a), {"tree": "population>owners"})
+    assert json.dumps(a["structure"]) == json.dumps(b["structure"])
+
+
+def test_parent_named_before_it_was_introduced_is_promoted_not_dropped():
+    """Candidates name a sub-branch before its header constantly. Losing the branch is
+    worse than hanging it off the root."""
+    st = S.fold_turn({}, {"tree": "costs>fixed costs"})
+    assert len(st["structure"]) == 2
+
+
+# ---------------------------------------------------------------- adversarial
+def test_a_turn_that_reports_nothing_is_a_no_op():
+    assert S.fold_turn({}, {}) == {}
+    assert S.to_tree(S.fold_turn({}, {"mode": "probe"})) is None
+
+
+def test_garbage_tag_yields_no_tree_and_no_exception():
+    assert S.to_tree(S.fold_turn({}, {"tree": "|||>>>###"})) is None
+
+
+def test_cycle_cannot_recurse_forever():
+    """a>b then b>a. Without the ancestor check this hangs to_tree()."""
+    root = S.to_tree(S.fold_turn({}, {"tree": "a>b|b>a"}))
+    assert root["id"] == "a" and _depth(root) == 2
+
+
+def test_node_cannot_parent_itself():
+    assert json.dumps(S.to_tree(S.fold_turn({}, {"tree": "a>a"}))).count('"id"') == 1
+
+
+def test_caps_hold_against_a_runaway_model():
+    """An unbounded tree is an unbounded SVG inside a live conversation."""
+    flood = S.fold_turn({}, {"tree": "|".join(f">n{i}" for i in range(60))})
+    assert len(flood["structure"]) <= S.MAX_EDGES_PER_TURN
+
+    big = {}
+    for i in range(40):
+        big = S.fold_turn(big, {"tree": "|".join(f">n{i}_{j}" for j in range(5))})
+    assert len(big["structure"]) == S.MAX_NODES
+
+    deep, prev = S.fold_turn({}, {"tree": ">root"}), "root"
+    for i in range(12):
+        deep = S.fold_turn(deep, {"tree": f"{prev}>lvl{i}"})
+        prev = f"lvl{i}"
+    assert _depth(S.to_tree(deep)) == S.MAX_DEPTH
+
+    long_label = S.fold_turn({}, {"tree": ">" + "x" * 200})["structure"][0]["label"]
+    assert len(long_label) <= S.MAX_LABEL
+
+
+def test_single_top_level_node_needs_no_synthetic_root():
+    assert S.to_tree(S.fold_turn({}, {"tree": ">revenue"}))["id"] == "revenue"
+
+
+def test_several_top_level_nodes_get_one():
+    assert S.to_tree(S.fold_turn({}, {"tree": ">revenue|>cost"}))["id"] == "__root"
+
+
+def test_hinglish_and_rupee_labels_survive():
+    st = S.fold_turn({}, {"tree": ">kitne log hain#₹2.4 cr"})
+    assert "₹" in json.dumps(st, ensure_ascii=False)
+
+
+def test_payload_is_a_single_sse_line():
+    """SSE data lines cannot contain a literal newline. A label with one in it must not be
+    able to split the frame and corrupt the stream."""
+    st = S.fold_turn({}, {"tree": '>pop"ulation\nx#1.2 crore'})
+    body = json.dumps({"root": S.to_tree(st, 'Chennai "pre-owned"'),
+                       "active_id": S.active_id(st)}, ensure_ascii=False)
+    assert "\n" not in body
+    assert json.loads(body)["root"]["label"]

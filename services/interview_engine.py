@@ -383,8 +383,13 @@ def _contextual_line(plan, new_user_message, channel, user_id,
             usage_out.update(raw_text=raw, model=model, provider=provider)
         tag, clean = parse_control_tag(raw)
         may_confirm = bool(plan["packet"]["interviewer_control"]["interviewer_decision"].get("may_confirm_correctness"))
+        # Read from the plan, NOT a new parameter. Every caller already builds the plan and
+        # the plan already carries the policy (see _build_plan), so taking it from there is
+        # the one version that cannot desync -- this is the fourth site where threading it
+        # as an argument went wrong, three times silently and once as this NameError.
         line, problems = validate_contextual_line(clean, new_user_message, channel, max_sent,
-                                                  may_confirm=may_confirm)
+                                                  may_confirm=may_confirm,
+                                                  policy=plan.get("policy") or "coached")
         if line and not problems:
             return {"text": line, "tag": tag or {}, "fallback": False, "problems": []}
         if line and "leak" not in problems and not best and len(line.split()) > 3:

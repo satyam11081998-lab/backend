@@ -218,8 +218,15 @@ def commit_attempt(case_id: Optional[str], case_type: Optional[str],
                    state: Optional[dict]) -> None:
     """Fold one finished attempt into the shared counters. Called at submit, once.
 
-    Best-effort to the point of silence: this runs inside a scored submit, and a counter
-    is never worth failing a candidate's result for.
+    ONE round trip, and Postgres does the arithmetic. The first cut issued a PostgREST
+    update per touched row, sequentially, inside the scored submit — five rows meant five
+    round trips to Tokyo for a side-channel nobody waits on — and each sent
+    `count = <cached value> + 1`, so two candidates submitting the same case inside the
+    five-minute cache window both wrote the same number and one attempt vanished from the
+    evidence. A bank whose job is to accumulate counts must not drop them under precisely
+    the load that makes it worth having. See migration 0078.
+
+    Best-effort to the point of silence: a counter is never worth failing a result for.
     """
     if not enabled():
         return
@@ -231,26 +238,36 @@ def commit_attempt(case_id: Optional[str], case_type: Optional[str],
     helped = set((state or {}).get("expectations_helped") or [])
     if not (seen or hit):
         return
+
+    # Short handles back to real row ids. A handle the model invented matches nothing and
+    # is simply dropped, so it cannot reach the database.
+    touched_ids, hit_ids, helped_ids = [], [], []
+    for r in rows:
+        sid = _short_id(r)
+        if sid not in seen and sid not in hit:
+            continue
+        touched_ids.append(r["id"])
+        if sid in hit or (r["kind"] == "expectation" and sid in seen):
+            hit_ids.append(r["id"])
+        if sid in helped:
+            helped_ids.append(r["id"])
+    if not touched_ids:
+        return
+
     sb = _sb()
     if sb is None:
         return
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    for r in rows:
-        sid = _short_id(r)
-        touched = sid in seen or sid in hit
-        if not touched:
-            continue
-        try:
-            sb.table("case_expectations").update({
-                "seen_count": int(r.get("seen_count") or 0) + 1,
-                "hit_count": int(r.get("hit_count") or 0) + (1 if sid in hit or (r["kind"] == "expectation" and sid in seen) else 0),
-                "helped_count": int(r.get("helped_count") or 0) + (1 if sid in helped else 0),
-                "last_seen_at": now,
-                "updated_at": now,
-            }).eq("id", r["id"]).execute()
-        except Exception as e:  # noqa: BLE001
-            print(f"[expectations] counter skipped id={r.get('id')}: {type(e).__name__}")
-            return
+    try:
+        sb.rpc("bump_case_expectations", {
+            "p_seen": touched_ids, "p_hit": hit_ids, "p_helped": helped_ids,
+        }).execute()
+    except Exception as e:  # noqa: BLE001
+        # Deliberately NO per-row fallback: a slow loop in the submit path is the thing
+        # 0078 exists to remove, and these counters are evidence, not a result. Loud,
+        # because silence is how a feature like this ends up dormant for a month.
+        print(f"[expectations] bump_case_expectations failed - run migration 0078 "
+              f"({type(e).__name__}: {str(e)[:90]})")
+        return
     invalidate(case_id)
 
 

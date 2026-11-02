@@ -174,6 +174,10 @@ class AttemptDetail(BaseModel):
     attempt: AttemptSummary
     case: Dict[str, Any]
     messages: List[MessageOut]
+    # The structure diagram as it stood at the last turn, so a refresh mid-case does not
+    # wipe it. Both default None: additive, so a client built before this ignores them.
+    structure: Optional[Dict[str, Any]] = None
+    structure_active: Optional[str] = None
 
 
 class PostMessageRequest(BaseModel):
@@ -615,6 +619,14 @@ def _fold_session_state(
                                     "TEACH_STEP", "REPAIR_AND_RESET"))
         except Exception as _ce_e:  # noqa: BLE001
             print(f"[expectations] fold skipped: {type(_ce_e).__name__}")
+        # The structure tree the candidate is building. Folded here so it survives a
+        # refresh and so the interviewer can read it next turn ("you have price under
+        # cost -- is that where it sits?"). Pure function, ~9us; never raises.
+        try:
+            from services import structure_tree as _stree
+            _new_state = _stree.fold_turn(_new_state, tag)
+        except Exception as _st_e:  # noqa: BLE001
+            print(f"[structure] fold skipped: {type(_st_e).__name__}")
         supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
         _viol = detect_violations(reply_text, teaching_policy or "coached", tag)
         if _viol:
@@ -800,6 +812,17 @@ def get_attempt(
         for m in (msg_rows.data or [])
     ]
 
+    _structure_root = None
+    _structure_active = None
+    if _resolve_policy(attempt, case) != "exam":
+        try:
+            from services import structure_tree as _stree
+            _sstate = attempt.get("session_state") or {}
+            _structure_root = _stree.to_tree(_sstate, case.get("title") or "")
+            _structure_active = _stree.active_id(_sstate)
+        except Exception as _st_e:  # noqa: BLE001
+            print(f"[structure] resume skipped: {type(_st_e).__name__}")
+
     return AttemptDetail(
         attempt=AttemptSummary(
             attempt_id=attempt["id"],
@@ -820,6 +843,8 @@ def get_attempt(
             "hint": case.get("hint"),
         },
         messages=messages,
+        structure=_structure_root,
+        structure_active=_structure_active,
     )
 
 
@@ -1002,6 +1027,20 @@ def post_message(
                 supabase, attempt_id, transcript, user_content,
                 teaching_policy, session_state, ctl, final_text,
             )
+            # The structure diagram, computed from state + this turn's reported edges.
+            # On the SSE stream already open: no extra request, no extra model call. Sent
+            # before `done` so the tree and the reply land together.
+            if teaching_policy != "exam":
+                try:
+                    from services import structure_tree as _stree
+                    _st = _stree.fold_turn(session_state, ctl.get("tag") or {})
+                    _root = _stree.to_tree(_st, case.get("title") or "")
+                    if _root:
+                        yield ("event: tree\ndata: " + json.dumps(
+                            {"root": _root, "active_id": _stree.active_id(_st)},
+                            ensure_ascii=False) + "\n\n")
+                except Exception as _st_e:  # noqa: BLE001
+                    print(f"[structure] emit skipped: {type(_st_e).__name__}")
             if silent:
                 yield "event: done\ndata: {\"message_id\": null}\n\n"
             else:
