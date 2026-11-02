@@ -264,3 +264,53 @@ def test_gap_nodes_are_excluded_from_the_stage_decision():
     with_gaps["structure"] = st["structure"] + CM.gaps_for("profitability", "profitability",
                                                            st["structure"])
     assert CM.stage_of(with_gaps, "profitability") == CM.stage_of(st, "profitability")
+
+
+# -------------------------------------------------------- expectations, inferred
+# These exist because the control tag that was MEANT to carry touched=/missed= is never
+# emitted in production, which left the case_expectations counters at zero since the day
+# they were added. The inference is their only real source, so it is tested like one.
+_EXPECT = {
+    "not_covered_yet": [{"id": "e1a2b3c4d", "is": "states the decomposition before computing"}],
+    "common_errors_on_this_case": [{"id": "m5d6e7f8a", "looks_like": "crore and million mixed"}],
+}
+
+
+def test_expectations_are_read_off_the_same_call_as_the_edges():
+    out = S.infer([], "a third own cars, 40 lakh", {}, "guesstimate", _EXPECT,
+                  llm=_FakeLLM("population>car owners#40 lakh\ncovered: e1a2b3c4d\n"
+                               "fell_into: m5d6e7f8a"))
+    assert out["edges"] == "population>car owners#40 lakh"
+    assert out["touched"] == "e1a2b3c4d"
+    assert out["missed"] == "m5d6e7f8a"
+
+
+def test_inferred_ids_reach_the_counters():
+    """The whole point: a turn with no control tag must still move the bank."""
+    from services import case_expectations as CE
+    out = S.infer([], "x", {}, "guesstimate", _EXPECT,
+                  llm=_FakeLLM("covered: e1a2b3c4d\nfell_into: m5d6e7f8a"))
+    state = CE.fold_turn({}, {"touched": out["touched"], "missed": out["missed"]}, helped=True)
+    assert state["expectations_touched"] == ["e1a2b3c4d"]
+    assert state["misconceptions_hit"] == ["m5d6e7f8a"]
+    assert state["expectations_helped"] == ["m5d6e7f8a"]
+
+
+def test_an_invented_id_never_reaches_the_bank():
+    """A model that makes up a handle must not be able to pollute shared counters."""
+    from services import case_expectations as CE
+    out = S.infer([], "x", {}, "guesstimate", _EXPECT,
+                  llm=_FakeLLM("covered: totally-made-up, zzzzzzzz"))
+    state = CE.fold_turn({}, {"touched": out["touched"], "missed": ""})
+    assert state["expectations_touched"] == []
+
+
+def test_no_expectations_means_no_expectation_lines_requested():
+    out = S.infer([], "x", {}, "guesstimate", None, llm=_FakeLLM(">population#1 crore"))
+    assert out["touched"] == "" and out["missed"] == ""
+
+
+def test_a_turn_that_touches_nothing_reports_nothing():
+    out = S.infer([], "what do you mean by pre-owned?", {}, "guesstimate", _EXPECT,
+                  llm=_FakeLLM("none"))
+    assert out["edges"] == "" and out["touched"] == "" and out["missed"] == ""

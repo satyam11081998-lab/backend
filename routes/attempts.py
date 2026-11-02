@@ -598,7 +598,7 @@ def _is_v11_silence(ctl: Dict[str, Any], chunks: List[str]) -> bool:
 def _fold_session_state(
     supabase, attempt_id: str, transcript, user_text: str,
     teaching_policy, session_state, ctl: Dict[str, Any], reply_text: str,
-    case_type: str = "",
+    case_type: str = "", case_id: Optional[str] = None,
 ) -> None:
     """Phase 2: fold V11's control tag into persisted session_state, and record
     any deterministic guardrail violation for evals/metrics. Wrapped: a
@@ -619,12 +619,15 @@ def _fold_session_state(
         # attempt; written to the shared counters only at submit, because a turn is the
         # latency-critical path. Never raises: 0077 may be outstanding, and this is a
         # side-channel that must not be able to break a turn.
+        _helped = function in ("MICRO_HINT", "CROSS_QUESTION", "CORRECT_AND_CONTINUE",
+                               "TEACH_STEP", "REPAIR_AND_RESET")
+        _expect_block = {}
         try:
             from services import case_expectations as _ce
-            _new_state = _ce.fold_turn(
-                _new_state, tag,
-                helped=function in ("MICRO_HINT", "CROSS_QUESTION", "CORRECT_AND_CONTINUE",
-                                    "TEACH_STEP", "REPAIR_AND_RESET"))
+            # Read BEFORE the fold so the ids handed to the reader are the ones still
+            # open. Cached for CASE_EXPECTATIONS_TTL_S, so this is not a round trip.
+            _expect_block = _ce.packet_block(case_id, case_type, _new_state) or {}
+            _new_state = _ce.fold_turn(_new_state, tag, helped=_helped)
         except Exception as _ce_e:  # noqa: BLE001
             print(f"[expectations] fold skipped: {type(_ce_e).__name__}: {_ce_e}")
         # The structure tree the candidate is building. Folded here so it survives a
@@ -638,9 +641,25 @@ def _fold_session_state(
                 # The interviewer did not report the branch on its tag. Infer it with a
                 # dedicated call -- safe HERE and nowhere else, because _after_turn runs
                 # this once the reply has already streamed, so it cannot delay a turn.
-                _inf = _stree.infer(transcript, user_text, _new_state, case_type)
+                _inf = _stree.infer(transcript, user_text, _new_state, case_type,
+                                    _expect_block)
                 if _inf.get("edges"):
                     _tag_for_tree = dict(tag, tree=_inf["edges"])
+                # The counters' only real source. Measured: the interviewer never emits
+                # touched=/missed= on its tag, so without this the whole accumulating
+                # evidence bank stays at zero however many people practise.
+                if _inf.get("touched") or _inf.get("missed"):
+                    try:
+                        from services import case_expectations as _ce2
+                        _new_state = _ce2.fold_turn(
+                            _new_state,
+                            {"touched": _inf.get("touched", ""),
+                             "missed": _inf.get("missed", "")},
+                            helped=_helped)
+                        print(f"[expectations] inferred touched={_inf.get('touched','')!r} "
+                              f"missed={_inf.get('missed','')!r} attempt={attempt_id}")
+                    except Exception as _e2:  # noqa: BLE001
+                        print(f"[expectations] inferred fold skipped: {type(_e2).__name__}")
                 # Classified once per attempt, from a closed list. Everything structural --
                 # operators, roles, formulas, which gap to show next -- is derived from
                 # this one choice in Python, so it is the only thing the model decides.
@@ -1086,6 +1105,7 @@ def post_message(
                 attempt_id, _fold_session_state,
                 supabase, attempt_id, transcript, user_content,
                 teaching_policy, session_state, ctl, final_text, case["type"],
+                attempt["case_id"],
             )
             # The structure diagram, computed from state + this turn's reported edges.
             # On the SSE stream already open: no extra request, no extra model call. Sent
@@ -1247,7 +1267,8 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
 
     if not body.is_partial:
         fold_args = (supabase, attempt_id, transcript, spoken,
-                     teaching_policy, session_state, ctl, say or "", case["type"])
+                     teaching_policy, session_state, ctl, say or "", case["type"],
+                     attempt["case_id"])
         if body.defer_fold and body.turn_id:
             # Early decision: folded only once the client confirms the words did
             # not change (or before the next turn, if it never says).
