@@ -180,3 +180,57 @@ def test_a_single_child_is_not_a_chain():
 def test_broken_chain_survives_garbage_state():
     for bad in ({"structure": "nope"}, {"structure": [{"id": "x"}]}):
         assert Q.arithmetic_relations(bad, "guesstimate") == []
+
+
+# -------------------------------------------------------- the judge can tell the modes apart
+def test_the_judge_is_told_which_mode_it_is_grading():
+    """It could not, and that is how an exam reply once passed for 'aligning with the
+    coached behaviour'. The score measured the rubric, not the interviewer."""
+    from tools.eval_interviewer_behavior import SCENARIOS, judge_prompt, POLICY_CONTRACT
+    s = next(x for x in SCENARIOS if x["id"] == "help_when_stuck_with_work")
+    coached, exam = judge_prompt(s, "x", "coached"), judge_prompt(s, "x", "exam")
+    assert coached != exam
+    assert POLICY_CONTRACT["exam"] in exam and POLICY_CONTRACT["coached"] in coached
+
+
+def test_exam_judging_is_told_that_withholding_is_correct():
+    from tools.eval_interviewer_behavior import POLICY_CONTRACT
+    assert "CORRECT here" in POLICY_CONTRACT["exam"]
+    assert "do not mark a reply down for withholding" in POLICY_CONTRACT["exam"]
+
+
+def test_praise_is_allowed_in_one_mode_and_forbidden_in_the_other():
+    from tools.eval_interviewer_behavior import POLICY_CONTRACT
+    assert "is fine" in POLICY_CONTRACT["coached"]
+    assert "praise in any form" in POLICY_CONTRACT["exam"]
+
+
+def test_the_inverting_scenarios_carry_their_own_exam_rubric():
+    """No contract wording turns 'give a directional hint' into correct exam behaviour."""
+    from tools.eval_interviewer_behavior import SCENARIOS
+    overridden = {x["id"] for x in SCENARIOS if x.get("required_exam")}
+    assert {"help_when_stuck_with_work", "explicit_hint_request", "solution_request_late",
+            "help_after_good_work", "sanity_check_absent"} <= overridden
+    # Asserted here: STRUCTURE only -- the override exists, it differs from the coached
+    # one, and it states a prohibition. Whether the prose describes the right behaviour is
+    # a human judgement. Two attempts to check it with a regex both failed on ordinary
+    # English ("Decline the hint" contains "hint"; "do not hand over the spine" is a
+    # negation), and a pattern that cannot read a negation is not a test, it is a test
+    # shaped object that will pass on a rubric saying the opposite of what it should.
+    for x in SCENARIOS:
+        req = x.get("required_exam")
+        if req:
+            assert req != x["required"], x["id"]
+            assert "MUST NOT" in req, x["id"]
+
+
+def test_an_unknown_policy_falls_back_rather_than_crashing():
+    from tools.eval_interviewer_behavior import SCENARIOS, judge_prompt
+    s = SCENARIOS[0]
+    assert judge_prompt(s, "x", "nonsense") == judge_prompt(s, "x", "coached")
+
+
+def test_the_arena_call_site_still_works_without_a_policy():
+    """routes/arena.py calls judge_prompt with two arguments."""
+    from tools.eval_interviewer_behavior import SCENARIOS, judge_prompt
+    assert judge_prompt(SCENARIOS[0], "x")

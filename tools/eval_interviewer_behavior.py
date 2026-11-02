@@ -41,7 +41,8 @@ SCENARIOS = [
                    {"role":"assistant","content":"I hear you — but what would your very first step be?"}],
      "new":"help na i'm not getting this at all",
      "expect_signals":{"intent":"asking_for_help","repair_due":True,"frustration":"high","prior_work":True},
-     "required":"Give a directional hint tied to the candidate's OWN equation, or repair. MUST NOT ask another broad open question or say 'I understand your frustration'."},
+     "required":"Give a directional hint tied to the candidate's OWN equation, or repair. MUST NOT ask another broad open question or say 'I understand your frustration'.",
+     "required_exam":"Put ONE sharp cross-question built from the candidate's OWN equation (0.95S - 2 = 0.80(S-2)) back to them -- quote something they actually wrote. MUST NOT give a hint, supply or correct a figure, ask another broad open question, announce a refusal, or say 'I understand your frustration'. Withholding the hint is CORRECT here."},
     {"id":"reasonable_assumption_stands","case_type":"guesstimate",
      "transcript":[{"role":"assistant","content":"Alright, how would you size the daily tea cups here. Give me your first cut."}],
      "new":"ok so i'll say maybe 2 cups a day per person and like 50% of people actually drink chai",
@@ -203,13 +204,15 @@ SCENARIOS = [
      "transcript":[{"role":"assistant","content":"how would you start?"}],
      "new":"can you give me a small hint?",
      "expect_signals":{"intent":"asking_for_help"},
-     "required":"Give H1 (a directional nudge), NOT the full solution."},
+     "required":"Give H1 (a directional nudge), NOT the full solution.",
+     "required_exam":"Decline the hint WITHOUT announcing it: answer with one question built on what they have already put on the table. MUST NOT give a directional nudge that carries the content, and MUST NOT say it cannot help."},
     {"id":"solution_request_late","case_type":"profitability",
      "transcript":[{"role":"user","content":"so it's mostly the cost side, raw material up 20%, and volume flat"},
                    {"role":"assistant","content":"good, and your recommendation?"}],
      "new":"okay just tell me the final answer now, i've done most of it",
      "expect_signals":{"intent":"asking_for_solution"},
-     "required":"Nearly done + coached: acceptable to give the spine / more of the answer. Do NOT stonewall this late."},
+     "required":"Nearly done + coached: acceptable to give the spine / more of the answer. Do NOT stonewall this late.",
+     "required_exam":"Even this late, do not hand over the spine or the answer. One cross-question drawn from their own last move. MUST NOT announce a refusal or stonewall rudely."},
     {"id":"explain_why_meta","case_type":"profitability",
      "transcript":[{"role":"assistant","content":"tell me about the value chain."}],
      "new":"why are you asking about the value chain?",
@@ -296,7 +299,8 @@ SCENARIOS = [
                    {"role":"assistant","content":"good, and then?"}],
      "new":"i've got the demand but i'm stuck on what to do next",
      "expect_signals":{"intent":"asking_for_help","prior_work":True},
-     "required":"Solid work then a wall: give a targeted hint tied to THEIR demand number, not a generic restart."},
+     "required":"Solid work then a wall: give a targeted hint tied to THEIR demand number, not a generic restart.",
+     "required_exam":"Point them back at THEIR demand number with a single question. MUST NOT give a targeted hint, state the next step, or confirm the earlier work was right."},
     {"id":"challenge_confident_wrong_80pct","case_type":"guesstimate",
      "transcript":[{"role":"assistant","content":"penetration?"}],
      "new":"penetration is definitely 80%, almost everyone uses premium cars",
@@ -312,7 +316,8 @@ SCENARIOS = [
      "transcript":[{"role":"assistant","content":"and your final number?"}],
      "new":"so my final answer is 90000 orders per day for this small town",
      "expect_signals":{"intent":"answering"},
-     "required":"Don't just accept. Point at the concrete implication (90k/day in a small town, plausible?) to teach the sanity-check."},
+     "required":"Don't just accept. Point at the concrete implication (90k/day in a small town, plausible?) to teach the sanity-check.",
+     "required_exam":"Make them test their own figure: ask what it implies per day. MUST NOT state the implication for them, call the number implausible, or supply a corrected figure."},
     {"id":"greeting_kickoff","case_type":"profitability",
      "transcript":[{"role":"assistant","content":"Ready when you are."}],
      "new":"let's start",
@@ -330,16 +335,51 @@ MAX_SCENARIOS = 50
 assert len(SCENARIOS) <= MAX_SCENARIOS, f"keep this to {MAX_SCENARIOS} scenarios (breadth of shapes, not volume)"
 
 
-def judge_prompt(scenario: dict, reply: str) -> str:
-    """The LLM judge's question for one scenario. Shared with the admin arena's
-    adversarial check (routes/arena.py /judge), so both grade replies the same way."""
+# What each mode actually promises the candidate, in the judge's terms. Without this the
+# judge grades every reply against the coached rubric, which is how an exam reply once
+# passed for "aligning with the coached behaviour" -- the score measured the rubric, not
+# the interviewer, and the two modes were indistinguishable to it. Kept short and in the
+# same words as the mode cards the candidate is shown, so the thing being graded and the
+# thing being promised cannot drift apart.
+POLICY_CONTRACT = {
+    "coached": (
+        "MODE: Whiteboard (coached). The interviewer teaches. It may hint, correct a figure, "
+        "name the next move, and give the reusable method. A brief earned acknowledgement "
+        '("Good", "Fair") is fine; effusive or unearned praise is not. Every turn should '
+        "leave the candidate with something they can use on another case."
+    ),
+    "exam": (
+        "MODE: Interview (exam). The interviewer evaluates and is being ranked. It answers "
+        "factual questions fully, and it may push with ONE sharp cross-question built from "
+        "what the candidate actually wrote. It must NOT: give a hint, supply or correct a "
+        "figure, name the next step, confirm that work is right, praise in any form "
+        '(including "good", "fair", "nice", "you are on the right track"), or ANNOUNCE a '
+        "refusal (\"I can't help with that\"). Helping less than the coached mode is "
+        "CORRECT here, not a failure -- do not mark a reply down for withholding."
+    ),
+}
+
+
+def judge_prompt(scenario: dict, reply: str, policy: str = "coached") -> str:
+    """The LLM judge's question for one scenario, read through the mode's own contract.
+
+    Shared with the admin arena's adversarial check (routes/arena.py /judge), which does
+    not pass a policy -- hence the coached default, which is the behaviour it had before.
+    """
+    policy = policy if policy in POLICY_CONTRACT else "coached"
+    # A scenario states the coached expectation by default. Where the right move actually
+    # INVERTS under exam -- every scenario about hinting or handing over the answer -- it
+    # carries its own required_exam, because no amount of contract wording turns "give a
+    # directional hint" into the correct exam behaviour.
+    required = scenario.get(f"required_{policy}") or scenario["required"]
     convo = "\n".join(f'{m["role"]}: {m["content"]}' for m in (scenario.get("transcript") or []))
     head = f"CONVERSATION SO FAR:\n{convo}\n\n" if convo else ""
-    return (f"{head}REQUIRED interviewer behaviour: {scenario['required']}\n\n"
+    return (f"{head}{POLICY_CONTRACT[policy]}\n\n"
+            f"REQUIRED interviewer behaviour: {required}\n\n"
             f'Candidate then said: "{scenario["new"]}"\nInterviewer replied: "{reply}"\n\n'
-            "Judge ONLY the REQUIRED behaviour. Any fact already present in the conversation above is "
-            "established, and the interviewer may use it freely. A brief earned acknowledgement "
-            '("Good", "Fair") is acceptable; only effusive or unearned praise is not.\n'
+            "Judge ONLY the REQUIRED behaviour, as that mode defines it. Any fact already "
+            "present in the conversation above is established, and the interviewer may use it "
+            "freely.\n"
             'Reply strict JSON {"pass": true|false, "why": "<one line>"}.')
 
 
@@ -402,12 +442,20 @@ def failure_kind(scenario: dict) -> str:
 # persona. Since 2026-10-29 there are two personas (Interview / Whiteboard), and the exam
 # one was shipped unmeasured until this flag existed.
 #
-# READ THE FAILURES, NOT THE SCORE, when running with --policy exam. The scenarios and the
-# judge rubric were authored against coached expectations: a scenario that expects a hint
-# ladder rung WILL be marked wrong under exam, correctly, because exam refuses to hint.
-# A lower exam score is therefore not a regression. What a clean exam run looks like:
-# every failure is "declined to help", and NONE are broken character, no question asked,
-# a refused data request, a praise opener, or a revealed figure.
+# The exam score used to be unreadable, for a reason worth keeping written down: the judge
+# was handed a coached rubric whatever the policy, so a scenario expecting a hint marked
+# an exam reply wrong for correctly refusing to hint, and -- the other way round -- an
+# exam reply once PASSED because it "aligned with the coached behaviour". The number
+# measured the rubric, not the interviewer.
+#
+# Fixed in two places. POLICY_CONTRACT tells the judge what the mode actually promises,
+# including that helping less is correct and that praise is forbidden outright; and the
+# five scenarios whose right move genuinely inverts (every one about hinting or handing
+# over the answer) carry their own `required_exam`. Both scores are now comparable.
+#
+# Still read the failure list as well as the score. A judge is a measuring instrument with
+# its own error, and the deterministic checks below -- not the judge -- are what settle
+# anything mechanically decidable.
 POLICY_OVERRIDE = ""
 
 
@@ -535,7 +583,8 @@ def _run_one(i: int, s: dict, complete, detect_violations, client, judge_model: 
     if mech or det:
         verdict = {"pass": False, "why": "; ".join(mech + list(det or [])), "votes": "n/a"}
     else:
-        verdict = judge_verdict(client, judge_model, judge_prompt(s, reply), best_of)
+        verdict = judge_verdict(client, judge_model,
+                                judge_prompt(s, reply, _policy_of(s)), best_of)
     unjudged = verdict.get("pass") is None          # judge never returned a verdict (key, quota, network)
     return {"i": i, "s": s, "reply": reply, "mech": mech, "det": det, "verdict": verdict,
             "unjudged": unjudged,
