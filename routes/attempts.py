@@ -178,6 +178,10 @@ class AttemptDetail(BaseModel):
     # wipe it. Both default None: additive, so a client built before this ignores them.
     structure: Optional[Dict[str, Any]] = None
     structure_active: Optional[str] = None
+    # The process rail: where they are in CLARIFY -> ... -> CONCLUDE, and the full list so
+    # the client draws the same stages the backend derived them against.
+    structure_stage: Optional[str] = None
+    structure_stages: Optional[List[str]] = None
 
 
 class PostMessageRequest(BaseModel):
@@ -591,6 +595,7 @@ def _is_v11_silence(ctl: Dict[str, Any], chunks: List[str]) -> bool:
 def _fold_session_state(
     supabase, attempt_id: str, transcript, user_text: str,
     teaching_policy, session_state, ctl: Dict[str, Any], reply_text: str,
+    case_type: str = "",
 ) -> None:
     """Phase 2: fold V11's control tag into persisted session_state, and record
     any deterministic guardrail violation for evals/metrics. Wrapped: a
@@ -618,7 +623,7 @@ def _fold_session_state(
                 helped=function in ("MICRO_HINT", "CROSS_QUESTION", "CORRECT_AND_CONTINUE",
                                     "TEACH_STEP", "REPAIR_AND_RESET"))
         except Exception as _ce_e:  # noqa: BLE001
-            print(f"[expectations] fold skipped: {type(_ce_e).__name__}")
+            print(f"[expectations] fold skipped: {type(_ce_e).__name__}: {_ce_e}")
         # The structure tree the candidate is building. Folded here so it survives a
         # refresh and so the interviewer can read it next turn ("you have price under
         # cost -- is that where it sits?"). Pure function, ~9us; never raises.
@@ -630,9 +635,14 @@ def _fold_session_state(
                 # The interviewer did not report the branch on its tag. Infer it with a
                 # dedicated call -- safe HERE and nowhere else, because _after_turn runs
                 # this once the reply has already streamed, so it cannot delay a turn.
-                _inferred = _stree.infer_edges(transcript, user_text, _new_state)
-                if _inferred:
-                    _tag_for_tree = dict(tag, tree=_inferred)
+                _inf = _stree.infer(transcript, user_text, _new_state, case_type)
+                if _inf.get("edges"):
+                    _tag_for_tree = dict(tag, tree=_inf["edges"])
+                # Classified once per attempt, from a closed list. Everything structural --
+                # operators, roles, formulas, which gap to show next -- is derived from
+                # this one choice in Python, so it is the only thing the model decides.
+                if _inf.get("archetype") and not _new_state.get("structure_archetype"):
+                    _new_state["structure_archetype"] = _inf["archetype"]
             _new_state = _stree.fold_turn(_new_state, _tag_for_tree)
             _after = len((_new_state or {}).get("structure") or [])
             # The one link in this chain that no test covers: whether the model actually
@@ -643,7 +653,13 @@ def _fold_session_state(
                   f"used={(_tag_for_tree.get('tree') or '')[:80]!r} "
                   f"nodes={_before}->{_after} attempt={attempt_id}")
         except Exception as _st_e:  # noqa: BLE001
-            print(f"[structure] fold skipped: {type(_st_e).__name__}")
+            # The MESSAGE and the line, not just the class. Logging only
+            # type(e).__name__ here cost a full debugging round: "AttributeError" says
+            # something broke, never which attribute, and a side-channel that swallows its
+            # own cause is worse than one that is simply absent.
+            import traceback as _tb
+            print(f"[structure] fold skipped: {type(_st_e).__name__}: {_st_e}\n"
+                  f"{_tb.format_exc(limit=4)}")
         supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
         _viol = detect_violations(reply_text, teaching_policy or "coached", tag)
         if _viol:
@@ -831,12 +847,18 @@ def get_attempt(
 
     _structure_root = None
     _structure_active = None
+    _structure_stage = None
+    _structure_stages = None
     if _resolve_policy(attempt, case) != "exam":
         try:
             from services import structure_tree as _stree
             _sstate = attempt.get("session_state") or {}
-            _structure_root = _stree.to_tree(_sstate, case.get("title") or "")
+            _structure_root = _stree.to_tree(_sstate, case.get("title") or "",
+                                             case_type=case["type"], with_gaps=True)
             _structure_active = _stree.active_id(_sstate)
+            from services import case_models as _cm
+            _structure_stage = _cm.stage_of(_sstate, case["type"])
+            _structure_stages = _cm.stages_for(case["type"])
         except Exception as _st_e:  # noqa: BLE001
             print(f"[structure] resume skipped: {type(_st_e).__name__}")
 
@@ -862,6 +884,8 @@ def get_attempt(
         messages=messages,
         structure=_structure_root,
         structure_active=_structure_active,
+        structure_stage=_structure_stage,
+        structure_stages=_structure_stages,
     )
 
 
@@ -1054,7 +1078,7 @@ def post_message(
             _after_turn(
                 attempt_id, _fold_session_state,
                 supabase, attempt_id, transcript, user_content,
-                teaching_policy, session_state, ctl, final_text,
+                teaching_policy, session_state, ctl, final_text, case["type"],
             )
             # The structure diagram, computed from state + this turn's reported edges.
             # On the SSE stream already open: no extra request, no extra model call. Sent
@@ -1063,10 +1087,14 @@ def post_message(
                 try:
                     from services import structure_tree as _stree
                     _st = _stree.fold_turn(session_state, ctl.get("tag") or {})
-                    _root = _stree.to_tree(_st, case.get("title") or "")
+                    _root = _stree.to_tree(_st, case.get("title") or "",
+                                           case_type=case["type"], with_gaps=True)
                     if _root:
+                        from services import case_models as _cm
                         yield ("event: tree\ndata: " + json.dumps(
-                            {"root": _root, "active_id": _stree.active_id(_st)},
+                            {"root": _root, "active_id": _stree.active_id(_st),
+                             "stage": _cm.stage_of(_st, case["type"]),
+                             "stages": _cm.stages_for(case["type"])},
                             ensure_ascii=False) + "\n\n")
                 except Exception as _st_e:  # noqa: BLE001
                     print(f"[structure] emit skipped: {type(_st_e).__name__}")
@@ -1210,7 +1238,7 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
 
     if not body.is_partial:
         fold_args = (supabase, attempt_id, transcript, spoken,
-                     teaching_policy, session_state, ctl, say or "")
+                     teaching_policy, session_state, ctl, say or "", case["type"])
         if body.defer_fold and body.turn_id:
             # Early decision: folded only once the client confirms the words did
             # not change (or before the next turn, if it never says).

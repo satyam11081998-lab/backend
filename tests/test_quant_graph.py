@@ -118,3 +118,65 @@ def test_packet_block_separates_the_impossible():
 def test_garbage_state_cannot_raise():
     for bad in ({"structure": "not a list"}, {"structure": [{"id": "x"}]}, {"structure": [None]}):
         assert Q.implications(bad, "40 lakh") == []
+
+
+# -------------------------------------------------------- recomputing their chain
+def _chain(parent_value, kids, parent="Cups per day"):
+    st = {"structure": [{"id": "p", "label": parent, "value": parent_value,
+                         "parent": "", "kind": "stated"}]}
+    for i, (label, value) in enumerate(kids):
+        st["structure"].append({"id": f"k{i}", "label": label, "value": value,
+                                "parent": "p", "kind": "stated"})
+    return st
+
+
+def test_a_chain_that_does_not_close_is_caught():
+    """Stronger than a ratio: true or false, with no plausibility judgement in it."""
+    st = _chain("2.7 crore", [("Drinkers", "90 lakh"), ("Cups per person", "5")])
+    rels = Q.arithmetic_relations(st, "guesstimate")
+    assert rels and rels[0]["flag"] == "arithmetic"
+    assert "4.5" in rels[0]["relation"]
+
+
+def test_a_chain_that_closes_says_nothing():
+    st = _chain("2.7 crore", [("Drinkers", "90 lakh"), ("Cups per person", "3")])
+    assert Q.arithmetic_relations(st, "guesstimate") == []
+
+
+def test_a_percentage_child_is_a_multiplier_not_a_magnitude():
+    st = _chain("90 lakh", [("Population", "1.5 crore"), ("Tea drinker share", "60%")])
+    assert Q.arithmetic_relations(st, "guesstimate") == []
+
+
+def test_exam_mode_never_carries_the_corrected_figure():
+    """The whole point of Interview mode. The candidate is told their chain does not
+    close and has to find where."""
+    st = _chain("2.7 crore", [("Drinkers", "90 lakh"), ("Cups per person", "5")])
+    exam = Q.arithmetic_relations(st, "guesstimate", exam=True)
+    assert exam and all("4.5" not in r["relation"] for r in exam)
+    assert "does not come to" in exam[0]["relation"]
+    block = Q.packet_block(st, "", case_type="guesstimate", exam=True)
+    assert all("4.5" not in line for line in block.get("their_chain_does_not_close", []))
+
+
+def test_rounding_inside_tolerance_is_not_an_error():
+    """These are estimates, rounded on purpose."""
+    st = _chain("2.7 crore", [("Drinkers", "90 lakh"), ("Cups per person", "3.05")])
+    assert Q.arithmetic_relations(st, "guesstimate") == []
+
+
+def test_the_operator_comes_from_the_framework_not_a_guess():
+    """Profit is Revenue MINUS cost; defaulting to multiply would invent an error."""
+    st = _chain("30 crore", [("Revenue", "100 crore"), ("Total costs", "70 crore")],
+                parent="Profit")
+    assert Q.arithmetic_relations(st, "profitability") == []
+
+
+def test_a_single_child_is_not_a_chain():
+    assert Q.arithmetic_relations(_chain("2.7 crore", [("Drinkers", "90 lakh")]),
+                                  "guesstimate") == []
+
+
+def test_broken_chain_survives_garbage_state():
+    for bad in ({"structure": "nope"}, {"structure": [{"id": "x"}]}):
+        assert Q.arithmetic_relations(bad, "guesstimate") == []

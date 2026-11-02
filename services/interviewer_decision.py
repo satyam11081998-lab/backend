@@ -747,7 +747,10 @@ def _case_context(sig: Dict[str, Any], fn: str, case_id: Optional[str] = None,
     # Plausibility is deliberately left to the model: see services/quant_graph.py.
     try:
         from services import quant_graph as _qg
-        ctx.update(_qg.packet_block(prior_state, candidate_text))
+        ctx.update(_qg.packet_block(
+            prior_state, candidate_text,
+            case_type=case_type or sig.get("case_type") or "",
+            exam=(sig.get("teaching_policy") or "coached") == "exam"))
     except Exception as _qe:  # noqa: BLE001 - a side-channel must never break a turn
         print(f"[quant] skipped: {type(_qe).__name__}: {_qe}")
     return ctx

@@ -170,3 +170,90 @@ def test_a_failing_model_degrades_to_no_edges():
     class Boom:
         chat = property(lambda self: (_ for _ in ()).throw(RuntimeError("down")))
     assert S.infer_edges([], "hello", {}, llm=Boom()) == ""
+
+
+# -------------------------------------------------------- the framework model
+from services import case_models as CM  # noqa: E402
+
+
+def _state(edges, archetype=None):
+    st = {}
+    for e in edges:
+        st = S.fold_turn(st, {"tree": e})
+    if archetype:
+        st["structure_archetype"] = archetype
+    return st
+
+
+def test_formula_is_rendered_from_the_children_that_exist():
+    """Never a stored string: it is derived at read time so it cannot disagree with the
+    tree the way a stored formula would the moment a branch is added."""
+    st = _state([">profit#70 crore"], "profitability")
+    t = S.to_tree(st, "Snacks maker", case_type="profitability", with_gaps=True)
+    profit = t["children"][0]
+    assert profit["formula"] == "Revenue − Total costs"
+    assert profit["role"] == "derived"
+
+
+def test_gaps_are_one_rung_not_the_skeleton():
+    """Drawing the whole archetype dotted turns decomposition into fill-in-the-blanks,
+    and decomposition is the skill being taught."""
+    st = _state([">profit#70 crore"], "profitability")
+    t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
+    profit = t["children"][0]
+    assert {c["kind"] for c in profit["children"]} == {"gap"}
+    # Revenue's own children (Price, Volume) must NOT appear: they are a rung further
+    # down, under a branch the candidate has not opened.
+    revenue = next(c for c in profit["children"] if c["label"] == "Revenue")
+    assert "children" not in revenue
+
+
+def test_a_branch_they_opened_earns_its_next_rung():
+    st = _state([">profit#70 crore", "profit>revenue#400 crore"], "profitability")
+    t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
+    revenue = next(c for c in t["children"][0]["children"] if c["label"] == "Revenue")
+    assert {c["label"] for c in revenue.get("children", [])} >= {"Price", "Volume"}
+
+
+def test_no_gaps_on_an_empty_tree():
+    """The first decomposition has to be theirs."""
+    assert S.to_tree({}, "x", case_type="profitability", with_gaps=True) is None
+
+
+def test_gaps_are_never_produced_without_an_archetype():
+    st = _state([">profit#70 crore"])          # unclassified
+    t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
+    assert "children" not in t["children"][0]
+
+
+def test_stage_is_derived_from_the_work_not_guessed():
+    g = "guesstimate"
+    assert CM.stage_of({}, g) == "Clarify"
+    assert CM.stage_of(_state([">population#1.5 crore"]), g) == "Classify"
+    assert CM.stage_of(_state([">population", "population>drinkers"]), g) == "Decompose"
+    assert CM.stage_of(_state([">population#1.5 crore", "population>drinkers"]), g) == "Assume"
+    assert CM.stage_of(_state([">population", "population>drinkers#90 lakh"]), g) == "Calculate"
+    assert CM.stage_of(_state([">population#1.5 crore", "population>drinkers#90 lakh"]), g) == "Validate"
+
+
+def test_stage_maps_onto_the_case_list_too():
+    c = "profitability"
+    assert CM.stage_of({}, c) == "Clarify"
+    assert CM.stage_of(_state([">profit#70 crore", "profit>revenue"]), c) == "Assume".replace(
+        "Assume", "Prioritise")
+
+
+def test_the_final_stage_is_never_reached_from_structure_alone():
+    """Concluding is committing to an answer, which is the submit, not a branch."""
+    for t in ("guesstimate", "profitability"):
+        st = _state([">a#1 crore", "a>b#50 lakh"])
+        assert CM.stage_of(st, t) != CM.stages_for(t)[-1]
+
+
+def test_gap_nodes_are_excluded_from_the_stage_decision():
+    """A rung the system drew is not work the candidate did."""
+    st = _state([">profit#70 crore"], "profitability")
+    with_gaps = dict(st)
+    with_gaps["structure"] = st["structure"] + CM.gaps_for("profitability", "profitability",
+                                                           st["structure"])
+    assert CM.stage_of(with_gaps, "profitability") == CM.stage_of(st, "profitability")

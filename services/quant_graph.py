@@ -192,13 +192,138 @@ def implications(state: Optional[Dict[str, Any]], message: str = "") -> List[Dic
     return ordered[:MAX_RELATIONS]
 
 
-def packet_block(state: Optional[Dict[str, Any]], message: str = "") -> Dict[str, Any]:
+def packet_block(state: Optional[Dict[str, Any]], message: str = "",
+                 case_type: str = "", exam: bool = False) -> Dict[str, Any]:
     """The `from_their_numbers` block, or {} when there is no arithmetic to report."""
     rels = implications(state, message)
-    if not rels:
+    try:
+        broken = arithmetic_relations(state, case_type, exam=exam)
+    except Exception:  # noqa: BLE001
+        broken = []
+    if not rels and not broken:
         return {}
-    block: Dict[str, Any] = {"from_their_numbers": [r["relation"] for r in rels]}
-    if any(r["flag"] == "impossible" for r in rels):
-        block["arithmetically_impossible"] = [r["relation"] for r in rels
-                                              if r["flag"] == "impossible"]
+    block: Dict[str, Any] = {}
+    if rels:
+        block["from_their_numbers"] = [r["relation"] for r in rels]
+        if any(r["flag"] == "impossible" for r in rels):
+            block["arithmetically_impossible"] = [r["relation"] for r in rels
+                                                  if r["flag"] == "impossible"]
+    if broken:
+        # Separate key: this is recomputation, not a reported relation. It is true or
+        # false with no plausibility judgement in it, so the model should treat it
+        # differently from the ratios above.
+        block["their_chain_does_not_close"] = [r["relation"] for r in broken[:2]]
     return block
+
+
+# =============================================================================
+# CHECKING THE ARITHMETIC, NOT JUST THE RATIO
+# =============================================================================
+#
+# Once a node carries HOW its children combine (services/case_models.py), the parent the
+# candidate wrote can be recomputed from the children they gave. That is a stronger check
+# than a ratio: a ratio says "this is 33% of that" and leaves the judgement to the model,
+# whereas this says "these three figures do not produce the total you wrote", which is
+# true or false with no judgement in it at all.
+#
+# The exam/coached split matters here and is NOT cosmetic. In an Interview the candidate
+# must not be handed the corrected number -- that is the whole point of the mode, and
+# tests/test_response_functions.py pins it. So exam gets the fact that the product does
+# not match; coached gets the figure it should have been.
+
+ARITHMETIC_TOLERANCE = 0.10   # 10%: these are estimates, rounded on purpose
+
+
+def _combine(op: str, values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    out = values[0]
+    try:
+        for v in values[1:]:
+            if op == "*":
+                out *= v
+            elif op == "+":
+                out += v
+            elif op == "-":
+                out -= v
+            elif op == "/":
+                if v == 0:
+                    return None
+                out /= v
+            else:
+                return None
+    except (OverflowError, ZeroDivisionError):
+        return None
+    return out if out == out and abs(out) != float("inf") else None
+
+
+def arithmetic_relations(state: Optional[Dict[str, Any]], case_type: str = "",
+                         exam: bool = False) -> List[Dict[str, Any]]:
+    """Every parent whose own children do not produce it."""
+    try:
+        nodes = [n for n in ((state or {}).get("structure") or []) if isinstance(n, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+    nodes = [n for n in nodes if n.get("id")]
+    if not nodes:
+        return []
+    try:
+        from services import case_models as _cm
+    except Exception:  # noqa: BLE001
+        return []
+
+    by_id = {n["id"]: n for n in nodes}
+    kids: Dict[str, List[Dict[str, Any]]] = {}
+    for n in nodes:
+        pid = n.get("parent") or ""
+        if pid in by_id:
+            kids.setdefault(pid, []).append(n)
+
+    out: List[Dict[str, Any]] = []
+    for pid, children in kids.items():
+        parent = by_id[pid]
+        pq = _value_of(parent.get("value") or "")
+        if not pq or pq.pct or len(children) < 2:
+            continue
+        vals, labels = [], []
+        for c in children:
+            cq = _value_of(c.get("value") or "")
+            if not cq:
+                vals = []
+                break
+            # A percentage child is a multiplier, not a magnitude: 60% enters as 0.6.
+            vals.append(cq.value / 100.0 if cq.pct else cq.value)
+            labels.append(f"{c.get('label')} ({cq.raw})")
+        if not vals:
+            continue
+
+        op = None
+        plabel = (parent.get("label") or "").strip().lower()
+        for arche in _cm.archetypes_for(case_type).values():
+            if (arche["label"] or "").strip().lower() == plabel:
+                op = arche["op"]
+                break
+        if op is None:
+            for sub_label, sub in _cm.SUB_MODELS.items():
+                if sub_label.strip().lower() == plabel:
+                    op = sub["op"]
+                    break
+        op = op or "*"
+
+        expected = _combine(op, vals)
+        if expected is None or expected <= 0 or pq.value <= 0:
+            continue
+        if abs(expected - pq.value) <= ARITHMETIC_TOLERANCE * max(expected, pq.value):
+            continue
+
+        joined = f" {_cm.OPS.get(op, op)} ".join(labels)
+        if exam:
+            # No corrected figure in an Interview. The candidate is told their own chain
+            # does not close, and has to find where.
+            rel = (f"{joined} does not come to the {parent.get('label')} they wrote "
+                   f"({pq.raw})")
+        else:
+            rel = (f"{joined} comes to {fmt_number(expected, indian_first=pq.indian)}, "
+                   f"not the {pq.raw} they wrote for {parent.get('label')}")
+        out.append({"flag": "arithmetic", "relation": rel})
+    return out

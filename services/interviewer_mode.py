@@ -408,7 +408,10 @@ NUMBERS_RULES = (
     "question. Quote the numbers; do not say they are wrong, do not give the right value, "
     "and do not name this block. Anything listed under arithmetically_impossible is a part "
     "bigger than the whole it came from -- raise that before anything else on the table. "
-    "When every relation looks fine, say nothing about them and take your turn as briefed."
+    "When every relation looks fine, say nothing about them and take your turn as briefed. "
+    "case_context.their_chain_does_not_close is different in kind: it is their own figures "
+    "RECOMPUTED, so it is true, not a judgement. Raise it before any ratio. Name the two "
+    "or three figures and what they come to, and let them find the step that broke."
 )
 
 
@@ -427,7 +430,7 @@ def _rules_for(control_packet: Optional[Dict[str, Any]], packet_rules: Optional[
             base += EXPECTATION_RULES
         if rg.get("track_structure"):
             base += TREE_RULES
-        if cc.get("from_their_numbers"):
+        if cc.get("from_their_numbers") or cc.get("their_chain_does_not_close"):
             base += NUMBERS_RULES
     except Exception:  # noqa: BLE001
         pass
