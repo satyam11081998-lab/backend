@@ -624,7 +624,24 @@ def _fold_session_state(
         # cost -- is that where it sits?"). Pure function, ~9us; never raises.
         try:
             from services import structure_tree as _stree
-            _new_state = _stree.fold_turn(_new_state, tag)
+            _before = len((_new_state or {}).get("structure") or [])
+            _tag_for_tree = tag
+            if not (tag.get("tree") or "").strip():
+                # The interviewer did not report the branch on its tag. Infer it with a
+                # dedicated call -- safe HERE and nowhere else, because _after_turn runs
+                # this once the reply has already streamed, so it cannot delay a turn.
+                _inferred = _stree.infer_edges(transcript, user_text, _new_state)
+                if _inferred:
+                    _tag_for_tree = dict(tag, tree=_inferred)
+            _new_state = _stree.fold_turn(_new_state, _tag_for_tree)
+            _after = len((_new_state or {}).get("structure") or [])
+            # The one link in this chain that no test covers: whether the model actually
+            # emits tree= . Everything downstream of it is tested, so without this line a
+            # missing diagram is indistinguishable from a parse failure and you are left
+            # guessing which half to fix. `emitted` is the model's half, `nodes` is ours.
+            print(f"[structure] emitted={'tree' in tag!r} "
+                  f"used={(_tag_for_tree.get('tree') or '')[:80]!r} "
+                  f"nodes={_before}->{_after} attempt={attempt_id}")
         except Exception as _st_e:  # noqa: BLE001
             print(f"[structure] fold skipped: {type(_st_e).__name__}")
         supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()

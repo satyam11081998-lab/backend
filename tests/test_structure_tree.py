@@ -116,3 +116,57 @@ def test_payload_is_a_single_sse_line():
                        "active_id": S.active_id(st)}, ensure_ascii=False)
     assert "\n" not in body
     assert json.loads(body)["root"]["label"]
+
+
+# -------------------------------------------------------- inferred edges (fallback path)
+class _FakeLLM:
+    """Stands in for the chat client; returns whatever the test wants the model to say."""
+    def __init__(self, text):
+        self.text = text
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kw):
+        class M:  # noqa: D401
+            pass
+        m, c, r = M(), M(), M()
+        m.content = self.text
+        c.message = m
+        r.choices = [c]
+        return r
+
+
+def _infer(text, msg="a third own cars, 40 lakh"):
+    return S.infer_edges([], msg, {}, llm=_FakeLLM(text))
+
+
+def test_inferred_edges_are_the_same_grammar_the_tag_uses():
+    """One parser, one format, two sources -- so parse_edges and its tests cover both."""
+    assert _infer("population>car owners#40 lakh") == "population>car owners#40 lakh"
+    assert S.fold_turn({}, {"tree": _infer("population>car owners#40 lakh")})["structure"]
+
+
+def test_a_turn_that_added_no_branch_infers_nothing():
+    for empty in ("none", "None.", "", "   ", "-"):
+        assert _infer(empty) == ""
+
+
+def test_model_wrapping_is_stripped():
+    assert _infer("tree=>population#1.2 crore") == ">population#1.2 crore"
+    assert _infer("`>population#1.2 crore`") == ">population#1.2 crore"
+    assert _infer(">population#1.2 crore\nsome explanation") == ">population#1.2 crore"
+
+
+def test_unparseable_output_is_discarded_rather_than_stored():
+    assert _infer("I think they are estimating the population of Chennai.") != "x"
+    assert S.parse_edges(_infer("|||###")) == []
+
+
+def test_inference_is_skipped_without_a_message():
+    assert S.infer_edges([], "", {}, llm=_FakeLLM(">x")) == ""
+
+
+def test_a_failing_model_degrades_to_no_edges():
+    class Boom:
+        chat = property(lambda self: (_ for _ in ()).throw(RuntimeError("down")))
+    assert S.infer_edges([], "hello", {}, llm=Boom()) == ""
