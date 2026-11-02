@@ -692,7 +692,9 @@ def _sentence_target(fn: str, voice: bool, contextual: bool) -> int:
     return _SENTENCES_TEXT.get(fn, 2 if contextual else 3)
 
 
-def _case_context(sig: Dict[str, Any], fn: str) -> Dict[str, Any]:
+def _case_context(sig: Dict[str, Any], fn: str, case_id: Optional[str] = None,
+                  case_type: Optional[str] = None,
+                  prior_state: Optional[dict] = None) -> Dict[str, Any]:
     """Facts the turn may lean on, computed in code: never a line to copy."""
     ctx: Dict[str, Any] = {}
     facts = list(sig.get("reference_facts") or [])
@@ -728,6 +730,15 @@ def _case_context(sig: Dict[str, Any], fn: str) -> Dict[str, Any]:
     if fn in ("RESTATE_CASE", "OPEN", "EXPLAIN_FORMAT"):
         ctx["where_the_case_is"] = ("the brief is on screen; on a phone it sits behind the menu icon "
                                     "at the top left of the chat")
+    # What a good answer on THIS case has still not touched, and what candidates reliably
+    # get wrong on it, ordered by how often they actually do. This is the half of the turn
+    # that does NOT depend on classifying the candidate correctly: whatever they typed, the
+    # case's own answer space is finite and knowable. See services/case_expectations.py.
+    try:
+        from services import case_expectations as _ce
+        ctx.update(_ce.packet_block(case_id, case_type or sig.get("case_type"), prior_state))
+    except Exception as _e:  # noqa: BLE001 - a side-channel must never break a turn
+        print(f"[expectations] packet skipped: {type(_e).__name__}")
     return ctx
 
 
@@ -756,7 +767,10 @@ PRODUCT_FACTS = (
 def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
                                      candidate_text: str = "",
                                      recent_lines: Optional[List[str]] = None,
-                                     allow_questions: Optional[bool] = None) -> Dict[str, Any]:
+                                     allow_questions: Optional[bool] = None,
+                                     case_id: Optional[str] = None,
+                                     case_type: Optional[str] = None,
+                                     prior_state: Optional[dict] = None) -> Dict[str, Any]:
     """The decision brief the model words a turn from. Plain data: no sentence to
     copy, no fallback line, no hidden case solution."""
     if isinstance(decision, str):
@@ -859,7 +873,8 @@ def build_interviewer_control_packet(signals: Dict[str, Any], decision: Any,
             # reasoning with them.
             "do_not_take_over_candidate_reasoning": fn not in ("TEACH_STEP", "EXPLAIN_CONCEPT", "DELIVER_SOLUTION"),
         },
-        "case_context": _case_context(sig, fn),
+        "case_context": _case_context(sig, fn, case_id=case_id, case_type=case_type,
+                                      prior_state=prior_state),
         "conversation_memory": {
             "recent_response_functions": list(sig.get("recent_functions") or []),
             "recent_interviewer_lines": [l for l in (recent_lines or [])][-3:],

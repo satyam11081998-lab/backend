@@ -285,7 +285,7 @@ def _annotate_help_and_finals(signals, tlist, msg, case_content, case_type) -> N
 def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarifications_exhausted,
                         teaching_policy, prior_state, channel, is_voice_partial,
                         messages_builder=None, prompt_overrides=None, audit_ctx=None,
-                        case_solution=None) -> Dict[str, Any]:
+                        case_solution=None, case_id=None) -> Dict[str, Any]:
     """Signals -> gates -> response function -> (for model turns) control packet + messages.
 
     messages_builder / prompt_overrides are the admin arena's seam (services/arena.py):
@@ -319,7 +319,9 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
                         "plain statements - no question at all this turn.")
     packet = build_interviewer_control_packet(signals, decision, candidate_text=new_user_message,
                                               recent_lines=_recent_lines(tlist),
-                                              allow_questions=allow_questions)
+                                              allow_questions=allow_questions,
+                                              case_id=case_id, case_type=case_type,
+                                              prior_state=prior_state)
     outcome = evaluate_intervention_outcome(prior_state, signals)
     plan.update({
         "allow_questions": allow_questions,
@@ -500,6 +502,7 @@ def stream_interviewer_reply(
     usage_out: Optional[dict] = None,
     prompt_overrides: Optional[dict] = None,
     case_solution: Optional[str] = None,
+    case_id: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """The production turn: /attempts/{id}/messages (text, SSE) and the voice route.
 
@@ -520,7 +523,7 @@ def stream_interviewer_reply(
                                    channel, is_voice_partial, messages_builder=messages_builder,
                                    prompt_overrides=prompt_overrides,
                                    audit_ctx={"llm": llm_override, "usage_out": usage_out, "user_id": user_id},
-                                   case_solution=case_solution)
+                                   case_solution=case_solution, case_id=case_id)
         policy, signals = plan["policy"], plan["signals"]
         mode, reason, function = plan["mode"], plan["reason"], plan["function"]
         render = plan["decision"]["render"]

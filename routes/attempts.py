@@ -602,6 +602,19 @@ def _fold_session_state(
     try:
         _sig = compute_signals(transcript, user_text, teaching_policy or "coached", session_state)
         _new_state = update_session_state(session_state, tag, _sig, function=function)
+        # Which of the case's expectations this turn touched, and which misconception it
+        # fell into, read off the control tag the model already emits. Carried on the
+        # attempt; written to the shared counters only at submit, because a turn is the
+        # latency-critical path. Never raises: 0077 may be outstanding, and this is a
+        # side-channel that must not be able to break a turn.
+        try:
+            from services import case_expectations as _ce
+            _new_state = _ce.fold_turn(
+                _new_state, tag,
+                helped=function in ("MICRO_HINT", "CROSS_QUESTION", "CORRECT_AND_CONTINUE",
+                                    "TEACH_STEP", "REPAIR_AND_RESET"))
+        except Exception as _ce_e:  # noqa: BLE001
+            print(f"[expectations] fold skipped: {type(_ce_e).__name__}")
         supabase.table("attempts").update({"session_state": _new_state}).eq("id", attempt_id).execute()
         _viol = detect_violations(reply_text, teaching_policy or "coached", tag)
         if _viol:
@@ -949,6 +962,7 @@ def post_message(
                 user_id=user_id,
                 clarifications_exhausted=clarifications_spent,
                 teaching_policy=teaching_policy,
+                case_id=attempt["case_id"],
                 prior_state=session_state,
                 control_out=ctl,
                 case_solution=case.get("solution"),
@@ -1105,6 +1119,7 @@ def _voice_decision(attempt_id: str, body: VoiceDecisionRequest, response: Respo
             user_id=user_id,
             clarifications_exhausted=clarifications_spent,
             teaching_policy=teaching_policy,
+            case_id=attempt["case_id"],
             prior_state=session_state,
             control_out=ctl,
             channel="voice",
@@ -1539,8 +1554,20 @@ def submit_attempt(
         sub_res = supabase.table("submissions").insert(_sub_row).execute()
     submission_id = sub_res.data[0]["id"]
 
+    # Fold this attempt into the case's shared expectation counters: which branches people
+    # actually reach, which errors they actually make, and whether the interviewer's move
+    # unstuck them. Runs for BOTH modes - a Whiteboard run is still evidence about the
+    # case; it is only the candidate's score that does not count. Best-effort to the point
+    # of silence: a counter is never worth failing a scored submit for.
+    try:
+        from services import case_expectations as _ce
+        _ce.commit_attempt(attempt["case_id"], case.get("type"),
+                           attempt.get("session_state") or {})
+    except Exception as _e:  # noqa: BLE001
+        print(f"WARN: expectation counters skipped: {_e}")
+
     if ranked:
-        # Bank the case's figures — one row per CASE, best-scoring answer wins.
+        # Bank the case's figures - one row per CASE, best-scoring answer wins.
         # Best-effort inside the helper; never fails a scored submit.
         bank_figures(supabase, attempt["case_id"], _figures, submission_id, feedback["score"])
 

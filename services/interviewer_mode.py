@@ -358,7 +358,14 @@ _PACKET_RULES = (
     "invent a figure for them to sanity-check. If visual_structure_allowed is true you may lay a structure "
     "out on separate short lines joined by arrows (→); otherwise plain sentences only. Never use numbered "
     "lists ('1.', '2.'). Never tell the "
-    "candidate a fact is not given or not available: you own the facts."
+    "candidate a fact is not given or not available: you own the facts. "
+    # The handles cost a dozen output tokens and no extra call: StreamShapeGuard already
+    # strips this tag before a token reaches the candidate.
+    "If case_context lists not_covered_yet or common_errors_on_this_case, add to your "
+    "control tag which of them THIS candidate turn touched, using their ids exactly: "
+    "touched=<ids they covered>; missed=<ids they fell into>, comma-separated, ids only, "
+    "omitted entirely when none apply. Never mention these ids or their text to the "
+    "candidate."
 )
 
 
