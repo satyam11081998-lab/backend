@@ -183,11 +183,18 @@ def gaps_for(case_type: str, archetype: Optional[str],
 
     # Rung 1: the headline equation, shown once they have put ANYTHING on the table. With
     # an empty tree nothing is drawn at all -- the first decomposition has to be theirs.
+    #
+    # The operands hang off the node the equation PRODUCES. When the candidate has already
+    # named it ("Profit"), that is their node and the operands are its children. When they
+    # have not -- a top-down guesstimate starts at Population, not at "Market size" -- the
+    # operands hang off the QUESTION itself (parent ""), never off whatever they happened
+    # to mention first. Measured live: anchoring to their first node made Population the
+    # parent of Penetration and Average price, which reads as "population x price", an
+    # equation nobody wrote and that the archetype does not contain.
     if not nodes:
         return []
-    roots = [n for n in nodes if not (n.get("parent") or "")]
-    anchor = roots[0] if roots else nodes[0]
-    _add(anchor["id"], model["op"], model["operands"])
+    result = by_label.get((model["label"] or "").strip().lower())
+    _add(result["id"] if result else "", model["op"], model["operands"])
 
     # Rung 2: only under an operand they have ALREADY named themselves.
     for label, sub in SUB_MODELS.items():
@@ -253,12 +260,35 @@ def stage_of(state: Optional[Dict[str, Any]], case_type: str) -> str:
 
     parent_ids = {n.get("parent") for n in nodes if n.get("parent")}
     leaves = [n for n in nodes if n["id"] not in parent_ids]
-    roots = [n for n in nodes if not (n.get("parent") or "")]
 
     if not any(has_value(n) for n in nodes):
         return at("decompose")
     if any(not has_value(n) for n in leaves):
         return at("assume")            # still filling in the inputs
-    if roots and has_value(roots[0]):
-        return at("validate")          # inputs AND a total: time to check it
+
+    # Validating means the equation is FILLED, not that the top node happens to carry a
+    # figure. Measured live: a top-down chain starts at population, so the root is an
+    # input, and "root has a value" reported Validate on the second turn of a case that
+    # had barely started. Compare against how many operands the archetype actually needs.
+    model = model_for(case_type, (state or {}).get("structure_archetype"))
+    needed = len(model["operands"]) if model else 3
+    filled = sum(1 for n in nodes if has_value(n))
+    if filled >= needed:
+        return at("validate")
     return at("calculate")
+
+
+def equation_of(case_type: str, archetype: Optional[str]) -> str:
+    """'Market size = Potential customers × Penetration × Purchase frequency × Average price'
+
+    The framework's own equation, printed as a caption above the tree. NOT derived from
+    the candidate's children the way a node's formula is: those two differ on purpose. A
+    node's formula describes what they have actually built; this describes what the case
+    is asking them to build, and it has to stay correct even when their tree is half
+    empty or shaped differently.
+    """
+    model = model_for(case_type, archetype)
+    if not model:
+        return ""
+    op = OPS.get(model["op"], model["op"])
+    return f"{model['label']} = " + f" {op} ".join(model["operands"])

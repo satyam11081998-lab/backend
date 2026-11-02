@@ -182,6 +182,9 @@ class AttemptDetail(BaseModel):
     # the client draws the same stages the backend derived them against.
     structure_stage: Optional[str] = None
     structure_stages: Optional[List[str]] = None
+    # The framework's equation for this case, as a caption. Distinct from a node's own
+    # formula: this is what they are being asked to build, not what they have built.
+    structure_equation: Optional[str] = None
 
 
 class PostMessageRequest(BaseModel):
@@ -849,6 +852,7 @@ def get_attempt(
     _structure_active = None
     _structure_stage = None
     _structure_stages = None
+    _structure_equation = None
     if _resolve_policy(attempt, case) != "exam":
         try:
             from services import structure_tree as _stree
@@ -859,6 +863,8 @@ def get_attempt(
             from services import case_models as _cm
             _structure_stage = _cm.stage_of(_sstate, case["type"])
             _structure_stages = _cm.stages_for(case["type"])
+            _structure_equation = _cm.equation_of(
+                case["type"], _sstate.get("structure_archetype")) or None
         except Exception as _st_e:  # noqa: BLE001
             print(f"[structure] resume skipped: {type(_st_e).__name__}")
 
@@ -886,6 +892,7 @@ def get_attempt(
         structure_active=_structure_active,
         structure_stage=_structure_stage,
         structure_stages=_structure_stages,
+        structure_equation=_structure_equation,
     )
 
 
@@ -1094,7 +1101,9 @@ def post_message(
                         yield ("event: tree\ndata: " + json.dumps(
                             {"root": _root, "active_id": _stree.active_id(_st),
                              "stage": _cm.stage_of(_st, case["type"]),
-                             "stages": _cm.stages_for(case["type"])},
+                             "stages": _cm.stages_for(case["type"]),
+                             "equation": _cm.equation_of(
+                                 case["type"], _st.get("structure_archetype")) or None},
                             ensure_ascii=False) + "\n\n")
                 except Exception as _st_e:  # noqa: BLE001
                     print(f"[structure] emit skipped: {type(_st_e).__name__}")

@@ -233,7 +233,14 @@ def test_stage_is_derived_from_the_work_not_guessed():
     assert CM.stage_of(_state([">population", "population>drinkers"]), g) == "Decompose"
     assert CM.stage_of(_state([">population#1.5 crore", "population>drinkers"]), g) == "Assume"
     assert CM.stage_of(_state([">population", "population>drinkers#90 lakh"]), g) == "Calculate"
-    assert CM.stage_of(_state([">population#1.5 crore", "population>drinkers#90 lakh"]), g) == "Validate"
+    # Two filled nodes is NOT validating: with no archetype the bar is three, and with
+    # one it is however many operands the equation needs. "The root has a figure" used to
+    # report Validate on turn two of a top-down chain, where the root is an input.
+    assert CM.stage_of(_state([">population#1.5 crore", "population>drinkers#90 lakh"]), g) == "Calculate"
+    full = _state([">market size#5000 crore", "market size>customers#17 crore",
+                   "market size>penetration#20%", "market size>frequency#4",
+                   "market size>price#500"], "market_sizing")
+    assert CM.stage_of(full, g) == "Validate"
 
 
 def test_stage_maps_onto_the_case_list_too():

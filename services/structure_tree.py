@@ -188,9 +188,10 @@ def _decorate(node: Dict[str, Any], kids: List[Dict[str, Any]], case_type: str) 
                 if sub_label.strip().lower() == label:
                     op = sub["op"]
                     break
-        if op is None and kids:
-            op = "*"            # a parent with children combines them somehow; x is the
-                                # overwhelmingly common case in a decomposition chain
+        # No default. A parent having children says nothing about HOW they combine, and
+        # guessing "x" rendered a formula joining a real branch to four unopened ones --
+        # a sentence the candidate never said and the framework does not contain. A
+        # formula is printed only where the equation is actually known.
         node["op"] = op
         node["role"] = _cm.ROLE_DERIVED if kids else _cm.ROLE_INPUT
         node["formula"] = _cm.formula_of(node, kids) or None
