@@ -648,6 +648,16 @@ def _fold_session_state(
                 # The counters' only real source. Measured: the interviewer never emits
                 # touched=/missed= on its tag, so without this the whole accumulating
                 # evidence bank stays at zero however many people practise.
+                # Logged whenever rows were OFFERED, not only when something came back.
+                # "no line in the log" has twice meant two different things this session --
+                # the channel is dead, or the channel is alive and had nothing to say --
+                # and a diagnostic that cannot tell those apart is not a diagnostic.
+                _offered = sum(len(_expect_block.get(k) or [])
+                               for k in ("not_covered_yet", "common_errors_on_this_case"))
+                if _offered:
+                    print(f"[expectations] offered={_offered} "
+                          f"touched={_inf.get('touched','')!r} missed={_inf.get('missed','')!r} "
+                          f"attempt={attempt_id}")
                 if _inf.get("touched") or _inf.get("missed"):
                     try:
                         from services import case_expectations as _ce2
@@ -656,8 +666,6 @@ def _fold_session_state(
                             {"touched": _inf.get("touched", ""),
                              "missed": _inf.get("missed", "")},
                             helped=_helped)
-                        print(f"[expectations] inferred touched={_inf.get('touched','')!r} "
-                              f"missed={_inf.get('missed','')!r} attempt={attempt_id}")
                     except Exception as _e2:  # noqa: BLE001
                         print(f"[expectations] inferred fold skipped: {type(_e2).__name__}")
                 # Classified once per attempt, from a closed list. Everything structural --
