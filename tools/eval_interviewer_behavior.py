@@ -42,7 +42,7 @@ SCENARIOS = [
      "new":"help na i'm not getting this at all",
      "expect_signals":{"intent":"asking_for_help","repair_due":True,"frustration":"high","prior_work":True},
      "required":"Give a directional hint tied to the candidate's OWN equation, or repair. MUST NOT ask another broad open question or say 'I understand your frustration'.",
-     "required_exam":"Put ONE sharp cross-question built from the candidate's OWN equation (0.95S - 2 = 0.80(S-2)) back to them -- quote something they actually wrote. MUST NOT give a hint, supply or correct a figure, ask another broad open question, announce a refusal, or say 'I understand your frustration'. Withholding the hint is CORRECT here."},
+     "required_exam":"Put ONE cross-question back to them that QUOTES something they actually wrote - their equation 0.95S - 2 = 0.80(S-2), or their figure 2.67. A question quoting their own work PASSES, however plainly it is phrased. MUST NOT give a hint, supply or correct a figure, announce a refusal, or say 'I understand your frustration'. Withholding the hint is CORRECT here."},
     {"id":"reasonable_assumption_stands","case_type":"guesstimate",
      "transcript":[{"role":"assistant","content":"Alright, how would you size the daily tea cups here. Give me your first cut."}],
      "new":"ok so i'll say maybe 2 cups a day per person and like 50% of people actually drink chai",
@@ -401,6 +401,21 @@ GUSH = ("great job", "well done", "impressive", "excellent work", "fantastic", "
         "perfect answer", "brilliant", "you nailed")
 NO_GUSH = {"good_answer_should_advance", "strong_synthesis_close"}
 
+# "The question must contain something they actually wrote" is the engine's OWN standard
+# for a cross-question (services/interviewer_mode.CROSS_QUESTION), and it is mechanically
+# decidable, so it is decided here rather than by a judge.
+#
+# Why it had to move: on the exam run the interviewer replied "What do you think has to be
+# true for the equation 0.95S - 2 = 0.80(S-2) to hold?" -- which is, almost verbatim, the
+# worked GOOD example in that same instruction -- and the judge failed it as "another
+# broad open question". A rubric phrase vague enough to catch its own worked example is
+# measuring the judge's mood. A substring test is not.
+MUST_QUOTE_CANDIDATE: dict = {
+    # scenario id -> fragments, any ONE of which must appear in the reply
+    "help_when_stuck_with_work": ("0.95s", "0.80(s", "0.8(s", "2.67"),
+    "help_after_good_work": ("demand",),
+}
+
 
 def mechanical_fail(scenario: dict, reply: str) -> list:
     """Deterministic rule breaks for this scenario, or []. Cheaper and far more reliable than the judge."""
@@ -416,6 +431,9 @@ def mechanical_fail(scenario: dict, reply: str) -> list:
             if g in r:
                 out.append(f'gushed ("{g}")')
                 break
+    frags = MUST_QUOTE_CANDIDATE.get(scenario["id"])
+    if frags and not any(f in r for f in frags):
+        out.append("the question quotes nothing the candidate actually wrote")
     return out
 
 
