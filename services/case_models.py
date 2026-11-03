@@ -196,11 +196,21 @@ def gaps_for(case_type: str, archetype: Optional[str],
     result = by_label.get((model["label"] or "").strip().lower())
     _add(result["id"] if result else "", model["op"], model["operands"])
 
-    # Rung 2: only under an operand they have ALREADY named themselves.
+    # Rung 2: the sub-decomposition of EVERY operand the framework defines one for, not
+    # only the ones the candidate has reached.
+    #
+    # This reverses an earlier call. One rung was argued from productive failure -- showing
+    # the structure before the learner generates their own causes lock-in -- and that
+    # argument holds for the FIRST decomposition, which is why an empty tree still gets
+    # nothing. It does not hold afterwards, and the cost was real: the diagram stayed a
+    # three-box column that looked nothing like the frameworks it is teaching, in a mode
+    # the candidate explicitly chose BECAUSE it teaches. Interview mode draws no gaps at
+    # all, which is where withholding the shape actually matters.
     for label, sub in SUB_MODELS.items():
         node = by_label.get(label.lower())
-        if node is not None:
-            _add(node["id"], sub["op"], sub["operands"])
+        nid = node["id"] if node is not None else _slug(label)
+        if node is not None or any(g["id"] == nid for g in out):
+            _add(nid, sub["op"], sub["operands"])
     return out
 
 

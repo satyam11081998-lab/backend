@@ -195,19 +195,6 @@ def test_formula_is_rendered_from_the_children_that_exist():
     assert profit["role"] == "derived"
 
 
-def test_gaps_are_one_rung_not_the_skeleton():
-    """Drawing the whole archetype dotted turns decomposition into fill-in-the-blanks,
-    and decomposition is the skill being taught."""
-    st = _state([">profit#70 crore"], "profitability")
-    t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
-    profit = t["children"][0]
-    assert {c["kind"] for c in profit["children"]} == {"gap"}
-    # Revenue's own children (Price, Volume) must NOT appear: they are a rung further
-    # down, under a branch the candidate has not opened.
-    revenue = next(c for c in profit["children"] if c["label"] == "Revenue")
-    assert "children" not in revenue
-
-
 def test_a_branch_they_opened_earns_its_next_rung():
     st = _state([">profit#70 crore", "profit>revenue#400 crore"], "profitability")
     t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
@@ -314,3 +301,74 @@ def test_a_turn_that_touches_nothing_reports_nothing():
     out = S.infer([], "what do you mean by pre-owned?", {}, "guesstimate", _EXPECT,
                   llm=_FakeLLM("none"))
     assert out["edges"] == "" and out["touched"] == "" and out["missed"] == ""
+
+
+# -------------------------------------------------------- what their numbers come to
+def test_a_parent_shows_what_its_children_multiply_to():
+    """The tree had the operators and the figures and used them only to criticise inside
+    the interviewer's packet. A diagram that can do the arithmetic and shows nothing is a
+    mirror."""
+    st = {"structure": [
+        {"id": "m", "label": "Market size", "value": "", "parent": "", "kind": "stated"},
+        {"id": "c", "label": "Potential customers", "value": "17 crore", "parent": "m", "kind": "stated"},
+        {"id": "p", "label": "Penetration", "value": "20%", "parent": "m", "kind": "stated"},
+    ], "structure_archetype": "market_sizing"}
+    t = S.to_tree(st, "x", case_type="guesstimate")
+    node = t if t["id"] == "m" else t["children"][0]
+    assert node["implied"] and node["implied"].startswith("3.4 crore")   # 17cr x 20%
+
+
+def test_a_figure_they_stated_is_never_overwritten_by_the_tool():
+    """Their claim and a consequence of their claim are different things. quant_graph
+    still catches a disagreement; the diagram does not silently correct them."""
+    st = {"structure": [
+        {"id": "m", "label": "Market size", "value": "99 crore", "parent": "", "kind": "stated"},
+        {"id": "c", "label": "Potential customers", "value": "17 crore", "parent": "m", "kind": "stated"},
+        {"id": "p", "label": "Penetration", "value": "20%", "parent": "m", "kind": "stated"},
+    ], "structure_archetype": "market_sizing"}
+    t = S.to_tree(st, "x", case_type="guesstimate")
+    node = t if t["id"] == "m" else t["children"][0]
+    assert node["value"] == "99 crore" and node["implied"] is None
+
+
+def test_a_half_filled_branch_implies_nothing():
+    st = {"structure": [
+        {"id": "m", "label": "Market size", "value": "", "parent": "", "kind": "stated"},
+        {"id": "c", "label": "Potential customers", "value": "17 crore", "parent": "m", "kind": "stated"},
+        {"id": "p", "label": "Penetration", "value": "", "parent": "m", "kind": "stated"},
+    ], "structure_archetype": "market_sizing"}
+    t = S.to_tree(st, "x", case_type="guesstimate")
+    node = t if t["id"] == "m" else t["children"][0]
+    assert node["implied"] is None
+
+
+def test_gap_children_carry_no_figures_so_they_imply_nothing():
+    """A skeleton branch must never produce an invented number."""
+    st = _state([">profit#70 crore"], "profitability")
+    t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
+    def walk(n):
+        if n.get("kind") == "gap":
+            assert not n.get("value") and not n.get("implied"), n["label"]
+        for c in n.get("children", []):
+            walk(c)
+    walk(t)
+
+
+def test_the_skeleton_is_now_the_whole_framework_not_one_rung():
+    """Reversed deliberately: one rung left a three-box column in the mode a candidate
+    picks BECAUSE it teaches. Interview still draws no gaps at all."""
+    st = _state([">profit#70 crore"], "profitability")
+    t = S.to_tree(st, "x", case_type="profitability", with_gaps=True)
+    labels = set()
+    def walk(n):
+        labels.add(n["label"])
+        for c in n.get("children", []):
+            walk(c)
+    walk(t)
+    assert {"Revenue", "Total costs", "Price", "Volume",
+            "Variable costs", "Fixed costs"} <= labels
+
+
+def test_an_empty_tree_still_gets_no_skeleton():
+    """The first decomposition has to be theirs -- that part of the argument stands."""
+    assert S.to_tree({}, "x", case_type="profitability", with_gaps=True) is None

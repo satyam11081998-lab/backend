@@ -195,6 +195,31 @@ def _decorate(node: Dict[str, Any], kids: List[Dict[str, Any]], case_type: str) 
         node["op"] = op
         node["role"] = _cm.ROLE_DERIVED if kids else _cm.ROLE_INPUT
         node["formula"] = _cm.formula_of(node, kids) or None
+
+        # What their own figures COME TO, when every child carries one and the candidate
+        # has not stated the parent themselves.
+        #
+        # The tree has had the operators and the numbers for a while and used them only to
+        # criticise, inside the interviewer's packet. A diagram that can do the arithmetic
+        # and shows you nothing is a mirror; showing it is the difference between a record
+        # of what you said and something that tells you something. It is marked separately
+        # from `value` precisely BECAUSE the candidate did not say it -- the renderer draws
+        # it as the tool's arithmetic, never as their figure, and a value they state later
+        # that disagrees is still caught by services/quant_graph.
+        node["implied"] = None
+        if op and not node.get("value") and len(kids) >= 2:
+            try:
+                from services.quant_graph import _value_of, _combine
+                from services.numbers_check import fmt_number
+                qs = [_value_of(k.get("value") or "") for k in kids]
+                if all(qs):
+                    vals = [q.value / 100.0 if q.pct else q.value for q in qs]
+                    got = _combine(op, vals)
+                    if got and got > 0:
+                        node["implied"] = fmt_number(
+                            got, indian_first=any(q.indian for q in qs))
+            except Exception:  # noqa: BLE001
+                pass
     except Exception:  # noqa: BLE001
         node.setdefault("op", None)
         node.setdefault("role", None)
