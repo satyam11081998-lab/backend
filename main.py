@@ -25,12 +25,28 @@ app = FastAPI(title="MECE Backend", version="0.2.0")
 # allow_origin_regex is required because allow_credentials=True forbids a "*"
 # origin — the regex reflects the specific matched origin instead.
 _CORS_PREVIEW_REGEX = os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https://[a-z0-9-]+-consilioo\.vercel\.app")
+
+# Extra exact origins, comma separated, from the environment.
+#
+# This exists because moving the site between Vercel accounts broke every API call with
+# no error anywhere but the browser console: the new production alias
+# (company-ebon-three.vercel.app) is not a preview, so it matched neither the list below
+# nor the preview regex, which is pinned to the OLD team slug. Putting it in the
+# environment means the next move -- or a rollback to the old alias mid-migration -- is a
+# Render setting rather than a code deploy at the worst possible moment.
+#
+# Deliberately NOT a broad "any .vercel.app" regex: allow_credentials is True, so every
+# allowed origin can make authenticated requests carrying a signed-in user's session.
+# The set of origins trusted with that has to stay one you can name.
+_CORS_EXTRA = [o.strip().rstrip("/") for o in
+               (os.getenv("CORS_ALLOW_ORIGINS") or "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "https://mece.in",
         "https://www.mece.in",
+        *_CORS_EXTRA,
     ],
     allow_origin_regex=_CORS_PREVIEW_REGEX,
     allow_credentials=True,
