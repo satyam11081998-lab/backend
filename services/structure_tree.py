@@ -289,6 +289,12 @@ def active_id(state: Optional[Dict[str, Any]]) -> Optional[str]:
 # It returns the SAME grammar the tag uses, so parse_edges and its tests are unchanged: one
 # parser, one format, two sources.
 
+_EXPECT_LINE = (
+    "\nThen, only if the user lists expectations: covered: <ids> and fell_into: <ids>, "
+    "comma separated, ids exactly as given, each line omitted when none apply. Judge the "
+    "LAST candidate message only. Do not invent ids."
+)
+
 _CLASSIFY_LINE = (
     "\nThen a second line: model: <one name from the list the user gives>. Pick the "
     "equation that GENERATES the answer to the case, not the topic it is about. If the "
@@ -317,18 +323,30 @@ def infer_edges(transcript, new_user_message: str,
 
 def infer(transcript, new_user_message: str,
           state: Optional[Dict[str, Any]] = None, case_type: str = "",
+          expectations: Optional[Dict[str, Any]] = None,
           *, llm=None) -> Dict[str, str]:
-    """Infer this turn's edges, and the case's archetype when it is not known yet.
+    """Read the candidate's turn: its structure edges, the case's archetype, and which of
+    the case's expectations it touched.
 
-    Both in ONE call: the context is identical, and classifying is a single choice from a
-    closed list of about a dozen equations, which is the kind of task a small model does
-    reliably. Everything structural -- operators, roles, formulas, gaps -- is then derived
-    in Python from that one choice, so there is nothing else for the model to get wrong.
+    THREE JOBS, ONE CALL, ON PURPOSE. The context each needs is identical -- the same last
+    message against the same known state -- so splitting them would be three round trips
+    for one read. This runs in _after_turn, once the reply has already streamed, so it
+    costs the candidate nothing; a second or third call would still cost money and still
+    be three chances to fail instead of one.
+
+    All three were previously meant to ride the interviewer's own control tag. Measured on
+    production, gpt-4o-mini emits none of those keys, which left the structure diagram
+    empty AND the case_expectations counters at zero -- the whole accumulating-evidence
+    mechanism was writing to a channel the model never used. This is the fallback that
+    makes them work regardless of whether the tag arrives.
+
+    (If a fourth job appears, this belongs in its own module as the background turn
+    reader. At three it is still one coherent read of one message.)
 
     Never raises and never retries: a side-channel on a background path, so a failure
-    means the diagram waits for the next turn, nothing more.
+    means the diagram and the counters wait for the next turn, nothing more.
     """
-    out_d: Dict[str, str] = {"edges": "", "archetype": ""}
+    out_d: Dict[str, str] = {"edges": "", "archetype": "", "touched": "", "missed": ""}
     msg = (new_user_message or "").strip()
     if not msg:
         return out_d
@@ -348,6 +366,15 @@ def infer(transcript, new_user_message: str,
             user += "earlier: " + " | ".join(r[:160] for r in recent) + "\n"
         user += "candidate: " + msg[:400]
         system = _INFER_SYSTEM
+        rows = []
+        for key, field in (("not_covered_yet", "is"), ("common_errors_on_this_case", "looks_like")):
+            for r in (expectations or {}).get(key) or []:
+                label = (r.get(field) or "").strip()
+                if r.get("id") and label:
+                    rows.append(f"{r['id']} {label[:70]}")
+        if rows:
+            system += _EXPECT_LINE
+            user += "\nexpectations:\n" + "\n".join(rows[:14])
         if need_model and case_type:
             from services import case_models as _cm
             names = _cm.archetype_names(case_type)
@@ -378,7 +405,11 @@ def infer(transcript, new_user_message: str,
     edge_line, model_line = "", ""
     for l in lines:
         low = l.lower()
-        if low.startswith("model:"):
+        if low.startswith("covered:"):
+            out_d["touched"] = l.split(":", 1)[1].strip()
+        elif low.startswith("fell_into:"):
+            out_d["missed"] = l.split(":", 1)[1].strip()
+        elif low.startswith("model:"):
             model_line = l.split(":", 1)[1].strip()
         elif not edge_line:
             edge_line = l[5:].strip() if low.startswith("tree:") else (
