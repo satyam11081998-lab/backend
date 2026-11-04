@@ -185,6 +185,13 @@ class AttemptDetail(BaseModel):
     # The framework's equation for this case, as a caption. Distinct from a node's own
     # formula: this is what they are being asked to build, not what they have built.
     structure_equation: Optional[str] = None
+    # The WORKED decomposition for this case type, in the same node shape as `structure`.
+    # The live tree on its own is a mirror -- it reports what they said. This is the thing
+    # it gets compared against, and the shared shape is the point: the candidate's working
+    # and the model structure read as the same kind of object, drawn by one renderer.
+    # Deterministic (services/case_models.approach_tree), so it is right by construction
+    # rather than by review. None whenever the archetype is not known yet.
+    structure_approach: Optional[Dict[str, Any]] = None
 
 
 class PostMessageRequest(BaseModel):
@@ -880,6 +887,7 @@ def get_attempt(
     _structure_stage = None
     _structure_stages = None
     _structure_equation = None
+    _structure_approach = None
     if _resolve_policy(attempt, case) != "exam":
         try:
             from services import structure_tree as _stree
@@ -892,6 +900,8 @@ def get_attempt(
             _structure_stages = _cm.stages_for(case["type"])
             _structure_equation = _cm.equation_of(
                 case["type"], _sstate.get("structure_archetype")) or None
+            _structure_approach = _cm.approach_tree(
+                case["type"], _sstate.get("structure_archetype"))
         except Exception as _st_e:  # noqa: BLE001
             print(f"[structure] resume skipped: {type(_st_e).__name__}")
 
@@ -920,6 +930,7 @@ def get_attempt(
         structure_stage=_structure_stage,
         structure_stages=_structure_stages,
         structure_equation=_structure_equation,
+        structure_approach=_structure_approach,
     )
 
 
@@ -1131,7 +1142,14 @@ def post_message(
                              "stage": _cm.stage_of(_st, case["type"]),
                              "stages": _cm.stages_for(case["type"]),
                              "equation": _cm.equation_of(
-                                 case["type"], _st.get("structure_archetype")) or None},
+                                 case["type"], _st.get("structure_archetype")) or None,
+                             # Small (3-9 nodes) and it only changes when the archetype is
+                             # first identified, so it rides the turn rather than needing a
+                             # second request. The client keys it off `equation` and keeps
+                             # the object it already has when that string is unchanged, so
+                             # an unchanged approach does not re-run the tree layout.
+                             "approach": _cm.approach_tree(
+                                 case["type"], _st.get("structure_archetype"))},
                             ensure_ascii=False) + "\n\n")
                 except Exception as _st_e:  # noqa: BLE001
                     print(f"[structure] emit skipped: {type(_st_e).__name__}")
