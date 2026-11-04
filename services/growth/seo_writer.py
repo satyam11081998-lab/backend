@@ -25,6 +25,7 @@ to clean HTTP errors. The daily-budget kill switch is checked by the route.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -32,7 +33,10 @@ from typing import Any, Dict, List, Optional
 from services.ai_providers import chat_with_fallback
 from services.ai_usage import log_ai_usage
 
-SITE = "https://mece.in"
+# The site's own address. Env-driven because the domain is moving: everything this
+# writes carries absolute links, so a hardcoded host silently publishes dead links
+# from the day of the cutover. Set SITE_URL once on the host.
+SITE = (os.getenv("SITE_URL") or "https://mece.in").rstrip("/")
 
 _WRITER_SYSTEM = """You are MECE's Growth Editor. MECE is an Indian case-interview and group-discussion \
 prep platform. You write a single, genuinely useful public article that helps an aspirant turn a REAL \

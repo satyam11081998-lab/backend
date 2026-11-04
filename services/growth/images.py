@@ -40,7 +40,8 @@ HERO_WIDTH = 2000
 INLINE_WIDTH = 1600
 OG_WIDTH = 1200
 CREDIT = "Image generated with Gemini for MECE Insights"
-UA = "MECE-Insights/1.0 (+https://mece.in/insights)"
+UA = ("MECE-Insights/1.0 (+"
+      + (os.getenv("SITE_URL") or "https://mece.in").rstrip("/") + "/insights)")
 
 HOUSE_STYLE = (
     "Editorial photograph for a long-form business and economics magazine, in the style of a documentary "

@@ -18,36 +18,42 @@ os.environ["ADAPTIVE_INTERVIEWER"] = "true"
 
 app = FastAPI(title="MECE Backend", version="0.2.0")
 
-# Vercel PREVIEW deployments get a fresh hashed hostname each build
-# (e.g. hirespring-<hash>-consilioo.vercel.app) so they can't be listed
-# statically. Allow this team's vercel.app previews via a regex (override with
-# CORS_ALLOW_ORIGIN_REGEX if the team slug changes); production stays explicit.
-# allow_origin_regex is required because allow_credentials=True forbids a "*"
-# origin — the regex reflects the specific matched origin instead.
-_CORS_PREVIEW_REGEX = os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https://[a-z0-9-]+-consilioo\.vercel\.app")
+# WHICH ORIGINS MAY CALL THIS API, AS CONFIGURATION RATHER THAN CODE
+#
+# This list was hardcoded and it has now been wrong twice in one migration: the preview
+# regex was pinned to a Vercel team slug that no longer exists, and the site origins were
+# pinned to a domain that is about to change. Both failures look identical from the
+# server -- nothing in any log, every request failing only in the browser -- so the cost
+# of getting it wrong is an outage you find out about from users.
+#
+# So: set CORS_ALLOW_ORIGINS on the host and a domain move is a settings change, with the
+# old and new origins allowed side by side for as long as the cutover takes. Unset, it
+# behaves exactly as before.
+#
+# allow_credentials is True, which means every allowed origin can make requests carrying
+# a signed-in user's session. That is why this is an explicit list and NOT a wildcard or
+# a broad "any .vercel.app" pattern: the set of origins trusted to act as your users has
+# to be a set you can name.
+_SITE_ORIGINS_DEFAULT = "https://mece.in,https://www.mece.in"
+_SITE_ORIGINS = [o.strip().rstrip("/") for o in
+                 (os.getenv("CORS_ALLOW_ORIGINS") or _SITE_ORIGINS_DEFAULT).split(",")
+                 if o.strip()]
 
-# Extra exact origins, comma separated, from the environment.
+# Local development, always. Kept OUT of the env var so that setting CORS_ALLOW_ORIGINS
+# for a production cutover cannot accidentally break every developer's machine.
+_DEV_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+# Vercel preview deployments get a fresh hashed hostname per build, so they cannot be
+# listed. Supply a regex for the CURRENT team only.
 #
-# This exists because moving the site between Vercel accounts broke every API call with
-# no error anywhere but the browser console: the new production alias
-# (company-ebon-three.vercel.app) is not a preview, so it matched neither the list below
-# nor the preview regex, which is pinned to the OLD team slug. Putting it in the
-# environment means the next move -- or a rollback to the old alias mid-migration -- is a
-# Render setting rather than a code deploy at the worst possible moment.
-#
-# Deliberately NOT a broad "any .vercel.app" regex: allow_credentials is True, so every
-# allowed origin can make authenticated requests carrying a signed-in user's session.
-# The set of origins trusted with that has to stay one you can name.
-_CORS_EXTRA = [o.strip().rstrip("/") for o in
-               (os.getenv("CORS_ALLOW_ORIGINS") or "").split(",") if o.strip()]
+# This deliberately defaults to EMPTY, where it used to default to a pattern matching the
+# old team's slug. A regex that matches a team you no longer control is worse than no
+# regex at all: slugs can be re-registered, and this one grants credentialed access.
+_CORS_PREVIEW_REGEX = (os.getenv("CORS_ALLOW_ORIGIN_REGEX") or "").strip() or None
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://mece.in",
-        "https://www.mece.in",
-        *_CORS_EXTRA,
-    ],
+    allow_origins=[*_DEV_ORIGINS, *_SITE_ORIGINS],
     allow_origin_regex=_CORS_PREVIEW_REGEX,
     allow_credentials=True,
     allow_methods=["*"],

@@ -3,7 +3,7 @@ Telegram review for the daily blog (services/growth/daily_blog.py).
 
 Every new daily draft is sent, in full, to the admin's Telegram chat. Replying there decides it:
 
-  publish   (or /publish, approve, post it)   -> published on mece.in/insights at once
+  publish   (or /publish, approve, post it)   -> published on <SITE_URL>/insights at once
   another   (or /another, new, rewrite)       -> this draft is dropped and a new one is written
                                                   on a different topic (3-5 minutes), then sent
   reject    (or /reject, drop, skip)          -> dropped
@@ -30,7 +30,13 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-SITE = "https://mece.in"
+# The site's own address. Env-driven because the domain is moving: everything this
+# writes carries absolute links, so a hardcoded host silently publishes dead links
+# from the day of the cutover. Set SITE_URL once on the host.
+SITE = (os.getenv("SITE_URL") or "https://mece.in").rstrip("/")
+# Bare host, for the prompts this bot shows the admin ("post it on mece.in now"). Derived
+# rather than configured separately so there is exactly one place the domain is set.
+SITE_HOST = SITE.split("//", 1)[-1]
 WEBHOOK_PATH = "/seo/telegram/webhook"
 MAX_CHARS = 3800  # Telegram's limit is 4096 per message
 
@@ -229,7 +235,7 @@ def render_messages(page: Dict[str, Any]) -> List[str]:
             cur = f"{cur}\n\n{b}" if cur else b
     if cur:
         msgs.append(cur)
-    return blocks + msgs + ["👆 Reply <b>publish</b> to post this on mece.in · <b>another</b> for a new topic · "
+    return blocks + msgs + [f"👆 Reply <b>publish</b> to post this on {SITE_HOST} · <b>another</b> for a new topic · "
                             "<b>reject</b> to drop it."]
 
 
@@ -274,7 +280,7 @@ _REJECT = {"reject", "drop", "skip", "discard", "delete", "no"}
 _STATUS = {"status", "what's pending", "pending"}
 _HELP = {"help", "start", "commands"}
 
-HELP_TEXT = ("Reply to a draft with:\n• publish — post it on mece.in now\n• another — drop it and write a new one "
+HELP_TEXT = (f"Reply to a draft with:\n• publish — post it on {SITE_HOST} now\n• another — drop it and write a new one "
              "on a different topic\n• reject — drop it\n• status — what is waiting")
 
 

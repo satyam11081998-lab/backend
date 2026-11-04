@@ -62,7 +62,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 IST = timezone(timedelta(hours=5, minutes=30))
 KIND = "daily"
 FORMAT = "daily-2"
-SITE = "https://mece.in"
+# The site's own address. Env-driven because the domain is moving: everything this
+# writes carries absolute links, so a hardcoded host silently publishes dead links
+# from the day of the cutover. Set SITE_URL once on the host.
+SITE = (os.getenv("SITE_URL") or "https://mece.in").rstrip("/")
 
 _run_lock = threading.Lock()
 

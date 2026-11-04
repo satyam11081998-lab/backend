@@ -621,7 +621,7 @@ r = tg.handle_update(sb, {"update_id": 3, "message": {"message_id": 7, "chat": {
 check("replying 'publish' publishes that draft", r.get("action") == "published" and page["status"] == "published"
       and page["published_at"] and page["agent_meta"]["review"] == "published"
       and page["agent_meta"]["reviewed_via"] == "telegram")
-check("and the live link comes back", "mece.in/insights/" + page["slug"] in [p for m, p in api if m == "sendMessage"][-1]["text"])
+check("and the live link comes back", tg.SITE_HOST + "/insights/" + page["slug"] in [p for m, p in api if m == "sendMessage"][-1]["text"])
 r = tg.handle_update(sb, {"update_id": 3, "message": {"message_id": 7, "chat": {"id": 777}, "text": "publish"}},
                      run_another=run_another)
 check("Telegram re-sending the same update does nothing twice", r.get("duplicate"))
