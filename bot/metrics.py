@@ -50,7 +50,7 @@ def _reached_validate(attempt: Dict[str, Any], case_type: str) -> bool:
     return st in ("Validate", "Diagnose")
 
 
-def _coerce_float(val: Any) -> Optional[float]:
+def coerce_float(val: Any) -> Optional[float]:
     if isinstance(val, bool) or val is None:
         return None
     if isinstance(val, (int, float)):
@@ -61,6 +61,9 @@ def _coerce_float(val: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+_coerce_float = coerce_float
 
 
 def _structure_subscore_pct(sub: Dict[str, Any]) -> Optional[float]:

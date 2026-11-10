@@ -230,6 +230,7 @@ def redact_text(
     user_info: Optional[Dict[str, Any]] = None,
     known_ids: Iterable[str] = (),
     known_emails: Iterable[str] = (),
+    known_phones: Iterable[str] = (),
     college_terms: Sequence[str] = (),
     extra_names: Iterable[str] = (),
 ) -> str:
@@ -255,8 +256,22 @@ def redact_text(
         out = re.compile(re.escape(em), re.I).sub("[EMAIL]", out)
     out = _EMAIL_RE.sub("[EMAIL]", out)
 
-    # Phone numbers
+    # Known DB phones + regexes
+    phones: List[str] = [str(x).strip() for x in known_phones if x and str(x).strip()]
+    if u.get("phone"):
+        phones.append(str(u["phone"]).strip())
+    for ph in sorted(set(phones), key=len, reverse=True):
+        digits = re.sub(r"\D", "", ph)
+        if len(digits) >= 7:
+            out = re.compile(r"(?<!\d)" + re.escape(ph) + r"(?!\d)").sub("[PHONE]", out)
+            if digits != ph:
+                out = re.compile(r"(?<!\d)" + re.escape(digits) + r"(?!\d)").sub("[PHONE]", out)
     out = _redact_phones(out)
+
+    # LinkedIn profile URLs on user profile
+    li = str(u.get("linkedin_url") or "").strip()
+    if len(li) >= 12:
+        out = re.compile(re.escape(li), re.I).sub("[NAME]", out)
 
     # Colleges (DB terms + user's college_other + regexes)
     user_colleges = list(college_terms)

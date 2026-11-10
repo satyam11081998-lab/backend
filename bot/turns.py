@@ -64,6 +64,61 @@ _STAGE_TO_PHASE = {
     "recommend": 6,
 }
 
+CANONICAL_STAGES = (
+    "Clarify",
+    "Classify",
+    "Decompose",
+    "Assume",
+    "Calculate",
+    "Validate",
+    "Conclude",
+)
+
+
+def canonical_stage_name(phase_idx: int) -> str:
+    """Return canonical 7-stage label (Clarify..Conclude) for phase index 0..6."""
+    return CANONICAL_STAGES[max(0, min(len(CANONICAL_STAGES) - 1, int(phase_idx)))]
+
+
+def infer_attempt_phase(
+    attempt: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    case_type: str,
+    policy: str,
+    *,
+    submitted_reaches_conclude: bool = False,
+) -> int:
+    """Deterministically infer phase index 0..6 without importing interviewer LLM clients."""
+    from bot.data import normalize_session_state
+
+    status = str(attempt.get("status") or "").strip().lower()
+    if submitted_reaches_conclude and (
+        status == "submitted"
+        or bool(attempt.get("submitted_at"))
+        or bool((attempt.get("final_recommendation") or "").strip())
+    ):
+        return 6
+
+    ss = normalize_session_state(attempt.get("session_state"))
+    if ss.get("structure"):
+        try:
+            return stage_phase_index(stage_of(ss, case_type))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    transcript_rows: List[Dict[str, str]] = []
+    cur_phase = 0
+    for msg in messages:
+        role = (msg.get("role") or "").strip()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user" and (msg.get("kind") or "text") != "recommendation":
+            sig = compute_signals(transcript_rows, content, teaching_policy=policy)
+            cur_phase = max(cur_phase, _inferred_turn_phase(sig, content))
+        transcript_rows.append({"role": role or "system", "kind": msg.get("kind") or "text", "content": content})
+    return cur_phase
+
 
 def resolve_policy(attempt: Dict[str, Any], case: Optional[Dict[str, Any]]) -> str:
     """Resolve teaching_policy matching routes/attempts._resolve_policy."""

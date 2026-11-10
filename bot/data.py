@@ -203,6 +203,12 @@ def _valid_submission_row(row: Any, ds: WindowDataset) -> bool:
     return True
 
 
+fetch_all = _fetch_all
+fetch_in_chunks = _fetch_in_chunks
+valid_ts_row = _valid_ts_row
+valid_submission_row = _valid_submission_row
+
+
 def fetch_window_data(
     supabase: Any,
     *,
