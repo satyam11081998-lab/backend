@@ -1,0 +1,9 @@
+{
+  "last_run_at": null,
+  "last_run_date": null,
+  "last_run_status": null,
+  "cursor": null,
+  "consecutive_failures": 0,
+  "hash_salt": null,
+  "id_hash_map": {}
+}

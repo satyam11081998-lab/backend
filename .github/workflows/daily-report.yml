@@ -1,0 +1,118 @@
+name: Daily Backend Quality Report (02:00 IST)
+
+on:
+  schedule:
+    # 20:30 UTC == 02:00 IST (next day)
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Lookback window in days (optional)'
+        required: false
+        type: string
+      since:
+        description: 'ISO-8601 start timestamp (optional)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run without committing reports/state'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore bot state and report history from bot/reports branch
+        run: |
+          if git ls-remote --exit-code --heads origin bot/reports >/dev/null 2>&1; then
+            git fetch origin bot/reports
+            git checkout origin/bot/reports -- bot/state.json || true
+            git checkout origin/bot/reports -- bot/reports || true
+            git reset HEAD -- bot/ || true
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run read-only daily reporter
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AI_DAILY_BUDGET_USD: ${{ secrets.AI_DAILY_BUDGET_USD }}
+          GEMINI_TEXT_IN_PER_1M: ${{ secrets.GEMINI_TEXT_IN_PER_1M }}
+          GEMINI_TEXT_OUT_PER_1M: ${{ secrets.GEMINI_TEXT_OUT_PER_1M }}
+        run: |
+          ARGS=()
+          if [ -n "${{ github.event.inputs.days }}" ]; then
+            ARGS+=(--days "${{ github.event.inputs.days }}")
+          fi
+          if [ -n "${{ github.event.inputs.since }}" ]; then
+            ARGS+=(--since "${{ github.event.inputs.since }}")
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m bot "${ARGS[@]}"
+
+      - name: Upload report and log artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-${{ github.run_id }}
+          path: |
+            bot/reports/
+            bot/logs/
+          if-no-files-found: ignore
+
+      - name: Commit report and state to bot/reports branch only
+        if: always() && github.event.inputs.dry_run != 'true'
+        run: |
+          if [ -n "$(git status --porcelain | grep -v -E '^.. bot/')" ]; then
+            echo "Refusing commit: paths outside bot/ are dirty"
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin bot/reports >/dev/null 2>&1; then
+            git fetch origin bot/reports
+            git worktree add /tmp/wt-bot-reports -B bot/reports origin/bot/reports
+          else
+            git worktree add /tmp/wt-bot-reports -b bot/reports HEAD
+          fi
+          mkdir -p /tmp/wt-bot-reports/bot/reports /tmp/wt-bot-reports/bot/logs
+          [ -f bot/state.json ] && cp -f bot/state.json /tmp/wt-bot-reports/bot/state.json
+          [ -d bot/reports ] && cp -rf bot/reports/. /tmp/wt-bot-reports/bot/reports/ || true
+          [ -d bot/logs ] && cp -rf bot/logs/. /tmp/wt-bot-reports/bot/logs/ || true
+          cd /tmp/wt-bot-reports
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot/state.json bot/reports bot/logs
+          if ! git diff --cached --quiet; then
+            git commit -m "bot: daily report $(date -u +%Y-%m-%d)"
+            git push origin bot/reports
+          else
+            echo "No changes in bot/ to commit."
+          fi
