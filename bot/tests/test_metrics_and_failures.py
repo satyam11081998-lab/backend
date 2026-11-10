@@ -61,6 +61,7 @@ def test_redaction_preserves_case_numbers_and_generic_college_words() -> None:
 
 def test_all_six_failure_triggers_and_frequency_sorting(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
     repo = init_temp_git_repo(tmp_path)
 
     u_in = "10000000-0000-0000-0000-000000000001"
@@ -153,6 +154,7 @@ def test_all_six_failure_triggers_and_frequency_sorting(tmp_path: Path, monkeypa
 
 def test_c6_aborts_and_step_exception_recovery(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "sk-secret-key-never-log")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
     repo = init_temp_git_repo(tmp_path)
 
     # 1. Supabase down -> abort before writing report/state
@@ -253,6 +255,7 @@ def test_suite_helpers_and_real_offline_eval_zero_drift() -> None:
 
 def test_all_nine_metrics_regions_and_prev_7d_comparison(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
     repo = init_temp_git_repo(tmp_path)
 
     u_in1 = "11000000-0000-0000-0000-000000000001"
@@ -353,6 +356,7 @@ def test_all_nine_metrics_regions_and_prev_7d_comparison(tmp_path: Path, monkeyp
 
 def test_wall_clock_cap_and_us_pii_redaction(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
     repo = init_temp_git_repo(tmp_path)
     rc = run_daily_report(
         repo_root=repo,
@@ -401,8 +405,9 @@ def test_real_log_ai_usage_shape_and_cli_dry_run(tmp_path: Path, monkeypatch) ->
     assert inserted_rows[0]["endpoint"] == "/bot/daily-report"
     assert inserted_rows[0]["total_tokens"] == 160
 
-    # Verify --dry-run does not write report or state.json
+    # Verify --dry-run writes preview reports while keeping state.json unchanged
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
     repo = init_temp_git_repo(tmp_path)
     rc = run_daily_report(
         repo_root=repo,
@@ -413,6 +418,62 @@ def test_real_log_ai_usage_shape_and_cli_dry_run(tmp_path: Path, monkeypatch) ->
         budget_checker=lambda: None,
     )
     assert rc == EXIT_OK
-    assert not (repo / "bot" / "reports" / f"{DATE_STR}.json").exists()
+    assert (repo / "bot" / "reports" / f"{DATE_STR}.json").is_file()
+    assert (repo / "bot" / "reports" / f"{DATE_STR}.md").is_file()
     assert load_state(repo / "bot" / "state.json")["last_run_at"] is None
+
+
+def test_malformed_real_rows_skipped_and_counted_in_notes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
+    repo = init_temp_git_repo(tmp_path)
+
+    u1 = "aaa00000-0000-0000-0000-000000000001"
+    c1 = "bbb00000-0000-0000-0000-000000000001"
+    sb = FakeSupabase({
+        "users": [{"id": u1, "name": "Test", "email": "t@example.com", "market": "IN"}],
+        "cases": [{"id": c1, "title": "Legacy Case", "type": "guesstimate", "market": "IN"}],
+        "attempts": [
+            # Legacy/corrupt attempt referenced by a recent message, with unparseable created_at -> skipped
+            {"id": "att_bad_ts", "user_id": u1, "case_id": c1, "status": "active", "created_at": "not-a-timestamp"},
+            # Valid Postgres space+00 timestamp + stringified session_state with malformed nodes
+            {
+                "id": "att_good",
+                "user_id": u1,
+                "case_id": c1,
+                "status": "submitted",
+                "session_state": json.dumps({"structure": ["not-a-dict", {"label": "missing-id"}, {"id": "n1", "label": "Pop", "value": "1M", "parent": ""}]}),
+                "created_at": (NOW - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S+00"),
+            },
+        ],
+        "attempt_messages": [
+            {"id": "m_ref_bad", "attempt_id": "att_bad_ts", "role": "user", "kind": "text", "content": "orphan message", "created_at": _ts(2.6)},
+            {"id": "m_bad_ts", "attempt_id": "att_good", "role": "user", "kind": "text", "content": "hi", "created_at": "invalid"},
+            {"id": "m_good_1", "attempt_id": "att_good", "role": "user", "kind": "text", "content": "1M population split by 2.", "created_at": _ts(2.5)},
+            {"id": "m_good_2", "attempt_id": "att_good", "role": "assistant", "kind": "text", "content": "Walk through the two segments.", "created_at": _ts(2.4)},
+        ],
+        "submissions": [
+            {"id": "s_str_json", "user_id": u1, "case_id": c1, "score": "82", "feedback_json": json.dumps({"rubric": "case", "breakdown": {"structure": "18"}}), "created_at": _ts(2)},
+            {"id": "s_bad_score", "user_id": u1, "case_id": c1, "score": "N/A", "feedback_json": "{bad json", "created_at": _ts(2)},
+        ],
+    })
+
+    rc = run_daily_report(
+        repo_root=repo,
+        now_utc=NOW,
+        supabase_client=sb,
+        gemini_client=FakeGeminiClient(),
+        suite_runner=stub_suite_ok,
+        budget_checker=lambda: None,
+    )
+    assert rc == EXIT_OK
+    rep = json.loads((repo / "bot" / "reports" / f"{DATE_STR}.json").read_text(encoding="utf-8"))
+    assert rep["window"]["sessions"] == 1
+    assert rep["metrics"]["mean_score"]["value"] == 82.0
+    assert rep["metrics"]["mean_structure_subscore"]["value"] == 72.0  # 18 * 4
+    notes_blob = "\n".join(rep["notes"])
+    assert "Skipped 3 unparseable/malformed row(s)" in notes_blob
+    assert "'attempts': 1" in notes_blob
+    assert "'attempt_messages': 1" in notes_blob
+    assert "'submissions': 1" in notes_blob
 

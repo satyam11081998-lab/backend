@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from bot.config import scrub_secrets
+from bot.config import SERVICE_ROLE_WARN, scrub_secrets, scrub_uuids
 
 _METRIC_LABELS = (
     ("completion_rate", "Completion rate"),
@@ -35,6 +35,7 @@ def build_report_payload(
     notes: List[str],
     report_only: bool = False,
     consecutive_failures: int = 0,
+    used_service_role: bool = False,
 ) -> Dict[str, Any]:
     """Assemble the C5 JSON contract dict."""
     payload: Dict[str, Any] = {
@@ -56,11 +57,13 @@ def build_report_payload(
         },
         "metrics": metrics,
         "failures": failures,
-        "notes": [scrub_secrets(str(n)) for n in notes if str(n).strip()],
+        "notes": [scrub_uuids(scrub_secrets(str(n))) for n in notes if str(n).strip()],
     }
     if report_only:
         payload["report_only"] = True
         payload["consecutive_failures"] = int(consecutive_failures)
+    if used_service_role:
+        payload["used_service_role"] = True
     return payload
 
 
@@ -86,6 +89,13 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
             "> [!CAUTION]",
             f"> **REPORT-ONLY MODE ACTIVE (consecutive_failures = {cf})**",
             "> Three or more consecutive failures occurred. Gemini model calls are paused and this run is report-only until investigated and reset.",
+            "",
+        ])
+
+    if payload.get("used_service_role"):
+        lines.extend([
+            "> [!WARNING]",
+            f"> {SERVICE_ROLE_WARN}",
             "",
         ])
 
@@ -164,7 +174,7 @@ def render_markdown_report(payload: Dict[str, Any]) -> str:
         for n in notes:
             lines.append(f"- {n}")
     lines.append("")
-    return scrub_secrets("\n".join(lines))
+    return scrub_uuids(scrub_secrets("\n".join(lines)))
 
 
 def write_reports(reports_dir: Path, payload: Dict[str, Any]) -> tuple[Path, Path]:
@@ -174,7 +184,7 @@ def write_reports(reports_dir: Path, payload: Dict[str, Any]) -> tuple[Path, Pat
     json_path = reports_dir / f"{date_str}.json"
     md_path = reports_dir / f"{date_str}.md"
 
-    json_text = scrub_secrets(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    json_text = scrub_uuids(scrub_secrets(json.dumps(payload, indent=2, ensure_ascii=False) + "\n"))
     md_text = render_markdown_report(payload)
 
     json_tmp = reports_dir / f"{date_str}.json.tmp"

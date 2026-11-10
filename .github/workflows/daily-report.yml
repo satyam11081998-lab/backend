@@ -62,12 +62,22 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_BOT_KEY: ${{ secrets.SUPABASE_BOT_KEY }}
+          BOT_HASH_SALT: ${{ secrets.BOT_HASH_SALT }}
+          BOT_REQUIRE_BOT_KEY: "1"
           AI_DAILY_BUDGET_USD: ${{ secrets.AI_DAILY_BUDGET_USD }}
           GEMINI_TEXT_IN_PER_1M: ${{ secrets.GEMINI_TEXT_IN_PER_1M }}
           GEMINI_TEXT_OUT_PER_1M: ${{ secrets.GEMINI_TEXT_OUT_PER_1M }}
         run: |
-          ARGS=()
+          if [ -z "${SUPABASE_BOT_KEY}" ]; then
+            echo "::error::SUPABASE_BOT_KEY secret is unset; refusing to run without read-only bot key."
+            exit 1
+          fi
+          if [ -z "${BOT_HASH_SALT}" ]; then
+            echo "::error::BOT_HASH_SALT secret is unset; refusing to run without stable hash salt."
+            exit 1
+          fi
+          ARGS=(--require-bot-key)
           if [ -n "${{ github.event.inputs.days }}" ]; then
             ARGS+=(--days "${{ github.event.inputs.days }}")
           fi

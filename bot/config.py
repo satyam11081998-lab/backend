@@ -1,11 +1,11 @@
-"""Configuration, caps, and secret hygiene helpers for the daily reporter bot."""
+"""Configuration, caps, credential resolution, and secret/UUID hygiene helpers."""
 from __future__ import annotations
 
 import os
 import re
 from datetime import timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Tuple
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -22,6 +22,10 @@ MAX_TOKENS_PER_RUN = int(os.getenv("BOT_MAX_TOKENS_PER_RUN", "50000"))
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
+SERVICE_ROLE_WARN = (
+    "[WARN] running with the service role key — create a read-only role before enabling the workflow"
+)
+
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_ABORT = 2
@@ -31,7 +35,9 @@ _SECRET_ENV_NAMES = (
     "GOOGLE_API_KEY",
     "OPENAI_API_KEY",
     "GROQ_API_KEY",
+    "SUPABASE_BOT_KEY",
     "SUPABASE_SERVICE_ROLE_KEY",
+    "BOT_HASH_SALT",
     "CRON_SECRET",
     "TELEGRAM_BOT_TOKEN",
 )
@@ -41,6 +47,7 @@ _KEY_PATTERNS = (
     re.compile(r"\bgsk_[0-9A-Za-z\-_]{16,}\b"),
     re.compile(r"\beyJ[0-9A-Za-z\-_]+\.[0-9A-Za-z\-_]+\.[0-9A-Za-z\-_]+\b"),
 )
+UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 
 
 def default_repo_root() -> Path:
@@ -56,6 +63,21 @@ def get_gemini_api_key() -> str:
     return (os.environ.get("GEMINI_API_KEY") or "").strip()
 
 
+def get_bot_hash_salt() -> str:
+    """Read BOT_HASH_SALT from os.environ."""
+    return (os.environ.get("BOT_HASH_SALT") or "").strip()
+
+
+def get_supabase_credentials() -> Tuple[str, str, bool]:
+    """Return (url, key, used_service_role), preferring SUPABASE_BOT_KEY over service role."""
+    url = (os.environ.get("SUPABASE_URL") or "").strip()
+    bot_key = (os.environ.get("SUPABASE_BOT_KEY") or "").strip()
+    if bot_key:
+        return url, bot_key, False
+    svc_key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    return url, svc_key, True
+
+
 def scrub_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     """Remove any configured secret values or API-key shapes from logs/reports."""
     out = text or ""
@@ -66,3 +88,8 @@ def scrub_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     for pat in _KEY_PATTERNS:
         out = pat.sub("[SECRET_REDACTED]", out)
     return out
+
+
+def scrub_uuids(text: str) -> str:
+    """Ensure no raw UUID ever survives in bot state, logs, or reports."""
+    return UUID_RE.sub("[UUID_REDACTED]", text or "")

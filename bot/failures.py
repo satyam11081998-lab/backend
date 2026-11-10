@@ -94,7 +94,7 @@ def _is_quota_or_auth_error(exc: Exception) -> bool:
 def build_redacted_shortlist(
     dataset: WindowDataset,
     attempt_evals: List[AttemptEval],
-    state: Dict[str, Any],
+    bot_hash_salt: str,
     windows: Dict[str, datetime],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Flag candidate turns deterministically, count 7d frequencies, and redact PII."""
@@ -146,7 +146,7 @@ def build_redacted_shortlist(
         aid = str(ae.attempt.get("id") or "")
         uid = str(ae.attempt.get("user_id") or "")
         user_info = dataset.users_by_id.get(uid) or {"id": uid}
-        attempt_hash = hash_identifier(state, aid)
+        attempt_hash = hash_identifier(aid, bot_hash_salt)
 
         for t in ae.turns:
             if not t.flags:

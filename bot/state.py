@@ -1,59 +1,70 @@
-"""Persistent state, window calculation, and id->hash mapping in bot/state.json."""
+"""Persistent state, window calculation, and salted identifier hashing (no id map)."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import secrets
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from bot.config import FIRST_RUN_DAYS, IST, MAX_WINDOW_DAYS, ROLLING_7D_DAYS
 
 
 def default_state() -> Dict[str, Any]:
-    """Return a clean initial bot state."""
+    """Return a clean initial bot state (never stores raw IDs or maps)."""
     return {
         "last_run_at": None,
         "last_run_date": None,
         "last_run_status": None,
         "cursor": None,
         "consecutive_failures": 0,
-        "hash_salt": None,
-        "id_hash_map": {},
     }
 
 
 def load_state(state_path: Path) -> Dict[str, Any]:
-    """Load bot/state.json, returning clean defaults if absent."""
+    """Load bot/state.json, dropping any legacy id_hash_map/hash_salt fields."""
     base = default_state()
     if not state_path.is_file():
         return base
     raw = json.loads(state_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"Invalid state file format in {state_path}")
-    base.update(raw)
-    if not isinstance(base.get("id_hash_map"), dict):
-        base["id_hash_map"] = {}
+    for key in base:
+        if key in raw:
+            base[key] = raw[key]
     if base.get("consecutive_failures") is None:
         base["consecutive_failures"] = 0
     return base
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
-    """Atomically write bot/state.json."""
+    """Atomically write bot/state.json without any raw identifier maps."""
+    clean = {
+        "last_run_at": state.get("last_run_at"),
+        "last_run_date": state.get("last_run_date"),
+        "last_run_status": state.get("last_run_status"),
+        "cursor": state.get("cursor"),
+        "consecutive_failures": int(state.get("consecutive_failures") or 0),
+    }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = state_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    tmp_path.write_text(json.dumps(clean, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     os.replace(tmp_path, state_path)
 
 
 def parse_iso_utc(ts: str) -> datetime:
-    """Parse an ISO timestamp string into timezone-aware UTC datetime."""
+    """Parse ISO-8601 / Postgres timestamptz strings into timezone-aware UTC datetime."""
     val = (ts or "").strip()
+    if not val:
+        raise ValueError("Empty timestamp")
+    if " " in val and "T" not in val:
+        val = val.replace(" ", "T", 1)
     if val.endswith("Z"):
         val = val[:-1] + "+00:00"
+    elif re.search(r"[+-]\d{2}$", val):
+        val = val + ":00"
     dt = datetime.fromisoformat(val)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -86,10 +97,7 @@ def compute_windows(
     days: Optional[int] = None,
     since: Optional[str] = None,
 ) -> Dict[str, datetime]:
-    """Compute current window, prior 7d comparison window, and rolling 7d window.
-
-    Normal resume: sessions since cursor, capped at 3 days; first run takes 2 days.
-    """
+    """Compute current window, prior 7d comparison window, and rolling 7d window."""
     now = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
 
@@ -127,18 +135,11 @@ def compute_windows(
     }
 
 
-def hash_identifier(state: Dict[str, Any], raw_id: str) -> str:
-    """Return a stable short hash for `raw_id` and store the id->hash map ONLY in state."""
+def hash_identifier(raw_id: str, salt: str) -> str:
+    """Compute irreversible 16-char hash sha256(BOT_HASH_SALT + raw_id)[:16]."""
     rid = str(raw_id or "").strip()
     if not rid:
         return ""
-    id_map = state.setdefault("id_hash_map", {})
-    if rid in id_map:
-        return id_map[rid]
-    salt = state.get("hash_salt")
     if not salt:
-        salt = secrets.token_hex(16)
-        state["hash_salt"] = salt
-    digest = hashlib.sha256(f"{salt}:{rid}".encode("utf-8")).hexdigest()[:12]
-    id_map[rid] = digest
-    return digest
+        raise ValueError("BOT_HASH_SALT is required to hash identifiers")
+    return hashlib.sha256((salt + rid).encode("utf-8")).hexdigest()[:16]

@@ -1,13 +1,14 @@
 """C4 Step 2 deterministic metrics (no model calls)."""
 from __future__ import annotations
 
+import json
 import statistics
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.case_models import stage_of
 
-from bot.data import WindowDataset
+from bot.data import WindowDataset, normalize_session_state
 from bot.state import parse_iso_utc
 from bot.turns import AttemptEval, stage_phase_index
 
@@ -35,31 +36,54 @@ def _in_range(ts_raw: Optional[str], start: datetime, end: datetime, *, inclusiv
 
 
 def _structure_node_count(attempt: Dict[str, Any]) -> int:
-    nodes = (attempt.get("session_state") or {}).get("structure") or []
+    ss = normalize_session_state(attempt.get("session_state"))
+    nodes = ss.get("structure") or []
     return sum(1 for n in nodes if isinstance(n, dict) and (n.get("kind") or "stated") != "gap")
 
 
 def _reached_validate(attempt: Dict[str, Any], case_type: str) -> bool:
-    st = stage_of(attempt.get("session_state"), case_type)
+    ss = normalize_session_state(attempt.get("session_state"))
+    try:
+        st = stage_of(ss, case_type)
+    except Exception:  # noqa: BLE001
+        return False
     return st in ("Validate", "Diagnose")
+
+
+def _coerce_float(val: Any) -> Optional[float]:
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _structure_subscore_pct(sub: Dict[str, Any]) -> Optional[float]:
     fj = sub.get("feedback_json") or {}
+    if isinstance(fj, str):
+        try:
+            fj = json.loads(fj)
+        except Exception:  # noqa: BLE001
+            return None
     if not isinstance(fj, dict):
         return None
     bd = fj.get("breakdown") or {}
     if not isinstance(bd, dict):
         return None
-    raw = bd.get("structure")
-    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+    raw_val = _coerce_float(bd.get("structure"))
+    if raw_val is None:
         return None
     rubric = str(fj.get("rubric") or "").strip().lower()
     if rubric == "guesstimate":
-        return float(raw)
-    if rubric == "case" or float(raw) <= 25.0:
-        return float(raw) * 100.0 / 25.0
-    return float(raw)
+        return raw_val
+    if rubric == "case" or raw_val <= 25.0:
+        return raw_val * 100.0 / 25.0
+    return raw_val
 
 
 def _compute_slice_metrics(
@@ -98,7 +122,7 @@ def _compute_slice_metrics(
             by_user[uid] = by_user.get(uid, 0) + 1
     return_rate = round(sum(1 for c in by_user.values() if c >= 2) / len(by_user), 4) if by_user else 0.0
 
-    scores = [float(s["score"]) for s in submissions if isinstance(s.get("score"), (int, float))]
+    scores = [v for s in submissions for v in [_coerce_float(s.get("score"))] if v is not None]
     mean_score = round(sum(scores) / len(scores), 4) if scores else 0.0
 
     struct_scores = [v for s in submissions for v in [_structure_subscore_pct(s)] if v is not None]

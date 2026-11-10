@@ -14,11 +14,20 @@ from bot.config import (
     EXIT_OK,
     MAX_TOKENS_PER_RUN,
     MAX_WALL_SECONDS,
+    SERVICE_ROLE_WARN,
     default_repo_root,
+    get_bot_hash_salt,
     get_gemini_api_key,
+    get_supabase_credentials,
     scrub_secrets,
+    scrub_uuids,
 )
-from bot.data import SupabaseUnavailableError, WindowDataset, fetch_window_data
+from bot.data import (
+    SupabaseUnavailableError,
+    WindowDataset,
+    build_supabase_client,
+    fetch_window_data,
+)
 from bot.failures import (
     BudgetExhaustedError,
     GeminiQuotaOrAuthError,
@@ -26,7 +35,7 @@ from bot.failures import (
     build_redacted_shortlist,
     rank_failures_with_gemini,
 )
-from bot.git_guard import check_git_clean_outside_bot
+from bot.git_guard import capture_outside_bot_baseline, compare_outside_bot_snapshot
 from bot.metrics import compute_all_metrics
 from bot.redact import RedactionLeakError, assert_no_identifiers
 from bot.report import build_report_payload, write_reports
@@ -48,7 +57,7 @@ class WallClockExceededError(RuntimeError):
 def _append_log(log_path: Path, message: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).isoformat()
-    safe_msg = scrub_secrets(message)
+    safe_msg = scrub_uuids(scrub_secrets(message))
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(f"[{ts}] {safe_msg}\n")
 
@@ -76,6 +85,7 @@ def run_daily_report(
     since: Optional[str] = None,
     dry_run: bool = False,
     skip_suite: bool = False,
+    require_bot_key: Optional[bool] = None,
     now_utc: Optional[datetime] = None,
     supabase_client: Any = None,
     gemini_client: Any = None,
@@ -103,7 +113,7 @@ def run_daily_report(
     start_mono = time.monotonic()
 
     def log(msg: str, *, echo: bool = True) -> None:
-        safe = scrub_secrets(msg)
+        safe = scrub_uuids(scrub_secrets(msg))
         _append_log(log_path, safe)
         if echo:
             print(safe)
@@ -114,14 +124,30 @@ def run_daily_report(
         log("[ABORT] GEMINI_API_KEY is unset; aborting without fallback to any other provider.")
         return EXIT_ABORT
 
-    # C1 & C6: Git working tree must be clean outside bot/ at start
-    git_ok, dirty_paths, git_err = check_git_clean_outside_bot(root)
-    if not git_ok:
-        if git_err:
-            log(f"[ABORT] {git_err}")
-        else:
-            log(f"[ABORT] Git dirty at start outside bot/: {', '.join(dirty_paths)}")
+    # Item 3: BOT_HASH_SALT must be set in environment (never persist an id->hash map)
+    bot_hash_salt = get_bot_hash_salt()
+    if not bot_hash_salt:
+        log("[ABORT] BOT_HASH_SALT is unset; aborting without persisting unhashed identifiers.")
         return EXIT_ABORT
+
+    # Item 1: Capture git working-tree baseline outside bot/ at run start
+    git_ok, git_baseline, git_err = capture_outside_bot_baseline(root)
+    if not git_ok:
+        log(f"[ABORT] {git_err}")
+        return EXIT_ABORT
+
+    # Item 2: Resolve Supabase credentials (prefer SUPABASE_BOT_KEY; warn on service role fallback)
+    strict_bot_key = (
+        require_bot_key
+        if require_bot_key is not None
+        else os.getenv("BOT_REQUIRE_BOT_KEY", "").strip() == "1"
+    )
+    sb_url, sb_key, used_service_role = get_supabase_credentials()
+    if strict_bot_key and used_service_role:
+        log("[ABORT] SUPABASE_BOT_KEY is unset and --require-bot-key is active.")
+        return EXIT_ABORT
+    if used_service_role:
+        log(SERVICE_ROLE_WARN)
 
     # Step 1: Resume state + same-day no-op + window calculation
     try:
@@ -139,8 +165,10 @@ def run_daily_report(
     if report_only:
         log(f"[WARN] consecutive_failures={consecutive_failures} >= {CONSECUTIVE_FAILURE_REPORT_ONLY}; entering REPORT-ONLY mode.")
 
-    # Ensure AI usage rows flush synchronously before CLI exit when using real services.ai_usage
     os.environ.setdefault("AI_USAGE_LOG_SYNC", "1")
+    # Allow services.ai_usage / services.supabase_client import when running in CI with SUPABASE_BOT_KEY only.
+    if sb_key and not (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip():
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"] = sb_key
 
     # C6: Check budget switch + Supabase connectivity before doing heavy work
     if budget_checker is not None:
@@ -159,14 +187,11 @@ def run_daily_report(
             log(f"[ABORT] Daily AI budget switch tripped: {exc.detail}")
             return EXIT_ABORT
         except Exception:  # noqa: BLE001
-            # Let Supabase probe below surface real DB connectivity errors.
             pass
 
     if supabase_client is None:
         try:
-            from services.supabase_client import get_supabase_client
-
-            supabase_client = get_supabase_client()
+            supabase_client = build_supabase_client(sb_url, sb_key)
         except Exception as exc:  # noqa: BLE001
             log(f"[ABORT] Supabase client initialization failed: {type(exc).__name__}: {exc}")
             return EXIT_ABORT
@@ -186,13 +211,17 @@ def run_daily_report(
         log(f"[ABORT] {exc}")
         return EXIT_ABORT
 
-    # Pipeline Steps 2-4: any unexpected exception writes a partial report, bumps consecutive_failures, exits non-zero
     notes: List[str] = []
     if report_only:
         notes.append(
             f"REPORT-ONLY MODE: consecutive_failures={consecutive_failures} (>= 3). "
             "Gemini calls skipped; manual investigation required."
         )
+    if used_service_role:
+        notes.append(SERVICE_ROLE_WARN)
+    if git_baseline:
+        dirty_desc = ", ".join(f"{p} ({st[0].strip() or '?'})" for p, st in sorted(git_baseline.items()))
+        notes.append(f"Pre-existing dirty paths outside bot/ at start (unchanged during run): {dirty_desc}")
 
     metrics: Dict[str, Any] = {}
     region_counts: Dict[str, int] = {"IN": 0, "US": 0}
@@ -218,10 +247,20 @@ def run_daily_report(
         from bot.turns import AttemptEval, analyze_attempt
 
         _check_wall_clock(start_mono, max_wall_seconds)
-        # Replay attempts once deterministically
-        attempt_evals: List[AttemptEval] = [
-            analyze_attempt(att, dataset, reference_now=windows["window_to"]) for att in dataset.attempts
-        ]
+        attempt_evals: List[AttemptEval] = []
+        for att in dataset.attempts:
+            try:
+                attempt_evals.append(analyze_attempt(att, dataset, reference_now=windows["window_to"]))
+            except Exception as row_exc:  # noqa: BLE001
+                dataset.note_skip("attempts_replay", f"{type(row_exc).__name__}: {row_exc}")
+
+        if dataset.total_skipped() > 0:
+            reasons_txt = "; ".join(dataset.skipped_reasons[:10])
+            notes.append(
+                f"Skipped {dataset.total_skipped()} unparseable/malformed row(s) "
+                f"({dict(dataset.skipped_counts)}): {reasons_txt}"
+            )
+
         win_evals = [
             ae
             for ae in attempt_evals
@@ -234,7 +273,7 @@ def run_daily_report(
 
         # Step 3: Deterministic failure shortlist + redaction + Gemini ranking
         _check_wall_clock(start_mono, max_wall_seconds)
-        shortlist, leak_ctx = build_redacted_shortlist(dataset, attempt_evals, state, windows)
+        shortlist, leak_ctx = build_redacted_shortlist(dataset, attempt_evals, bot_hash_salt, windows)
         if shortlist:
             failures, cost_usd, _tokens = rank_failures_with_gemini(
                 shortlist,
@@ -269,26 +308,25 @@ def run_daily_report(
         return EXIT_ABORT
     except Exception as exc:  # noqa: BLE001
         step_failed = True
-        err_note = f"Run error ({type(exc).__name__}): {scrub_secrets(str(exc))}"
+        err_note = f"Run error ({type(exc).__name__}): {scrub_uuids(scrub_secrets(str(exc)))}"
         notes.append(err_note)
         log(f"[ERROR] {err_note}")
 
     if before_write_hook is not None:
         before_write_hook()
 
-    # C1: Re-check git status --porcelain right before writing the report
-    git_ok_end, dirty_end, git_err_end = check_git_clean_outside_bot(root)
+    # Item 1 & C1: Compare git working tree outside bot/ against start baseline
+    git_ok_end, changed_end, git_err_end = compare_outside_bot_snapshot(root, git_baseline)
     if not git_ok_end:
         if git_err_end:
             log(f"[ABORT] Pre-write git check failed: {git_err_end}")
         else:
             log(
-                "[ABORT] Refusing to write report — path(s) outside bot/ changed mid-run: "
-                + ", ".join(dirty_end)
+                "[ABORT] Refusing to write report — path(s) outside bot/ changed during run: "
+                + ", ".join(changed_end)
             )
         return EXIT_ABORT
 
-    # Assemble & verify report contains zero identifiers
     payload = build_report_payload(
         report_date=report_date,
         window_from_iso=windows["window_from"].isoformat(),
@@ -302,6 +340,7 @@ def run_daily_report(
         notes=notes,
         report_only=report_only,
         consecutive_failures=consecutive_failures,
+        used_service_role=bool(used_service_role and not os.getenv("SUPABASE_BOT_KEY", "").strip()),
     )
 
     try:
@@ -324,10 +363,14 @@ def run_daily_report(
         return EXIT_ABORT
 
     if dry_run:
-        log(f"[DRY-RUN] Report prepared for {report_date} (cost_usd={cost_usd:.6f}, failures={len(failures)}). Not written.")
+        md_path, json_path = write_reports(reports_dir, payload)
+        log(
+            f"[DRY-RUN] Report prepared for {report_date} "
+            f"(sessions={sessions_in_window}, cost_usd={cost_usd:.6f}, failures={len(failures)}). "
+            f"Preview written to {json_path.relative_to(root)} and {md_path.relative_to(root)}; state.json unchanged."
+        )
         return EXIT_ERROR if step_failed else EXIT_OK
 
-    # Step 5: Write bot/reports/<date>.md & <date>.json and update bot/state.json
     md_path, json_path = write_reports(reports_dir, payload)
     if step_failed:
         state["consecutive_failures"] = consecutive_failures + 1

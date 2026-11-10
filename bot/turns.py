@@ -222,6 +222,8 @@ def analyze_attempt(
     """Deterministically replay one attempt and evaluate metrics/failure signals."""
     from services.interviewer_decision import decide_response, is_praise_only
 
+    from bot.data import normalize_session_state
+
     aid = str(attempt.get("id") or "")
     uid = str(attempt.get("user_id") or "")
     case = dataset.cases_by_id.get(str(attempt.get("case_id") or "")) or {}
@@ -230,8 +232,11 @@ def analyze_attempt(
     region = dataset.attempt_region(attempt)
     messages = list(dataset.messages_by_attempt.get(aid) or [])
 
-    session_state = attempt.get("session_state") or {}
-    final_db_stage = stage_of(session_state, case_type)
+    session_state = normalize_session_state(attempt.get("session_state"))
+    try:
+        final_db_stage = stage_of(session_state, case_type)
+    except Exception:  # noqa: BLE001
+        final_db_stage = "Clarify"
     final_db_phase = stage_phase_index(final_db_stage)
     is_abandoned = is_attempt_abandoned(attempt, messages, reference_now)
 

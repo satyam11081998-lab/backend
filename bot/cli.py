@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--since", type=str, default=None, help="ISO-8601 start timestamp (manual override)")
     ap.add_argument("--dry-run", action="store_true", help="Run without writing reports or updating state.json")
     ap.add_argument("--skip-suite", action="store_true", help="Skip pytest + offline eval checks")
+    ap.add_argument("--require-bot-key", action="store_true", help="Fail if SUPABASE_BOT_KEY is unset (no service-role fallback)")
     ap.add_argument("--no-dotenv", action="store_true", help="Do not load .env from disk")
     return ap
 
@@ -34,6 +35,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         since=args.since,
         dry_run=args.dry_run,
         skip_suite=args.skip_suite,
+        require_bot_key=True if args.require_bot_key else None,
     )
 
 
