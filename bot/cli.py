@@ -15,7 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--repo-root", type=str, default=None, help="Override repository root path")
     ap.add_argument("--days", type=int, default=None, help="Lookback window in days (manual override)")
     ap.add_argument("--since", type=str, default=None, help="ISO-8601 start timestamp (manual override)")
-    ap.add_argument("--dry-run", action="store_true", help="Run without writing reports or updating state.json")
+    ap.add_argument("--dry-run", action="store_true", help="Write preview reports without updating state.json")
     ap.add_argument("--skip-suite", action="store_true", help="Skip pytest + offline eval checks")
     ap.add_argument("--require-bot-key", action="store_true", help="Fail if SUPABASE_BOT_KEY is unset (no service-role fallback)")
     ap.add_argument("--no-dotenv", action="store_true", help="Do not load .env from disk")
