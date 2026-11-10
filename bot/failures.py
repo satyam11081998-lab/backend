@@ -91,6 +91,44 @@ def _is_quota_or_auth_error(exc: Exception) -> bool:
     return any(t in msg for t in tokens)
 
 
+def _is_transient_gemini_error(exc: Exception) -> bool:
+    if _is_quota_or_auth_error(exc):
+        return False
+    code = getattr(exc, "status_code", None)
+    if code in (500, 502, 503, 504):
+        return True
+    msg = str(exc).lower()
+    tokens = ("500", "502", "503", "504", "unavailable", "high demand", "overloaded", "temporarily", "timeout", "timed out")
+    return any(t in msg for t in tokens)
+
+
+def format_deterministic_failures(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build capped C5 failure entries deterministically without a Gemini call."""
+    ordered = sorted(
+        candidates,
+        key=lambda item: (-int(item.get("frequency_7d", 1)), int(item.get("id", 0))),
+    )
+    out: List[Dict[str, Any]] = []
+    for idx, item in enumerate(ordered[:MAX_FAILURES_IN_REPORT], start=1):
+        out.append({
+            "rank": idx,
+            "signal": item["signal"],
+            "attempt_hash": item["attempt_hash"],
+            "case_type": item["case_type"],
+            "stage": item["stage"],
+            "candidate_turn": item["candidate_turn"],
+            "interviewer_reply": item["interviewer_reply"],
+            "signals": item["signals"],
+            "response_function": item["response_function"],
+            "should_have": _DEFAULT_SHOULD_HAVE.get(
+                item["signal"], "Respond specifically to the candidate's turn and move the case forward."
+            ),
+            "frequency_7d": item["frequency_7d"],
+            "abandoned_within_2_turns": item["abandoned_within_2_turns"],
+        })
+    return out
+
+
 def build_redacted_shortlist(
     dataset: WindowDataset,
     attempt_evals: List[AttemptEval],
@@ -245,6 +283,8 @@ def rank_failures_with_gemini(
     usage_logger: Optional[Callable[..., None]] = None,
     budget_checker: Optional[Callable[[], None]] = None,
     cost_estimator: Optional[Callable[[str, Optional[int], Optional[int]], float]] = None,
+    max_retries: int = 2,
+    retry_delay_sec: float = 2.0,
 ) -> Tuple[List[Dict[str, Any]], float, int]:
     """Rank up to 10 failures using Gemini (or deterministic fallback in report-only mode)."""
     if not shortlist:
@@ -253,25 +293,7 @@ def rank_failures_with_gemini(
     candidates = shortlist[:MAX_SHORTLIST_FOR_LLM]
 
     if report_only:
-        out: List[Dict[str, Any]] = []
-        for idx, item in enumerate(candidates[:MAX_FAILURES_IN_REPORT], start=1):
-            out.append({
-                "rank": idx,
-                "signal": item["signal"],
-                "attempt_hash": item["attempt_hash"],
-                "case_type": item["case_type"],
-                "stage": item["stage"],
-                "candidate_turn": item["candidate_turn"],
-                "interviewer_reply": item["interviewer_reply"],
-                "signals": item["signals"],
-                "response_function": item["response_function"],
-                "should_have": _DEFAULT_SHOULD_HAVE.get(
-                    item["signal"], "Respond specifically to the candidate's turn and move the case forward."
-                ),
-                "frequency_7d": item["frequency_7d"],
-                "abandoned_within_2_turns": item["abandoned_within_2_turns"],
-            })
-        return out, 0.0, 0
+        return format_deterministic_failures(candidates), 0.0, 0
 
     # Lazy import so GEMINI_API_KEY/git guards run before services.ai_providers/supabase_client load.
     if budget_checker is None:
@@ -313,20 +335,36 @@ def rank_failures_with_gemini(
     model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
 
     t0 = time.time()
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a precise consulting case interviewer quality reviewer. Output strictly valid JSON only.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=8192,
-        )
-    except Exception as exc:  # noqa: BLE001
+    resp = None
+    last_exc: Optional[Exception] = None
+    attempts_allowed = max(1, int(max_retries) + 1)
+    for attempt_idx in range(attempts_allowed):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a precise consulting case interviewer quality reviewer. Output strictly valid JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=8192,
+            )
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _is_quota_or_auth_error(exc):
+                break
+            if attempt_idx + 1 < attempts_allowed and _is_transient_gemini_error(exc):
+                if retry_delay_sec > 0:
+                    time.sleep(retry_delay_sec * (attempt_idx + 1))
+                continue
+            break
+
+    if last_exc is not None:
         latency_ms = int((time.time() - t0) * 1000)
         usage_logger(
             user_id=None,
@@ -335,11 +373,11 @@ def rank_failures_with_gemini(
             response=None,
             latency_ms=latency_ms,
             success=False,
-            meta={"error": type(exc).__name__},
+            meta={"error": type(last_exc).__name__},
         )
-        if _is_quota_or_auth_error(exc):
-            raise GeminiQuotaOrAuthError(f"Gemini quota/auth error: {type(exc).__name__}: {exc}") from exc
-        raise
+        if _is_quota_or_auth_error(last_exc):
+            raise GeminiQuotaOrAuthError(f"Gemini quota/auth error: {type(last_exc).__name__}: {last_exc}") from last_exc
+        raise last_exc
 
     latency_ms = int((time.time() - t0) * 1000)
     usage_logger(

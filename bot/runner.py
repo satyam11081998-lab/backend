@@ -33,6 +33,7 @@ from bot.failures import (
     GeminiQuotaOrAuthError,
     TokenCapExceededError,
     build_redacted_shortlist,
+    format_deterministic_failures,
     rank_failures_with_gemini,
 )
 from bot.git_guard import capture_outside_bot_baseline, compare_outside_bot_snapshot
@@ -243,11 +244,21 @@ def run_daily_report(
         "raw_colleges": [str(u.get("college_other")) for u in dataset.users_by_id.values() if u.get("college_other")],
     }
 
+    abort_excs = (
+        BudgetExhaustedError,
+        GeminiQuotaOrAuthError,
+        TokenCapExceededError,
+        WallClockExceededError,
+        RedactionLeakError,
+    )
+    attempt_evals = []
+    shortlist: List[Dict[str, Any]] = []
+
     try:
         from bot.turns import AttemptEval, analyze_attempt
 
         _check_wall_clock(start_mono, max_wall_seconds)
-        attempt_evals: List[AttemptEval] = []
+        attempt_evals = []
         for att in dataset.attempts:
             try:
                 attempt_evals.append(analyze_attempt(att, dataset, reference_now=windows["window_to"]))
@@ -270,7 +281,16 @@ def run_daily_report(
 
         # Step 2: Metrics (no model calls)
         metrics, region_counts = compute_all_metrics(dataset, attempt_evals, windows)
+    except abort_excs as abort_exc:
+        log(f"[ABORT] {type(abort_exc).__name__}: {abort_exc}")
+        return EXIT_ABORT
+    except Exception as exc:  # noqa: BLE001
+        step_failed = True
+        err_note = f"Metrics/replay error ({type(exc).__name__}): {scrub_uuids(scrub_secrets(str(exc)))}"
+        notes.append(err_note)
+        log(f"[ERROR] {err_note}")
 
+    try:
         # Step 3: Deterministic failure shortlist + redaction + Gemini ranking
         _check_wall_clock(start_mono, max_wall_seconds)
         shortlist, leak_ctx = build_redacted_shortlist(dataset, attempt_evals, bot_hash_salt, windows)
@@ -286,7 +306,18 @@ def run_daily_report(
                 budget_checker=budget_checker,
                 cost_estimator=cost_estimator,
             )
+    except abort_excs as abort_exc:
+        log(f"[ABORT] {type(abort_exc).__name__}: {abort_exc}")
+        return EXIT_ABORT
+    except Exception as exc:  # noqa: BLE001
+        step_failed = True
+        if shortlist:
+            failures = format_deterministic_failures(shortlist)
+        err_note = f"Failure ranking error ({type(exc).__name__}): {scrub_uuids(scrub_secrets(str(exc)))}"
+        notes.append(err_note)
+        log(f"[ERROR] {err_note}")
 
+    try:
         # Step 4: Test suite + offline eval diff
         _check_wall_clock(start_mono, max_wall_seconds)
         if not skip_suite:
@@ -296,19 +327,12 @@ def run_daily_report(
             notes.extend(suite_res.get("notes") or [])
         else:
             notes.append("Suite check skipped (--skip-suite).")
-
-    except (
-        BudgetExhaustedError,
-        GeminiQuotaOrAuthError,
-        TokenCapExceededError,
-        WallClockExceededError,
-        RedactionLeakError,
-    ) as abort_exc:
+    except abort_excs as abort_exc:
         log(f"[ABORT] {type(abort_exc).__name__}: {abort_exc}")
         return EXIT_ABORT
     except Exception as exc:  # noqa: BLE001
         step_failed = True
-        err_note = f"Run error ({type(exc).__name__}): {scrub_uuids(scrub_secrets(str(exc)))}"
+        err_note = f"Suite error ({type(exc).__name__}): {scrub_uuids(scrub_secrets(str(exc)))}"
         notes.append(err_note)
         log(f"[ERROR] {err_note}")
 

@@ -477,3 +477,86 @@ def test_malformed_real_rows_skipped_and_counted_in_notes(tmp_path: Path, monkey
     assert "'attempt_messages': 1" in notes_blob
     assert "'submissions': 1" in notes_blob
 
+
+def test_step3_transient_503_retry_and_fallback_preserves_failures_and_suite(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BOT_HASH_SALT", "test-salt-1234")
+    monkeypatch.setenv("SUPABASE_BOT_KEY", "bot-ro-key")
+
+    # 1. Transient 503 followed by 200 succeeds on retry inside rank_failures_with_gemini
+    attempts_seen = {"n": 0}
+
+    class _FlakyGemini:
+        class _Msg:
+            def __init__(self, c): self.content = c
+        class _Choice:
+            def __init__(self, c): self.message = _FlakyGemini._Msg(c)
+        class _Resp:
+            def __init__(self, c):
+                self.choices = [_FlakyGemini._Choice(c)]
+                self.usage = type("U", (), {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30})()
+        class _Completions:
+            def __init__(self, outer): self._outer = outer
+            def create(self, **kwargs):
+                attempts_seen["n"] += 1
+                if attempts_seen["n"] == 1:
+                    raise RuntimeError("Error code: 503 - UNAVAILABLE high demand")
+                return _FlakyGemini._Resp('{"items": [{"id": 1, "rank": 1, "should_have": "Avoid praise-only reply."}]}')
+        def __init__(self):
+            self.chat = type("C", (), {"completions": _FlakyGemini._Completions(self)})()
+
+    sample = [{
+        "id": 1,
+        "signal": "praise_only",
+        "attempt_hash": "abc123def4567890",
+        "case_type": "guesstimate",
+        "stage": "Decompose",
+        "candidate_turn": "Pop is 10M.",
+        "interviewer_reply": "Great job!",
+        "signals": {},
+        "response_function": "SHORT_ACK",
+        "frequency_7d": 2,
+        "abandoned_within_2_turns": False,
+    }]
+    ranked, _cost, tokens = rank_failures_with_gemini(
+        sample,
+        {},
+        gemini_api_key="test-key",
+        gemini_client=_FlakyGemini(),
+        usage_logger=lambda **kw: None,
+        budget_checker=lambda: None,
+        cost_estimator=lambda _m, pt, ct: 0.001,
+        max_retries=2,
+        retry_delay_sec=0.0,
+    )
+    assert attempts_seen["n"] == 2
+    assert tokens == 30
+    assert ranked[0]["should_have"] == "Avoid praise-only reply."
+
+    # 2. Persistent 503 during full run -> Step 4 suite STILL runs and deterministic failures are kept
+    repo = init_temp_git_repo(tmp_path)
+    sb = FakeSupabase({
+        "attempts": [{"id": "a503", "user_id": "u503", "case_id": "c503", "status": "active", "created_at": _ts(2)}],
+        "attempt_messages": [
+            {"id": "m1", "attempt_id": "a503", "role": "user", "kind": "text", "content": "10M users.", "created_at": _ts(1.9)},
+            {"id": "m2", "attempt_id": "a503", "role": "assistant", "kind": "text", "content": "Great job!", "created_at": _ts(1.8)},
+        ],
+    })
+    rc = run_daily_report(
+        repo_root=repo,
+        now_utc=NOW,
+        supabase_client=sb,
+        gemini_client=FakeGeminiClient(raise_exc=RuntimeError("Error code: 503 - UNAVAILABLE")),
+        suite_runner=stub_suite_ok,
+        usage_logger=lambda **kw: None,
+        budget_checker=lambda: None,
+    )
+    assert rc == EXIT_ERROR
+    rep = json.loads((repo / "bot" / "reports" / f"{DATE_STR}.json").read_text(encoding="utf-8"))
+    assert rep["suite"]["pytest_passed"] == 517
+    assert len(rep["failures"]) == 1
+    assert rep["failures"][0]["signal"] == "praise_only"
+    assert load_state(repo / "bot" / "state.json")["consecutive_failures"] == 1
+
