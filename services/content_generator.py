@@ -12,6 +12,13 @@ insert hard-failed → /cron/schedule-daily 500 → no daily content ever.
 The guesstimate is stored as a normal case with type='guesstimate', so it
 flows through the same /cases/[id] → submit → AI-score → leaderboard path
 as every other case (nothing special needed downstream).
+
+2026-11-11: the guesstimate is now seeded from the day's news where a suitable
+story exists (services/news_seed.py) — Delhi's air quality becomes "how many air
+purifiers will Delhi households buy this winter" rather than an invented sector.
+The seed is strictly optional: no story, no key, no provider, or any failure at
+all, and generation falls back to exactly the previous behaviour. The CASE is
+never seeded (see _seed_instruction).
 """
 
 import os
@@ -129,8 +136,59 @@ US_SYSTEM_PROMPT += (
 )
 
 
-def generate_daily_content(recent_themes: List[str], market: str = "IN") -> dict:
-    """Call GPT-4o to produce one case + one guesstimate as a JSON object."""
+def _seed_instruction(seed: dict) -> str:
+    """
+    Turn today's news story into a prompt block.
+
+    Only the GUESSTIMATE is seeded. The case stays invented: a case needs
+    internal figures (revenue, margin, volume) that a news story does not supply,
+    and inventing them around a real company is how an email ends up asserting
+    something false about a real business.
+
+    The guesstimate must still be fully self-contained — a reader who has not
+    seen the news has to be able to solve it.
+    """
+    headline = (seed.get("title") or "").strip()
+    if not headline:
+        return ""
+    bits = [
+        "\n# TODAY'S NEWS SEED — applies to the GUESSTIMATE ONLY",
+        f'Headline: "{headline}"',
+    ]
+    desc = (seed.get("description") or "").strip()
+    if desc:
+        bits.append(f"Context: {desc[:280]}")
+    want = (seed.get("quantity") or "").strip()
+    if want:
+        bits.append(f"Quantity to estimate (a starting point, improve it if you can): {want}")
+    bits += [
+        "Build the guesstimate around the countable quantity this story makes people curious about, "
+        "and put that quantity in the title as a question.",
+        "The guesstimate must be SELF-CONTAINED: someone who never saw this headline must be able to "
+        "solve it from the prompt alone. Give the situation in your own words; do not tell them to read "
+        "the news, do not cite the outlet, and do not depend on any figure from the article.",
+        "Do not invent statistics and present them as reported fact. Every number in the solution is the "
+        "candidate's own assumption, derived from public anchors (population, households, income, "
+        "ownership rates).",
+        "The CASE is NOT seeded by this story — invent it independently, as usual.",
+    ]
+    return "\n".join(bits) + "\n"
+
+
+def generate_daily_content(
+    recent_themes: List[str],
+    market: str = "IN",
+    seed_headline: Optional[dict] = None,
+) -> dict:
+    """
+    Call GPT-4o to produce one case + one guesstimate as a JSON object.
+
+    `seed_headline` (2026-11-11): today's news story, from
+    services.news_seed.pick_guesstimate_seed(). When given, the guesstimate is
+    built from it — "Delhi's AQI crossed 450" becomes "how many air purifiers
+    will Delhi households buy this winter". When None, generation is exactly as
+    it has always been.
+    """
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise GeneratorError("OPENAI_API_KEY not set")
@@ -143,6 +201,8 @@ def generate_daily_content(recent_themes: List[str], market: str = "IN") -> dict
                 "Make them DISTINCT from these recent titles (different sector AND different "
                 f"mechanic):\n{joined}\n"
             )
+    if seed_headline:
+        user_prompt += _seed_instruction(seed_headline)
 
     try:
         t0 = time.time()
@@ -255,7 +315,18 @@ def save_generated_content(market: str = "IN") -> dict:
     # Recent titles → anti-repeat signal for the prompt.
     recent_themes = _recent_titles(supabase, market)
 
-    content = generate_daily_content(recent_themes, market=market)
+    # Today's news story for the guesstimate. Imported here rather than at module
+    # scope so this module keeps working if the seed module is ever absent, and
+    # so a seed failure can never stop the daily pair being generated.
+    seed = None
+    try:
+        from services.news_seed import pick_guesstimate_seed
+
+        seed = pick_guesstimate_seed(market)
+    except Exception as exc:  # noqa: BLE001
+        print(f"daily content: seed lookup skipped ({type(exc).__name__}: {exc})")
+
+    content = generate_daily_content(recent_themes, market=market, seed_headline=seed)
     case_data = content.get("case")
     guess_data = content.get("guesstimate")
     if not case_data or not guess_data:
@@ -281,4 +352,10 @@ def save_generated_content(market: str = "IN") -> dict:
         raise GeneratorError("Guesstimate insert returned no row")
     guesstimate_id = guess_res.data[0]["id"]
 
-    return {"case_id": case_id, "guesstimate_id": guesstimate_id}
+    # `seed_*` are additive: every existing caller reads only the two ids.
+    return {
+        "case_id": case_id,
+        "guesstimate_id": guesstimate_id,
+        "seed_headline": (seed or {}).get("title"),
+        "seed_score": (seed or {}).get("score"),
+    }

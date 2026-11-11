@@ -42,7 +42,7 @@ PRIORITY_KEYWORDS = [
 INDIAN_DOMAINS = "livemint.com,timesofindia.indiatimes.com,hindustantimes.com,thehindu.com,economictimes.indiatimes.com"
 
 
-def fetch_from_gnews(api_key: str, max_results: int = 50, page: int = 1) -> List[RawHeadline]:
+def fetch_from_gnews(api_key: str, max_results: int = 50, page: int = 1, country: str = "in") -> List[RawHeadline]:
     """
     Fetch recent business headlines from GNews API.
     Docs: https://gnews.io/docs/v4
@@ -56,7 +56,10 @@ def fetch_from_gnews(api_key: str, max_results: int = 50, page: int = 1) -> List
             params = {
                 "category": topic,
                 "lang": "en",
-                "country": "in",         # India focus
+                # Defaults to India. services/news_seed.py passes "us" to find a
+                # US seed story WITHOUT writing US rows into news_headlines,
+                # which has no market column and feeds the India-only GD briefs.
+                "country": country,
                 "max": max_results // len(GNEWS_TOPICS),
                 "page": page,
                 "apikey": api_key,
