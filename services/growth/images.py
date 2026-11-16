@@ -705,6 +705,19 @@ _SECTOR_QUERIES: List[tuple] = [
      ["North Block New Delhi", "Parliament House New Delhi", "government office building India"]),
     (("real estate", "housing", "property", "construction", "infrastructure", "metro", "railway"),
      ["construction site India high rise", "Indian metro train station", "urban skyline construction"]),
+    # Added 2026-11-16. These five sectors had no entry, so their articles fell straight to the generic
+    # "Mumbai skyline" set — a Google/creator-economy story and an Air India story both did.
+    (("startup", "software", "app", "internet", "digital", "creator", "video", "streaming", "google", "microsoft",
+      "technology", "saas", "platform"),
+     ["technology park Bangalore", "software office India", "person using smartphone India"]),
+    (("airline", "aviation", "aircraft", "airport", "widebody", "flight", "indigo"),
+     ["Air India aircraft", "Indian airport terminal", "aircraft on runway India"]),
+    (("steel", "manufacturing", "factory", "mining", "battery", "recycling", "industrial", "plant", "metal"),
+     ["factory floor India", "industrial plant India", "steel plant India"]),
+    (("jobs", "layoff", "layoffs", "workforce", "employment", "hiring", "salary", "employees", "mental health"),
+     ["office workers India", "IT park India employees", "commuters Mumbai local train"]),
+    (("insurance", "pension", "provident", "epfo", "mutual fund", "savings", "wealth"),
+     ["Bombay Stock Exchange building", "Dalal Street Mumbai", "Life Insurance Corporation building Mumbai"]),
 ]
 _DEFAULT_QUERIES = ["Mumbai skyline business district", "office building glass facade India", "Nariman Point Mumbai"]
 
@@ -715,75 +728,133 @@ def widen_queries(item: Dict[str, Any], title: str) -> List[str]:
         item.get("subject") or "", item.get("alt") or "", item.get("prompt") or "", title or "",
         " ".join(item.get("search") or []),
     )).lower()
-    out: List[str] = []
-    for words, queries in _SECTOR_QUERIES:
+    # The sector with the MOST matching words wins, not the first one listed. First-listed sent a Google
+    # creator-economy story to bank branches because its headline said "ten crore rupees" (2026-11-16).
+    scored = []
+    for order, (words, queries) in enumerate(_SECTOR_QUERIES):
         # Whole words only. Bare substrings matched inside unrelated words -- "car" in "healthcare" and "scarce",
         # "power" in "empowerment", "trade" in "tradeoff", "gas" in "Vegas" -- and sent a healthcare story to a
-        # car assembly line.
-        if any(re.search(rf"\b{re.escape(w)}\b", hay) for w in words):
-            out += queries
+        # car assembly line. A plural is the same word: "exports" must reach the trade scenes.
+        hits = sum(1 for w in words if re.search(rf"\b{re.escape(w)}(?:s|es)?\b", hay))
+        if hits:
+            scored.append((-hits, order, queries))
+    scored.sort()
+    out: List[str] = []
+    for _hits, _order, queries in scored:
+        out += queries
     return (out or _DEFAULT_QUERIES)[:3]
+
+
+def query_pick(cands: List[Dict[str, Any]], queries: List[str]) -> Optional[Dict[str, Any]]:
+    """A candidate whose title shares at least two real words with ONE of the writer's precise queries.
+
+    `heuristic_pick` scores against the slot's subject sentence, which is prose ("Indian professional reviewing
+    vertical video on a smartphone") and often shares no word with a perfectly good file title ("Google Hyderabad
+    campus.jpg"). The precise queries are proper nouns the writer chose for this article, so a title that matches
+    two words of one of them is the named thing. Two words, not one: one would let "bank" match every bank.
+    Never used on the widened path, where the queries are generic and everything would match.
+    """
+    best, best_score = None, 0.0
+    for q in queries:
+        qt = _tokens(q)
+        if len(qt) < 2:
+            continue
+        for c in cands:
+            if not _landscape(c):
+                continue
+            n = len(_tokens(c.get("title") or "") & qt)
+            if n < 2:
+                continue
+            score = n * 2.0 + min((c.get("width") or 0) / 4000.0, 1.0)
+            if score > best_score:
+                best, best_score = c, score
+    return best
+
+
+# How long a slot that MUST be filled (the hero) may keep looking after the article's shared budget is spent.
+MUST_GRACE_S = 20
 
 
 def find_photo(item: Dict[str, Any], title: str, used: set, *, search: Callable = candidates,
                pick: Callable = judge, fetch: Callable = _http_bytes, errors: Optional[List[str]] = None,
-               slug: str = "", deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
+               slug: str = "", deadline: Optional[float] = None, must: bool = False) -> Optional[Dict[str, Any]]:
     """{bytes, meta} for a real, openly licensed photo for this slot, or None.
 
-    Two paths, deliberately scored differently (2026-10-27):
+    Three rungs, each tried only when the one above produced nothing (rewritten 2026-11-16):
 
-      PRECISE  the writer's own proper-noun queries. Candidates here are supposed to show the named subject, so a
-               judge failure falls back to `heuristic_pick`, which demands a real title/subject overlap.
-      WIDENED  broad sector scenes, tried only when the precise queries find nothing. Title overlap is meaningless
-               here (the candidates were retrieved by those very queries), so `fallback_pick` chooses by slug
-               instead: topical by construction, varied across articles, stable for one article.
+      PRECISE  the writer's own proper-noun queries. The vision judge chooses; if it finds none or is down,
+               `heuristic_pick` (title vs subject) and then `query_pick` (title vs the precise query) choose.
+      WIDENED  broad sector scenes for the article's industry. The judge gets first say; otherwise
+               `fallback_pick` chooses by slug: topical by construction, varied across articles, stable for one.
+      DEFAULT  generic business scenes, only for a slot that `must` be filled (the hero).
 
-    Either way the photo is landscape and has passed `_BAD_TITLE`, so the judge's hard rejects -- logos, maps,
-    charts, portraits of identifiable people -- still hold on the judge-free path.
+    Before this, WIDENED ran only when PRECISE returned zero candidates. An article whose precise search found
+    eight photos the judge disliked — or whose judge call crashed — stopped there with "8 photo(s) found, none
+    usable" and shipped with no cover at all. That was 8 of 32 published articles, and 3 of the last 5.
+
+    Every photo on every rung is landscape and has passed `_BAD_TITLE`, so the hard rejects — logos, maps, charts,
+    portraits of identifiable people — hold whether or not the judge ran.
     """
-    queries = [q for q in (item.get("search") or []) if isinstance(q, str) and q.strip()]
-    if not queries and item.get("subject"):
-        queries = [str(item["subject"])]
-    precise = bool(queries)
-    if not queries:
-        queries = widen_queries(item, title)
-
-    cands = search(queries, used=used, errors=errors, deadline=deadline)
-    widened: List[str] = []
-    if not cands and precise:
-        widened = [q for q in widen_queries(item, title) if q not in queries]
-        if widened:
-            cands = search(widened, used=used, errors=errors, deadline=deadline)
-    if not cands:
+    def note(msg: str) -> None:
         if errors is not None:
-            errors.append(f"no open-licensed photo found for: {', '.join(queries + widened)[:160]}")
-        return None
+            errors.append(msg)
 
-    on_widened = bool(widened) or not precise
-    want = str(item.get("subject") or item.get("alt") or item.get("prompt") or queries[0])[:300]
+    def judged(cands: List[Dict[str, Any]], want: str) -> Optional[Dict[str, Any]]:
+        try:
+            return pick(cands, want, title)
+        except Exception as e:  # noqa: BLE001
+            note(f"photo judge unavailable ({type(e).__name__})")
+            return None
 
-    def without_judge() -> Optional[Dict[str, Any]]:
-        return fallback_pick(cands, f"{slug}/{item.get('after_section', 0)}") if on_widened \
-            else heuristic_pick(cands, want)
+    def window() -> Optional[float]:
+        # A slot that must be filled is never refused a search because earlier slots or a slow source spent
+        # the shared budget: it gets a short grace period of its own.
+        if must and deadline and time.time() > deadline - 5:
+            return time.time() + MUST_GRACE_S
+        return deadline
 
-    best = None
-    try:
-        best = pick(cands, want, title)
-        if not best:
-            best = without_judge()
-            if best and errors is not None:
-                errors.append(f"judge found none close enough for '{queries[0][:50]}'; used a sector photo"
-                              if on_widened else
-                              f"judge found none close enough for '{queries[0][:50]}'; used the closest match by title")
-    except Exception as e:  # noqa: BLE001
-        best = without_judge()
-        if errors is not None:
-            errors.append(f"photo judge unavailable ({type(e).__name__}); "
-                          + ("used a sector photo" if (best and on_widened) else
-                             "picked the closest match by title" if best else "no usable candidate"))
+    precise = [q for q in (item.get("search") or []) if isinstance(q, str) and q.strip()]
+    if not precise and item.get("subject"):
+        precise = [str(item["subject"])]
+    want = str(item.get("subject") or item.get("alt") or item.get("prompt") or (precise[0] if precise else title))[:300]
+    slot = f"{slug}/{item.get('after_section', 0)}"
+    best: Optional[Dict[str, Any]] = None
+    tried: List[str] = []
+
+    # 1. PRECISE
+    if precise:
+        tried += precise
+        cands = search(precise, used=used, errors=errors, deadline=deadline)
+        if cands:
+            best = judged(cands, want)
+            if not best:
+                best = heuristic_pick(cands, want) or query_pick(cands, precise)
+                note(f"judge chose none for '{precise[0][:50]}'; "
+                     + ("used the closest match by title" if best else f"{len(cands)} found, none close enough"))
+
+    # 2. WIDENED
     if not best:
-        if errors is not None:
-            errors.append(f"{len(cands)} photo(s) found for '{queries[0][:60]}', none usable")
+        widened = [q for q in widen_queries(item, title) if q not in tried]
+        if widened:
+            tried += widened
+            cands = search(widened, used=used, errors=errors, deadline=window())
+            if cands:
+                best = judged(cands, want) or fallback_pick(cands, slot)
+                if best:
+                    note("used a sector photo")
+
+    # 3. DEFAULT — only for a slot that must not ship empty
+    if not best and must:
+        default = [q for q in _DEFAULT_QUERIES if q not in tried]
+        if default:
+            tried += default
+            cands = search(default, used=used, errors=errors, deadline=window())
+            best = fallback_pick(cands, slot) if cands else None
+            if best:
+                note("used a general business photo")
+
+    if not best:
+        note(f"no open-licensed photo found for: {', '.join(tried)[:160]}")
         return None
     data = fetch(best["image_url"])
     used.add(best["image_url"])
@@ -878,7 +949,10 @@ def make_images(supabase, slug: str, art: Dict[str, Any], *, title: str = "", ge
         deadline = time.time() + PHOTO_BUDGET_S
         for idx, (role, n, item) in enumerate(jobs):
             try:
-                got = photo(item, title, used, errors=out["errors"], slug=slug, deadline=deadline)
+                # The hero is the cover and the link preview: it must not ship empty, so it may fall all the
+                # way back to a general business photo. Inline slots stay optional.
+                got = photo(item, title, used, errors=out["errors"], slug=slug, deadline=deadline,
+                            must=(role == "hero"))
                 if got:
                     m = got["meta"]
                     results[idx] = _save(supabase, slug, item, role, n, got["bytes"], upload=upload, extra={
