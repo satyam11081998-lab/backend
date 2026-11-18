@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 import difflib
-from typing import Any, Dict, Iterable, List
+from typing import Optional, Any, Dict, Iterable, List
 
 _HELP = (
     "help", "hint", "i am stuck", "i'm stuck", "im stuck", " stuck",
@@ -690,24 +690,27 @@ def detect_intent(text: str) -> Dict[str, Any]:
         "is_greeting_only": t in _GREETING,
         "is_hypothesis": _has_any(t, _HYPOTHESIS_MARKERS)
     }
-    if flags["is_meta"]:
-        primary = "meta"
-    elif flags["solution_requested"]:
-        primary = "asking_for_solution"
-    elif flags["skip_or_stop"]:
-        primary = "wants_to_stop"
-    elif flags["help_requested"]:
-        primary = "asking_for_help"
-    elif flags["is_greeting_only"]:
-        primary = "greeting"
-    elif flags["is_question"] or flags["is_directive"]:
-        primary = "clarification"
-    elif flags["is_hypothesis"]:
-        primary = "hypothesis"
-    else:
-        primary = "answering"
-    flags["intent"] = primary
+    flags["intent"] = _primary_intent(flags)
     return flags
+
+
+def _primary_intent(flags: Dict[str, Any]) -> str:
+    """The single intent label, by fixed precedence. Shared by detect_intent and the turn reader merge."""
+    if flags["is_meta"]:
+        return "meta"
+    if flags["solution_requested"]:
+        return "asking_for_solution"
+    if flags["skip_or_stop"]:
+        return "wants_to_stop"
+    if flags["help_requested"]:
+        return "asking_for_help"
+    if flags["is_greeting_only"]:
+        return "greeting"
+    if flags["is_question"] or flags["is_directive"]:
+        return "clarification"
+    if flags["is_hypothesis"]:
+        return "hypothesis"
+    return "answering"
 
 def _candidate_turns(transcript: Iterable[Dict[str, str]]) -> List[str]:
     return [_norm(t.get("content")) for t in transcript
@@ -739,7 +742,12 @@ def _error_materiality(t: str) -> str:
     return "none"
 
 def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
-                    teaching_policy: str = "coached", prior_state=None, channel: str = "text", is_voice_partial: bool = False) -> Dict[str, Any]:
+                    teaching_policy: str = "coached", prior_state=None, channel: str = "text", is_voice_partial: bool = False,
+                    reading: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """`reading` (services/turn_reader.py, 2026-11-18): the model's read of what this turn MEANT. When given,
+    it is merged into the keyword flags BEFORE anything is derived from them, so frustration, the turn
+    shape and the session-close logic all see the better read. None -- every caller before step 1, and every
+    voice turn -- is the keyword path exactly as it was."""
     transcript = list(transcript or [])
     # a pasted essay is read on its first few thousand characters (a 20k-char paste took 4s)
     new_user_message = (new_user_message or "")[:4000]
@@ -747,6 +755,22 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
     asst = _assistant_turns(transcript)
     new_norm = _norm(new_user_message)
     intent = detect_intent(new_user_message)
+    digits_nearby = bool(re.search(r"\d", new_norm)) or any(re.search(r"\d", c) for c in cand[-3:])
+    reader_changed: List[str] = []
+    if reading:
+        from services.turn_reader import merge_flags
+        early = {k: reading[k] for k in ("help", "solution", "skip_or_stop", "frustrated", "meta", "confidence")
+                 if k in reading}
+        merged, reader_changed = merge_flags(
+            {"help_requested": intent["help_requested"], "solution_requested": intent["solution_requested"],
+             "skip_or_stop": intent["skip_or_stop"], "frustration_explicit": intent["frustration"],
+             "is_meta": intent["is_meta"]}, early, digits_nearby=digits_nearby)
+        for k in ("help_requested", "solution_requested", "skip_or_stop", "is_meta"):
+            if k in merged:
+                intent[k] = merged[k]
+        if "frustration_explicit" in merged:
+            intent["frustration"] = merged["frustration_explicit"]
+        intent["intent"] = _primary_intent(intent)
 
     # V10.2: Fixed historic memory bug. has_work is evaluated ONLY on the current turn to prevent infinite acks.
     has_work = (len(new_norm) > 60 or bool(re.search(r"\d", new_norm)) or _has_any(new_norm, _WORK_MARKERS))
@@ -927,7 +951,7 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
                   for t in transcript[-8:]
                   if (t.get("role") or "user") == "user" and asks_interviewer(t.get("content") or "")["asks"]][-2:]
 
-    return {
+    out = {
         "intent": intent["intent"],
         "teaching_policy": teaching_policy,
         "channel": channel,
@@ -1014,6 +1038,27 @@ def compute_signals(transcript: Iterable[Dict[str, str]], new_user_message: str,
         "candidate_plan": _latest_plan(transcript),
         "last_assistant_asked": last_assistant_asked,
     }
+    if reading:
+        _apply_reading(out, reading, digits_nearby, reader_changed)
+    return out
+
+
+def _apply_reading(out: Dict[str, Any], reading: Dict[str, Any], digits_nearby: bool, changed_early: List[str]) -> None:
+    """Merge the turn reader's flags that are not intent flags, then re-derive what follows from them."""
+    from services.turn_reader import merge_flags
+    merged, changed = merge_flags(out, reading, digits_nearby=digits_nearby)
+    out.update(merged)
+    if out.get("stuck_blank"):
+        out["help_requested"] = True
+    out["states_final_estimate"] = out.get("final_declared")
+    if out.get("frustration_explicit"):
+        out["frustration"] = "high"
+    elif out.get("help_requested") and out.get("frustration") == "none":
+        out["frustration"] = "mild"
+    if out.get("asks_for_space"):
+        out["wants_space"] = True
+    out["turn_reader"] = {"confidence": reading.get("confidence"),
+                          "changed": sorted(set(changed_early) | set(changed))}
 
 
 # Functions that are a presence beat (acknowledge / hand back), fast-lane or

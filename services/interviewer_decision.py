@@ -1081,13 +1081,19 @@ _FAST_PHRASES = {
 }
 _FAST_ALIASES = {"ACKNOWLEDGE": "SHORT_ACK", "VALIDATE": "HAND_BACK"}
 
-def get_fast_lane_event(mode: str, signals: Dict[str, Any]) -> Dict[str, Any]:
+def fast_kind(mode: str, signals: Dict[str, Any]) -> str:
+    """Which beat a fast-lane turn needs: SHORT_ACK, HAND_BACK, THINK or SPACE (shared with services/short_lines)."""
     key = _FAST_ALIASES.get(mode, mode)
     if key in ("HAND_BACK", "SHORT_ACK"):
         if signals.get("asks_for_space"):
             key = "SPACE"
         elif signals.get("candidate_mid_thought") and not signals.get("is_substantive_reasoning"):
             key = "THINK"
+    return key if key in _FAST_PHRASES else "SHORT_ACK"
+
+
+def get_fast_lane_event(mode: str, signals: Dict[str, Any]) -> Dict[str, Any]:
+    key = fast_kind(mode, signals)
     options = _FAST_PHRASES.get(key, _FAST_PHRASES["SHORT_ACK"])
     
     msg = signals.get("new_message_norm", "default")

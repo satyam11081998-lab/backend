@@ -50,3 +50,10 @@ for _k, _v in {
     "SUPABASE_SERVICE_ROLE_KEY": "test",
 }.items():
     os.environ.setdefault(_k, _v)
+
+
+# 3. The model-led interviewer layers are ON by default in production (turn reader, worded short lines). The
+#    suite pins the deterministic path, so they are off here unless a test opts in; their own tests inject fakes
+#    through prompt_overrides and never touch the network.
+os.environ.setdefault("INTERVIEWER_TURN_READER", "off")
+os.environ.setdefault("INTERVIEWER_SHORT_LINES", "fixed")

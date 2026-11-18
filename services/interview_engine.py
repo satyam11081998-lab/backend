@@ -31,7 +31,7 @@ from services.session_signals import compute_signals, needs_contextual_assessmen
 from services.interviewer_mode import get_function_instruction, ALLOW_QUESTIONS, build_mode_block
 from services.interviewer_decision import (
     StreamTagStripper, parse_control_tag, sanitize_reply, enforce_mode, 
-    assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event,
+    assess_context_with_llm, evaluate_intervention_gate, get_fast_lane_event, fast_kind,
     decide_response, build_interviewer_control_packet, validate_contextual_line,
     CONTEXTUAL_PRESENCE, scrub_control_leak, StreamLeakGuard,
     StreamReplyGuard, StreamShapeGuard, looks_like_refusal, is_praise_only, strip_all_questions, strip_solicitations,
@@ -39,6 +39,8 @@ from services.interviewer_decision import (
     _filter_lines,
 )
 from services import numbers_check
+from services import turn_reader
+from services import short_lines
 from services import logic_check
 from services.learning_model import evaluate_intervention_outcome, build_learning_block
 from prompts.voice_renderer import strip_say_label
@@ -295,6 +297,8 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
     policy = _teaching_policy(teaching_policy)
     signals = compute_signals(tlist, new_user_message, policy, prior_state=prior_state,
                               channel=channel, is_voice_partial=is_voice_partial)
+    signals = _with_turn_reading(signals, tlist, new_user_message, case_content, policy, prior_state,
+                                 channel, is_voice_partial, overrides, audit_ctx)
     if not is_voice_partial:
         _annotate_turn(signals, tlist, new_user_message, case_content, case_type, prior_state,
                        overrides, audit_ctx, case_solution)
@@ -333,6 +337,84 @@ def _plan_adaptive_turn(case_content, case_type, tlist, new_user_message, clarif
             packet_rules=overrides.get("packet_rules")),
     })
     return plan
+
+
+def _with_turn_reading(signals, tlist, msg, case_content, policy, prior_state, channel, is_voice_partial,
+                       overrides, audit_ctx):
+    """Step 1 of the prompt-led interviewer (services/turn_reader.py): a model reads what the turn MEANT.
+
+    on      (default) the signals are rebuilt with the reading merged in
+    shadow  the keyword signals route the turn; a background thread reads it and logs any disagreement
+    off     the keyword signals, untouched
+    The arena may inject `turn_reader` (a callable) and `turn_reader_mode`."""
+    m = turn_reader.mode(overrides.get("turn_reader_mode"))
+    if m == "off" or not turn_reader.should_read(msg, channel, is_voice_partial, signals):
+        return signals
+    ctx = audit_ctx or {}
+    usage_out, user_id = ctx.get("usage_out"), ctx.get("user_id")
+
+    def _record(resp, latency_ms, model):
+        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages/read",
+                       model=model, response=resp, latency_ms=latency_ms, provider="openai")
+
+    # Its own client, deliberately NOT the interviewer's (audit_ctx["llm"]): the reader is a fixed small
+    # classifier, so an arena run that pins the INTERVIEWER model must not silently re-pin the reader too.
+    reader = overrides.get("turn_reader") or (
+        lambda t, u, c: turn_reader.read_turn(t, u, c, record=_record))
+
+    def _rebuild(reading):
+        return compute_signals(tlist, msg, policy, prior_state=prior_state, channel=channel,
+                               is_voice_partial=is_voice_partial, reading=reading)
+
+    if m == "shadow":
+        def _compare():
+            try:
+                reading = reader(tlist, msg, case_content)
+                if not reading:
+                    return
+                changed = (_rebuild(reading).get("turn_reader") or {}).get("changed") or []
+                if changed:
+                    print("[turn_reader] disagree " + json.dumps(
+                        {"user": user_id, "turn": (msg or "")[:160], "confidence": reading.get("confidence"),
+                         "flags": {k: signals.get(k) for k in changed}}, ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001 - shadow must never touch a live turn
+                print(f"[turn_reader] shadow skipped: {type(e).__name__}")
+        turn_reader.shadow(_compare)
+        return signals
+
+    try:
+        reading = reader(tlist, msg, case_content)
+    except Exception as e:  # noqa: BLE001
+        print(f"[turn_reader] read skipped: {type(e).__name__}")
+        reading = {}
+    return _rebuild(reading) if reading else signals
+
+
+def _fast_beat(function, signals, new_user_message, channel, user_id, usage_out, overrides):
+    """The fast-lane event. Step 2 (services/short_lines.py): in text (unless INTERVIEWER_SHORT_LINES=fixed), a
+    small model call words the beat for this turn; any failure or a line that breaks a rule keeps the fixed one.
+    Returns (event, worded)."""
+    ev = get_fast_lane_event(function, signals)
+    overrides = overrides or {}
+    if channel != "text" or short_lines.mode(overrides.get("short_line_mode")) != "model":
+        return ev, False
+
+    def _record(resp, latency_ms, model):
+        _record_or_log(usage_out, user_id=user_id, endpoint="/attempts/messages/shortline",
+                       model=model, response=resp, latency_ms=latency_ms, provider="openai")
+
+    kind = fast_kind(function, signals)
+    liner = overrides.get("short_liner") or (
+        lambda k, sig, msg: short_lines.word_line(k, sig, msg, record=_record))
+    try:
+        line = liner(kind, signals, new_user_message)
+    except Exception as e:  # noqa: BLE001
+        print(f"[short_lines] skipped: {type(e).__name__}")
+        line = None
+    if not line:
+        return ev, False
+    ev = {**ev, "data": {**ev["data"], "text": line, "code": "MODEL"}}
+    return ev, True
 
 
 def _set_control(control_out, plan, tag, render):
@@ -547,8 +629,10 @@ def stream_interviewer_reply(
         # HAND_BACK reach here, and only when the candidate's turn was not substantive.
         if render == "fast":
             t0 = time.time()
-            fast_event_dict = get_fast_lane_event(function, signals)
-            _set_control(control_out, plan, {"mode": function, "intervention": "fast_lane"}, "fast")
+            fast_event_dict, worded = _fast_beat(function, signals, new_user_message, channel, user_id,
+                                                 usage_out, prompt_overrides)
+            _set_control(control_out, plan, {"mode": function,
+                                             "intervention": "model_short_line" if worded else "fast_lane"}, "fast")
             # Text: plain line (the SSE UI renders text). Voice: the typed event.
             if channel == "text":
                 yield fast_event_dict["data"]["text"]
@@ -767,8 +851,10 @@ def complete_interviewer_reply(
             return ""
 
         if render == "fast":
-            fast_event = get_fast_lane_event(function, signals)
-            _set_control(control_out, plan, {"mode": function, "intervention": "fast_lane"}, "fast")
+            fast_event, worded = _fast_beat(function, signals, new_user_message, channel, None,
+                                            usage_out, prompt_overrides)
+            _set_control(control_out, plan, {"mode": function,
+                                             "intervention": "model_short_line" if worded else "fast_lane"}, "fast")
             return fast_event["data"]["text"] if channel == "text" else json.dumps(fast_event)
 
         if function in CONTEXTUAL_PRESENCE:
